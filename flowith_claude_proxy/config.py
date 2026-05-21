@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -49,6 +50,18 @@ if _https_proxy:
 # Server bind defaults
 DEFAULT_HOST = os.environ.get("FLOWITH_API_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("FLOWITH_API_PORT", "8787"))
+
+# Custom model aliases: JSON string, merged with built-in aliases (user ones win).
+# e.g. FLOWITH_MODEL_ALIASES={"claude-3-5-sonnet-20241022":"claude-4.6-sonnet"}
+CUSTOM_MODEL_ALIASES: dict[str, str] = {}
+_raw_aliases = os.environ.get("FLOWITH_MODEL_ALIASES", "").strip()
+if _raw_aliases:
+    try:
+        CUSTOM_MODEL_ALIASES = {
+            str(k): str(v) for k, v in json.loads(_raw_aliases).items()
+        }
+    except (json.JSONDecodeError, AttributeError):
+        pass
 
 def load_api_key() -> str | None:
     """Resolve a Flowith API key.
