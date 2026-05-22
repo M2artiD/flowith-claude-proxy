@@ -14,14 +14,17 @@ def client():
     return TestClient(app)
 
 
-def _mock_flowith_response(content="Hello!", prompt_tokens=10, completion_tokens=5):
-    return {
+def _mock_flowith_response(content="Hello!", prompt_tokens=10, completion_tokens=5, tool_calls=None):
+    result = {
         "success": True,
         "content": content,
         "time_ms": 100.0,
         "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
         "reasoning_content": "",
+        "tool_calls": tool_calls,
+        "finish_reason": "tool_calls" if tool_calls else "stop",
     }
+    return result
 
 
 # ── Health & root ──────────────────────────────────────────────
@@ -121,6 +124,61 @@ class TestNonStreaming:
             )
             assert r.status_code == 502
 
+    def test_tool_calls_response(self, client):
+        with patch("flowith_claude_proxy.server.FlowithClient") as MockClient:
+            instance = MockClient.return_value
+            instance.call_api.return_value = _mock_flowith_response(
+                content="",
+                tool_calls=[{
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                }],
+            )
+            r = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-3-5-sonnet-20241022",
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "run ls"}],
+                },
+                headers={"x-api-key": "k"},
+            )
+            assert r.status_code == 200
+            data = r.json()
+            assert data["stop_reason"] == "tool_use"
+            tool_block = next(b for b in data["content"] if b["type"] == "tool_use")
+            assert tool_block["name"] == "bash"
+            assert tool_block["input"] == {"command": "ls"}
+
+    def test_tools_passed_to_client(self, client):
+        with patch("flowith_claude_proxy.server.FlowithClient") as MockClient:
+            instance = MockClient.return_value
+            instance.call_api.return_value = _mock_flowith_response()
+            r = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-3-5-sonnet-20241022",
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [
+                        {
+                            "name": "bash",
+                            "description": "Run bash",
+                            "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}},
+                        }
+                    ],
+                },
+                headers={"x-api-key": "k"},
+            )
+            assert r.status_code == 200
+            # Verify tools were passed to call_api
+            call_kwargs = instance.call_api.call_args
+            assert call_kwargs is not None
+            tools_arg = call_kwargs.kwargs.get("tools") or call_kwargs[1].get("tools") if len(call_kwargs.args) > 1 else call_kwargs.kwargs.get("tools")
+            assert tools_arg is not None
+            assert tools_arg[0]["function"]["name"] == "bash"
+
 
 # ── Streaming ──────────────────────────────────────────────────
 
@@ -157,6 +215,48 @@ class TestStreaming:
             assert "event: content_block_delta" in body
             assert "event: content_block_stop" in body
             assert "event: message_stop" in body
+
+    def test_streaming_tool_use_events(self, client):
+        with patch("flowith_claude_proxy.server.FlowithClient") as MockClient:
+            instance = MockClient.return_value
+
+            def fake_call_api(messages, **kwargs):
+                if kwargs.get("stream"):
+                    on_tool_call = kwargs.get("on_tool_call")
+                    if on_tool_call:
+                        on_tool_call({
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                        })
+                    return _mock_flowith_response(
+                        content="",
+                        tool_calls=[{
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                        }],
+                    )
+                return _mock_flowith_response()
+
+            instance.call_api.side_effect = fake_call_api
+
+            r = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-3-5-sonnet-20241022",
+                    "max_tokens": 100,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "run ls"}],
+                },
+                headers={"x-api-key": "k"},
+            )
+            assert r.status_code == 200
+            body = r.text
+            assert "event: content_block_start" in body
+            assert "tool_use" in body
+            assert "input_json_delta" in body
+            assert "tool_use" in body or "stop_reason" in body
 
 
 # ── Input validation ──────────────────────────────────────────

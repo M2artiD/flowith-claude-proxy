@@ -6,10 +6,13 @@ import pytest
 from flowith_claude_proxy.adapter import (
     MODEL_ALIASES,
     _extract_text,
+    anthropic_tool_choice_to_openai,
+    anthropic_tools_to_openai,
     claude_request_to_flowith_messages,
     flowith_result_to_claude_response,
     map_model,
     new_message_id,
+    openai_tool_calls_to_anthropic,
     sse_content_block_delta,
     sse_content_block_start,
     sse_content_block_stop,
@@ -18,6 +21,7 @@ from flowith_claude_proxy.adapter import (
     sse_message_start,
     sse_message_stop,
     sse_ping,
+    sse_tool_input_delta,
 )
 
 
@@ -107,6 +111,56 @@ class TestExtractText:
         assert _extract_text(42) == "42"
 
 
+# ── anthropic_tools_to_openai ──────────────────────────────────
+
+class TestAnthropicToolsToOpenAI:
+    def test_basic_conversion(self):
+        tools = [
+            {
+                "name": "get_weather",
+                "description": "Get weather",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            }
+        ]
+        result = anthropic_tools_to_openai(tools)
+        assert len(result) == 1
+        assert result[0]["type"] == "function"
+        assert result[0]["function"]["name"] == "get_weather"
+        assert result[0]["function"]["parameters"]["properties"]["city"]["type"] == "string"
+
+    def test_computer_tool_skipped(self):
+        tools = [
+            {"type": "computer_20250124", "name": "computer"},
+            {"name": "bash", "description": "Run bash", "input_schema": {"type": "object", "properties": {}}},
+        ]
+        result = anthropic_tools_to_openai(tools)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "bash"
+
+    def test_empty_list(self):
+        assert anthropic_tools_to_openai([]) == []
+
+
+# ── anthropic_tool_choice_to_openai ────────────────────────────
+
+class TestAnthropicToolChoiceToOpenAI:
+    def test_auto(self):
+        assert anthropic_tool_choice_to_openai("auto") == "auto"
+
+    def test_none(self):
+        assert anthropic_tool_choice_to_openai(None) == "auto"
+
+    def test_any(self):
+        assert anthropic_tool_choice_to_openai("any") == "required"
+
+    def test_specific_tool(self):
+        result = anthropic_tool_choice_to_openai({"type": "tool", "name": "bash"})
+        assert result == {"type": "function", "function": {"name": "bash"}}
+
+
 # ── claude_request_to_flowith_messages ─────────────────────────
 
 class TestRequestConversion:
@@ -149,6 +203,104 @@ class TestRequestConversion:
     def test_no_messages_key(self):
         assert claude_request_to_flowith_messages({}) == []
 
+    def test_assistant_tool_use_converted(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "run ls"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_123", "name": "bash", "input": {"command": "ls"}},
+                    ],
+                },
+            ],
+        }
+        msgs = claude_request_to_flowith_messages(body)
+        assert len(msgs) == 2
+        assert msgs[1]["role"] == "assistant"
+        assert "tool_calls" in msgs[1]
+        assert msgs[1]["tool_calls"][0]["function"]["name"] == "bash"
+        assert msgs[1]["tool_calls"][0]["id"] == "toolu_123"
+
+    def test_tool_result_converted(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "run ls"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_123", "name": "bash", "input": {"command": "ls"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_123", "content": "file1.txt\nfile2.txt"},
+                    ],
+                },
+            ],
+        }
+        msgs = claude_request_to_flowith_messages(body)
+        # assistant with tool_calls, then tool role message
+        assert any(m["role"] == "tool" for m in msgs)
+        tool_msg = next(m for m in msgs if m["role"] == "tool")
+        assert tool_msg["tool_call_id"] == "toolu_123"
+        assert "file1.txt" in tool_msg["content"]
+
+    def test_mixed_text_and_tool_use(self):
+        body = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "I'll run that."},
+                        {"type": "tool_use", "id": "toolu_abc", "name": "bash", "input": {"command": "pwd"}},
+                    ],
+                },
+            ],
+        }
+        msgs = claude_request_to_flowith_messages(body)
+        assert len(msgs) == 1
+        assert msgs[0]["role"] == "assistant"
+        assert "tool_calls" in msgs[0]
+        assert msgs[0]["content"] == "I'll run that."
+
+
+# ── openai_tool_calls_to_anthropic ─────────────────────────────
+
+class TestOpenAIToolCallsToAnthropic:
+    def test_basic_conversion(self):
+        tool_calls = [
+            {
+                "id": "call_abc123",
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "ls"}',
+                },
+            }
+        ]
+        result = openai_tool_calls_to_anthropic(tool_calls)
+        assert len(result) == 1
+        assert result[0]["type"] == "tool_use"
+        assert result[0]["id"] == "call_abc123"
+        assert result[0]["name"] == "bash"
+        assert result[0]["input"] == {"command": "ls"}
+
+    def test_invalid_arguments_json(self):
+        tool_calls = [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "invalid{"},
+            }
+        ]
+        result = openai_tool_calls_to_anthropic(tool_calls)
+        assert result[0]["input"] == {}
+
+    def test_empty_list(self):
+        assert openai_tool_calls_to_anthropic([]) == []
+
 
 # ── flowith_result_to_claude_response ──────────────────────────
 
@@ -178,6 +330,47 @@ class TestResultConversion:
         assert mid.startswith("msg_")
         assert len(mid) == 28  # "msg_" + 24 hex chars
 
+    def test_tool_calls_in_response(self):
+        result = flowith_result_to_claude_response(
+            {
+                "content": "",
+                "usage": {"prompt_tokens": 5, "completion_tokens": 10},
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                    }
+                ],
+            },
+            "claude-3-5-sonnet-20241022",
+        )
+        assert result["stop_reason"] == "tool_use"
+        tool_block = next(b for b in result["content"] if b["type"] == "tool_use")
+        assert tool_block["name"] == "bash"
+        assert tool_block["input"] == {"command": "ls"}
+
+    def test_text_and_tool_calls(self):
+        result = flowith_result_to_claude_response(
+            {
+                "content": "Running that for you.",
+                "usage": {"prompt_tokens": 5, "completion_tokens": 10},
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                    }
+                ],
+            },
+            "claude-3-5-sonnet-20241022",
+        )
+        assert result["stop_reason"] == "tool_use"
+        text_block = next(b for b in result["content"] if b["type"] == "text")
+        assert text_block["text"] == "Running that for you."
+        tool_block = next(b for b in result["content"] if b["type"] == "tool_use")
+        assert tool_block["name"] == "bash"
+
 
 # ── SSE helpers ────────────────────────────────────────────────
 
@@ -205,3 +398,16 @@ class TestSSE:
         sse = sse_error("something broke")
         assert "event: error" in sse
         assert "something broke" in sse
+
+    def test_tool_use_content_block_start(self):
+        sse = sse_content_block_start(1, block_type="tool_use", tool_id="toolu_abc", tool_name="bash")
+        assert "event: content_block_start" in sse
+        assert '"type": "tool_use"' in sse
+        assert '"id": "toolu_abc"' in sse
+        assert '"name": "bash"' in sse
+
+    def test_tool_input_delta(self):
+        sse = sse_tool_input_delta('{"command": "ls"}', index=1)
+        assert "event: content_block_delta" in sse
+        assert '"type": "input_json_delta"' in sse
+        assert '"partial_json"' in sse

@@ -33,6 +33,15 @@ class FlowithClient:
         self.ssl_verify = ssl_verify
         self.proxies = proxies
 
+        self._session = requests.Session()
+        self._session.verify = ssl_verify
+        self._session.proxies = proxies or {}
+        self._session.headers.update({"Authorization": f"Bearer {self.api_key}"})
+
+        if not ssl_verify:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
     def call_api(
         self,
         messages: list[dict[str, Any]],
@@ -40,6 +49,9 @@ class FlowithClient:
         max_retries: int = 1,
         stream: bool = False,
         on_chunk: Callable[[str], None] | None = None,
+        on_tool_call: Callable[[dict[str, Any]], None] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
     ) -> dict[str, Any]:
         use_model = model or self.model
         last_error: Exception | None = None
@@ -47,19 +59,23 @@ class FlowithClient:
         for attempt in range(1, max_retries + 1):
             try:
                 start = time.time()
-                response = requests.post(
+
+                payload: dict[str, Any] = {
+                    "models": [use_model],
+                    "messages": messages,
+                    "stream": stream,
+                    "thinking": self.thinking,
+                }
+                if tools:
+                    payload["tools"] = tools
+                if tool_choice is not None:
+                    payload["tool_choice"] = tool_choice
+
+                response = self._session.post(
                     self.base_url,
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                    json={
-                        "models": [use_model],
-                        "messages": messages,
-                        "stream": stream,
-                        "thinking": self.thinking,
-                    },
+                    json=payload,
                     timeout=self.timeout,
                     stream=stream,
-                    verify=self.ssl_verify,
-                    proxies=self.proxies,
                 )
                 elapsed_ms = (time.time() - start) * 1000
 
@@ -69,50 +85,22 @@ class FlowithClient:
                     )
                 else:
                     if stream:
-                        content_parts: list[str] = []
-                        reasoning_parts: list[str] = []
-                        usage: dict[str, Any] = {}
-                        for raw_line in response.iter_lines(decode_unicode=True):
-                            if not raw_line:
-                                continue
-                            line = raw_line.strip()
-                            if line.startswith("data:"):
-                                line = line[5:].strip()
-                            if line == "[DONE]":
-                                break
-                            try:
-                                chunk = json.loads(line)
-                            except Exception:
-                                continue
-                            if "usage" in chunk:
-                                usage = chunk.get("usage", {}) or usage
-                            for choice in chunk.get("choices", []) or []:
-                                delta = choice.get("delta", {}) or {}
-                                piece = delta.get("content")
-                                if piece:
-                                    content_parts.append(piece)
-                                    if on_chunk:
-                                        on_chunk(piece)
-                                reasoning = delta.get("reasoning_content")
-                                if reasoning:
-                                    reasoning_parts.append(reasoning)
-                        return {
-                            "success": True,
-                            "content": "".join(content_parts),
-                            "time_ms": elapsed_ms,
-                            "usage": usage,
-                            "reasoning_content": "".join(reasoning_parts),
-                        }
+                        return self._parse_stream(
+                            response, elapsed_ms, on_chunk, on_tool_call
+                        )
 
                     result = response.json()
                     if result.get("choices"):
                         msg = result["choices"][0]["message"]
+                        tool_calls = msg.get("tool_calls")
                         return {
                             "success": True,
-                            "content": msg.get("content", ""),
+                            "content": msg.get("content", "") or "",
                             "time_ms": elapsed_ms,
                             "usage": result.get("usage", {}) or {},
                             "reasoning_content": msg.get("reasoning_content", "") or "",
+                            "tool_calls": tool_calls,
+                            "finish_reason": result["choices"][0].get("finish_reason"),
                         }
                     last_error = Exception("Upstream response has no choices")
 
@@ -133,3 +121,84 @@ class FlowithClient:
                 time.sleep(attempt * 2)
 
         return {"success": False, "error": str(last_error) if last_error else "unknown error"}
+
+    def _parse_stream(
+        self,
+        response: requests.Response,
+        elapsed_ms: float,
+        on_chunk: Callable[[str], None] | None,
+        on_tool_call: Callable[[dict[str, Any]], None] | None,
+    ) -> dict[str, Any]:
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        usage: dict[str, Any] = {}
+        # Accumulate tool_call fragments: index -> {id, function: {name, arguments}}
+        tool_call_accum: dict[int, dict[str, Any]] = {}
+        finish_reason: str | None = None
+
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            line = raw_line.strip()
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if line == "[DONE]":
+                break
+            try:
+                chunk = json.loads(line)
+            except Exception:
+                continue
+            if "usage" in chunk:
+                usage = chunk.get("usage", {}) or usage
+            for choice in chunk.get("choices", []) or []:
+                delta = choice.get("delta", {}) or {}
+                fr = choice.get("finish_reason")
+                if fr:
+                    finish_reason = fr
+
+                piece = delta.get("content")
+                if piece:
+                    content_parts.append(piece)
+                    if on_chunk:
+                        on_chunk(piece)
+                reasoning = delta.get("reasoning_content")
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+
+                # Accumulate tool call deltas
+                tc_deltas = delta.get("tool_calls")
+                if tc_deltas:
+                    for tc in tc_deltas:
+                        idx = tc.get("index", 0)
+                        if idx not in tool_call_accum:
+                            tool_call_accum[idx] = {
+                                "id": tc.get("id", ""),
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        entry = tool_call_accum[idx]
+                        if tc.get("id"):
+                            entry["id"] = tc["id"]
+                        func_delta = tc.get("function", {})
+                        if func_delta.get("name"):
+                            entry["function"]["name"] = func_delta["name"]
+                        if func_delta.get("arguments"):
+                            entry["function"]["arguments"] += func_delta["arguments"]
+
+        # Finalize tool calls and notify
+        tool_calls: list[dict[str, Any]] | None = None
+        if tool_call_accum:
+            tool_calls = [tool_call_accum[i] for i in sorted(tool_call_accum)]
+            if on_tool_call:
+                for tc in tool_calls:
+                    on_tool_call(tc)
+
+        return {
+            "success": True,
+            "content": "".join(content_parts),
+            "time_ms": elapsed_ms,
+            "usage": usage,
+            "reasoning_content": "".join(reasoning_parts),
+            "tool_calls": tool_calls,
+            "finish_reason": finish_reason,
+        }
