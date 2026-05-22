@@ -20,6 +20,8 @@ from .adapter import (
     map_model,
     new_message_id,
     openai_tool_calls_to_anthropic,
+    parse_xml_tool_calls,
+    split_text_and_xml_tool_calls,
     sse_content_block_delta,
     sse_content_block_start,
     sse_content_block_stop,
@@ -136,7 +138,7 @@ async def create_message(
         if tc is not None:
             openai_tool_choice = anthropic_tool_choice_to_openai(tc)
 
-    messages = claude_request_to_flowith_messages(body)
+    messages = claude_request_to_flowith_messages(body, anthropic_tools=raw_tools)
     if not messages or all(m["role"] == "system" for m in messages):
         raise HTTPException(
             status_code=400,
@@ -251,16 +253,52 @@ def _stream_claude_events(
 
     # Track content block state
     current_block_index = 0
-    current_block_type: str | None = None  # "text" or "tool_use"
+    current_block_type: str | None = None  # "text", "thinking", or "tool_use"
     streamed_any = False
     last_ping = time.time()
 
-    def close_current_block() -> None:
-        nonlocal current_block_type
+    # XML tool call buffering: accumulate text chunks, detect XML patterns,
+    # then convert to tool_use content blocks instead of plain text
+    text_buffer = ""
+    xml_parsing = False  # True once we detect <function_calls> start
+
+    def _close_block() -> None:
+        nonlocal current_block_type, current_block_index
         if current_block_type is not None:
             yield sse_content_block_stop(current_block_index).encode("utf-8")
-            current_block_index + 1  # advance for next block
+            current_block_index += 1
             current_block_type = None
+
+    def _open_block(btype: str, **kwargs: Any) -> None:
+        nonlocal current_block_type
+        yield sse_content_block_start(current_block_index, block_type=btype, **kwargs).encode("utf-8")
+        current_block_type = btype
+
+    def _flush_text_as_block(text: str) -> None:
+        """Emit a complete text content block for the given text."""
+        nonlocal current_block_index, streamed_any
+        if not text:
+            return
+        yield from _close_block()
+        yield from _open_block("text")
+        streamed_any = True
+        yield sse_content_block_delta(text, current_block_index).encode("utf-8")
+
+    def _emit_tool_use_block(tool: dict[str, Any]) -> None:
+        """Emit a complete tool_use content block."""
+        nonlocal current_block_index, streamed_any
+        yield from _close_block()
+        yield from _open_block(
+            "tool_use",
+            tool_id=tool["id"],
+            tool_name=tool["name"],
+        )
+        streamed_any = True
+        import json as _json
+        yield sse_tool_input_delta(
+            _json.dumps(tool["input"], ensure_ascii=False),
+            current_block_index,
+        ).encode("utf-8")
 
     while True:
         try:
@@ -280,43 +318,66 @@ def _stream_claude_events(
 
         if kind == "reasoning":
             if current_block_type != "thinking":
-                if current_block_type is not None:
-                    yield sse_content_block_stop(current_block_index).encode("utf-8")
-                    current_block_index += 1
-                yield sse_content_block_start(current_block_index, block_type="thinking").encode("utf-8")
-                current_block_type = "thinking"
+                yield from _close_block()
+                yield from _open_block("thinking")
             streamed_any = True
             yield sse_thinking_delta(payload, current_block_index).encode("utf-8")
 
         elif kind == "text":
-            # Open text block if not open or if current is tool_use
-            if current_block_type != "text":
-                if current_block_type is not None:
-                    yield sse_content_block_stop(current_block_index).encode("utf-8")
-                    current_block_index += 1
-                yield sse_content_block_start(current_block_index, block_type="text").encode("utf-8")
-                current_block_type = "text"
-            streamed_any = True
-            yield sse_content_block_delta(payload, current_block_index).encode("utf-8")
+            text_buffer += payload
+
+            # Detect XML tool call start
+            if "<function_calls>" in text_buffer and not xml_parsing:
+                xml_parsing = True
+                # Emit any text before the XML as a text block
+                pre_xml = text_buffer[:text_buffer.index("<function_calls>")]
+                if pre_xml.strip():
+                    yield from _flush_text_as_block(pre_xml.strip())
+
+            if xml_parsing:
+                # Wait until we have the complete XML block(s)
+                # Check if we have a closing tag
+                if "</function_calls>" in text_buffer:
+                    # Parse all complete XML tool calls
+                    tools = parse_xml_tool_calls(text_buffer)
+                    for tool in tools:
+                        yield from _emit_tool_use_block(tool)
+
+                    # Keep any trailing text after last </function_calls>
+                    last_close = text_buffer.rfind("</function_calls>") + len("</function_calls>")
+                    remaining = text_buffer[last_close:]
+                    text_buffer = remaining
+                    xml_parsing = "<function_calls>" in text_buffer
+
+                    # Emit remaining non-XML text
+                    if text_buffer and not xml_parsing:
+                        if text_buffer.strip():
+                            yield from _flush_text_as_block(text_buffer.strip())
+                        text_buffer = ""
+                # else: still buffering XML, don't emit yet
+            else:
+                # No XML detected yet. Emit text safely but keep a trailing
+                # window in text_buffer so a <function_calls> tag split across
+                # SSE chunks isn't missed (tag is 16 chars, keep 24 for safety).
+                _TAG_WINDOW = 24
+                if len(text_buffer) > _TAG_WINDOW:
+                    safe_text = text_buffer[:-_TAG_WINDOW]
+                    if current_block_type != "text":
+                        yield from _close_block()
+                        yield from _open_block("text")
+                    streamed_any = True
+                    yield sse_content_block_delta(safe_text, current_block_index).encode("utf-8")
+                    text_buffer = text_buffer[-_TAG_WINDOW:]
 
         elif kind == "tool_call":
-            # Close current block if any
-            if current_block_type is not None:
-                yield sse_content_block_stop(current_block_index).encode("utf-8")
-                current_block_index += 1
-
-            # Open tool_use block
+            # Structured tool call from upstream (rare for Flowith)
+            yield from _close_block()
             tc_id = payload.get("id", f"toolu_{threading.get_ident()}")
             func = payload.get("function", {})
             tc_name = func.get("name", "")
-            yield sse_content_block_start(
-                current_block_index, block_type="tool_use",
-                tool_id=tc_id, tool_name=tc_name,
-            ).encode("utf-8")
+            yield from _open_block("tool_use", tool_id=tc_id, tool_name=tc_name)
             current_block_type = "tool_use"
             streamed_any = True
-
-            # Stream the arguments as input_json_delta
             raw_args = func.get("arguments", "{}")
             if raw_args:
                 yield sse_tool_input_delta(raw_args, current_block_index).encode("utf-8")
@@ -324,6 +385,21 @@ def _stream_claude_events(
         if time.time() - last_ping > 15:
             yield sse_ping().encode("utf-8")
             last_ping = time.time()
+
+    # Flush any remaining text buffer
+    if text_buffer.strip():
+        # If still in XML parsing mode at stream end, try to parse what we have
+        if xml_parsing:
+            tools = parse_xml_tool_calls(text_buffer)
+            for tool in tools:
+                yield from _emit_tool_use_block(tool)
+            # Any remaining text after parsing
+            import re
+            remaining = re.sub(r"<function_calls>.*?</function_calls>", "", text_buffer, flags=re.DOTALL).strip()
+            if remaining:
+                yield from _flush_text_as_block(remaining)
+        else:
+            yield from _flush_text_as_block(text_buffer.strip())
 
     # Close last content block
     if current_block_type is not None:
@@ -345,6 +421,10 @@ def _stream_claude_events(
     usage = res.get("usage", {}) or {}
     output_tokens = int(usage.get("completion_tokens", 0) or 0)
     has_tool_calls = bool(res.get("tool_calls"))
+    # Also check for XML-parsed tool calls in the result content
+    result_content = res.get("content", "") or ""
+    if not has_tool_calls and "<function_calls>" in result_content:
+        has_tool_calls = True
     stop_reason = "tool_use" if has_tool_calls else "end_turn"
 
     yield sse_message_delta(output_tokens=output_tokens, stop_reason=stop_reason).encode("utf-8")
