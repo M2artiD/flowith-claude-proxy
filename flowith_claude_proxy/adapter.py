@@ -247,10 +247,12 @@ def _convert_tool_messages(
                 text_parts = []
                 tool_calls = []
 
+            # Flowith doesn't accept role="tool"; convert to user message
+            tool_id = block.get("tool_use_id", "")
+            result_text = _extract_text(block.get("content", ""))
             result.append({
-                "role": "tool",
-                "tool_call_id": block.get("tool_use_id", ""),
-                "content": _extract_text(block.get("content", "")),
+                "role": "user",
+                "content": f"[Tool Result (id={tool_id})]\n{result_text}",
             })
 
     if text_parts or tool_calls:
