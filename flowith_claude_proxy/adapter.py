@@ -125,14 +125,74 @@ def _has_tool_blocks(content: Any) -> bool:
 # ---------------------------------------------------------------
 # Claude request -> Flowith (OpenAI-compatible) messages
 # ---------------------------------------------------------------
-def claude_request_to_flowith_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
+def _build_tool_xml_prompt(anthropic_tools: list[dict[str, Any]]) -> str:
+    """Generate XML-format tool-use instructions from Anthropic tool definitions.
+
+    Injects into the system prompt so the upstream model (which may not
+    support native function calling) knows to output <function_calls> XML.
+    """
+    if not anthropic_tools:
+        return ""
+
+    tool_descs: list[str] = []
+    for tool in anthropic_tools:
+        name = tool.get("name", "")
+        desc = tool.get("description", "")
+        schema = tool.get("input_schema", {})
+        props = schema.get("properties", {})
+        required = schema.get("required", [])
+
+        param_parts: list[str] = []
+        for pname, pinfo in props.items():
+            ptype = pinfo.get("type", "string")
+            pdesc = pinfo.get("description", "")
+            is_req = "required" if pname in required else "optional"
+            param_parts.append(f"    {pname} ({ptype}, {is_req}): {pdesc}")
+
+        param_str = "\n".join(param_parts) if param_parts else "    (no parameters)"
+        tool_descs.append(
+            f"### {name}\n{desc}\nParameters:\n{param_str}"
+        )
+
+    tool_list = "\n\n".join(tool_descs)
+
+    return (
+        "\n\n## Tool Use Instructions\n\n"
+        "You have access to the following tools. To use a tool, output it "
+        "in this EXACT XML format inside your response:\n\n"
+        "<function_calls>\n"
+        "<invoke name=\"TOOL_NAME\">\n"
+        "<parameter name=\"PARAM_NAME\">PARAM_VALUE</parameter>\n"
+        "</invoke>\n"
+        "</function_calls>\n\n"
+        "Rules:\n"
+        "- NEVER output <function_calls> XML unless you are actually calling a tool.\n"
+        "- Each <function_calls> block can contain multiple <invoke> elements.\n"
+        "- Parameter values should be literal strings (not JSON-encoded) unless the "
+        "parameter description says otherwise.\n"
+        "- After outputting a tool call, STOP — the tool result will be provided.\n\n"
+        f"{tool_list}\n"
+    )
+
+
+def claude_request_to_flowith_messages(
+    body: dict[str, Any],
+    anthropic_tools: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
 
     system = body.get("system")
-    if system:
-        sys_text = _extract_text(system)
-        if sys_text:
-            messages.append({"role": "system", "content": sys_text})
+    sys_text = _extract_text(system) if system else ""
+
+    # Inject XML tool-use instructions so the upstream model knows how to
+    # call tools even when it doesn't support native function calling.
+    if anthropic_tools:
+        xml_prompt = _build_tool_xml_prompt(anthropic_tools)
+        if xml_prompt:
+            sys_text = (sys_text + xml_prompt) if sys_text else xml_prompt
+
+    if sys_text:
+        messages.append({"role": "system", "content": sys_text})
 
     for msg in body.get("messages", []) or []:
         role = msg.get("role", "user")
