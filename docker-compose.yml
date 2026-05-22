@@ -1,0 +1,9 @@
+services:
+  flowith-proxy:
+    build: .
+    container_name: flowith-claude-proxy
+    ports:
+      - "${FLOWITH_API_PORT:-8787}:8787"
+    env_file:
+      - .env
+    restart: unless-stopped
