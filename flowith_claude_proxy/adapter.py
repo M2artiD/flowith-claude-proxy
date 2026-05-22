@@ -266,7 +266,7 @@ def _build_assistant_msg(
 ) -> dict[str, Any]:
     msg: dict[str, Any] = {"role": "assistant"}
     combined = "\n".join(p for p in text_parts if p)
-    msg["content"] = combined or None
+    msg["content"] = combined or ""
     if tool_calls:
         msg["tool_calls"] = tool_calls
     return msg
