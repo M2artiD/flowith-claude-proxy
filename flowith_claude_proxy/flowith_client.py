@@ -49,9 +49,11 @@ class FlowithClient:
         max_retries: int = 1,
         stream: bool = False,
         on_chunk: Callable[[str], None] | None = None,
+        on_reasoning: Callable[[str], None] | None = None,
         on_tool_call: Callable[[dict[str, Any]], None] | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
+        thinking: bool | None = None,
     ) -> dict[str, Any]:
         use_model = model or self.model
         last_error: Exception | None = None
@@ -60,11 +62,13 @@ class FlowithClient:
             try:
                 start = time.time()
 
+                use_thinking = thinking if thinking is not None else self.thinking
+
                 payload: dict[str, Any] = {
                     "models": [use_model],
                     "messages": messages,
                     "stream": stream,
-                    "thinking": self.thinking,
+                    "thinking": use_thinking,
                 }
                 if tools:
                     payload["tools"] = tools
@@ -86,7 +90,7 @@ class FlowithClient:
                 else:
                     if stream:
                         return self._parse_stream(
-                            response, elapsed_ms, on_chunk, on_tool_call
+                            response, elapsed_ms, on_chunk, on_reasoning, on_tool_call
                         )
 
                     result = response.json()
@@ -127,6 +131,7 @@ class FlowithClient:
         response: requests.Response,
         elapsed_ms: float,
         on_chunk: Callable[[str], None] | None,
+        on_reasoning: Callable[[str], None] | None,
         on_tool_call: Callable[[dict[str, Any]], None] | None,
     ) -> dict[str, Any]:
         content_parts: list[str] = []
@@ -164,6 +169,8 @@ class FlowithClient:
                 reasoning = delta.get("reasoning_content")
                 if reasoning:
                     reasoning_parts.append(reasoning)
+                    if on_reasoning:
+                        on_reasoning(reasoning)
 
                 # Accumulate tool call deltas
                 tc_deltas = delta.get("tool_calls")

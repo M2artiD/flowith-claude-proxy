@@ -28,6 +28,7 @@ from .adapter import (
     sse_message_start,
     sse_message_stop,
     sse_ping,
+    sse_thinking_delta,
     sse_tool_input_delta,
 )
 from .config import (
@@ -121,6 +122,10 @@ async def create_message(
     flowith_model = map_model(requested_model, default=DEFAULT_MODEL)
     stream = bool(body.get("stream"))
 
+    # Parse thinking config from Claude Code request
+    raw_thinking = body.get("thinking")
+    enable_thinking = isinstance(raw_thinking, dict) and raw_thinking.get("type") == "enabled"
+
     # Convert tool definitions and tool_choice
     openai_tools = None
     openai_tool_choice = None
@@ -159,6 +164,7 @@ async def create_message(
             stream=False,
             tools=openai_tools,
             tool_choice=openai_tool_choice,
+            thinking=enable_thinking,
         )
         if not result.get("success"):
             return JSONResponse(
@@ -182,6 +188,7 @@ async def create_message(
             client, messages, requested_model,
             openai_tools=openai_tools,
             openai_tool_choice=openai_tool_choice,
+            enable_thinking=enable_thinking,
         ),
         media_type="text/event-stream; charset=utf-8",
         headers={
@@ -201,6 +208,7 @@ def _stream_claude_events(
     requested_model: str,
     openai_tools: list[dict[str, Any]] | None = None,
     openai_tool_choice: Any = None,
+    enable_thinking: bool = False,
 ) -> Generator[bytes, None, None]:
     q: "queue.Queue[Any]" = queue.Queue(maxsize=512)
     result_holder: dict[str, Any] = {}
@@ -208,6 +216,10 @@ def _stream_claude_events(
     def on_chunk(piece: str) -> None:
         if piece:
             q.put(("text", piece))
+
+    def on_reasoning(piece: str) -> None:
+        if piece:
+            q.put(("reasoning", piece))
 
     def on_tool_call(tc: dict[str, Any]) -> None:
         q.put(("tool_call", tc))
@@ -219,9 +231,11 @@ def _stream_claude_events(
                 max_retries=1,
                 stream=True,
                 on_chunk=on_chunk,
+                on_reasoning=on_reasoning,
                 on_tool_call=on_tool_call,
                 tools=openai_tools,
                 tool_choice=openai_tool_choice,
+                thinking=enable_thinking,
             )
             result_holder["result"] = res
         except Exception as e:  # pragma: no cover
@@ -264,7 +278,17 @@ def _stream_claude_events(
 
         kind, payload = item
 
-        if kind == "text":
+        if kind == "reasoning":
+            if current_block_type != "thinking":
+                if current_block_type is not None:
+                    yield sse_content_block_stop(current_block_index).encode("utf-8")
+                    current_block_index += 1
+                yield sse_content_block_start(current_block_index, block_type="thinking").encode("utf-8")
+                current_block_type = "thinking"
+            streamed_any = True
+            yield sse_thinking_delta(payload, current_block_index).encode("utf-8")
+
+        elif kind == "text":
             # Open text block if not open or if current is tool_use
             if current_block_type != "text":
                 if current_block_type is not None:

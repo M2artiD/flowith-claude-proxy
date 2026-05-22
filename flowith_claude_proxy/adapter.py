@@ -245,12 +245,15 @@ def flowith_result_to_claude_response(
     requested_model: str,
 ) -> dict[str, Any]:
     content_text = flowith_result.get("content", "") or ""
+    reasoning_text = flowith_result.get("reasoning_content", "") or ""
     tool_calls = flowith_result.get("tool_calls") or []
     usage = flowith_result.get("usage", {}) or {}
     input_tokens = int(usage.get("prompt_tokens", 0) or 0)
     output_tokens = int(usage.get("completion_tokens", 0) or 0)
 
     content: list[dict[str, Any]] = []
+    if reasoning_text:
+        content.append({"type": "thinking", "thinking": reasoning_text})
     if content_text:
         content.append({"type": "text", "text": content_text})
     if tool_calls:
@@ -311,7 +314,9 @@ def sse_message_start(message_id: str, requested_model: str, input_tokens: int =
 
 def sse_content_block_start(index: int = 0, block_type: str = "text", tool_id: str = "", tool_name: str = "") -> str:
     content_block: dict[str, Any] = {"type": block_type}
-    if block_type == "text":
+    if block_type == "thinking":
+        content_block["thinking"] = ""
+    elif block_type == "text":
         content_block["text"] = ""
     elif block_type == "tool_use":
         content_block["id"] = tool_id
@@ -334,6 +339,17 @@ def sse_content_block_delta(text: str, index: int = 0) -> str:
             "type": "content_block_delta",
             "index": index,
             "delta": {"type": "text_delta", "text": text},
+        },
+    )
+
+
+def sse_thinking_delta(thinking: str, index: int = 0) -> str:
+    return _sse(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "thinking_delta", "thinking": thinking},
         },
     )
 
