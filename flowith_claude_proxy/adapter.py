@@ -14,6 +14,7 @@ Key capabilities:
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any
 
@@ -210,6 +211,98 @@ def _build_assistant_msg(
 
 
 # ---------------------------------------------------------------
+# XML tool call parser (Flowith returns tool calls as XML text)
+# ---------------------------------------------------------------
+_XML_FUNC_RE = re.compile(
+    r"<function_calls>(.*?)</function_calls>",
+    re.DOTALL,
+)
+_XML_INVOKE_RE = re.compile(
+    r"<invoke\s+name=\"([^\"]+)\">(.*?)</invoke>",
+    re.DOTALL,
+)
+_XML_PARAM_RE = re.compile(
+    r"<parameter\s+name=\"([^\"]+)\">(.*?)</parameter>",
+    re.DOTALL,
+)
+
+
+def parse_xml_tool_calls(text: str) -> list[dict[str, Any]]:
+    """Parse Flowith-style XML tool calls from text content.
+
+    Returns a list of dicts with keys: id, name, input.
+    """
+    if "<function_calls>" not in text:
+        return []
+
+    results: list[dict[str, Any]] = []
+    for func_match in _XML_FUNC_RE.finditer(text):
+        func_body = func_match.group(1)
+        for invoke_match in _XML_INVOKE_RE.finditer(func_body):
+            tool_name = invoke_match.group(1)
+            invoke_body = invoke_match.group(2)
+            params: dict[str, Any] = {}
+            for param_match in _XML_PARAM_RE.finditer(invoke_body):
+                p_name = param_match.group(1)
+                p_value = param_match.group(2)
+                try:
+                    params[p_name] = json.loads(p_value)
+                except (json.JSONDecodeError, ValueError):
+                    params[p_name] = p_value
+            results.append({
+                "id": f"toolu_{uuid.uuid4().hex[:24]}",
+                "name": tool_name,
+                "input": params,
+            })
+    return results
+
+
+def split_text_and_xml_tool_calls(text: str) -> list[dict[str, Any]]:
+    """Split text into Anthropic content blocks, extracting XML tool calls.
+
+    Returns a list of content blocks: {"type": "text", "text": ...} and
+    {"type": "tool_use", "id": ..., "name": ..., "input": ...}.
+    """
+    if "<function_calls>" not in text:
+        return [{"type": "text", "text": text}] if text else []
+
+    blocks: list[dict[str, Any]] = []
+    last_end = 0
+
+    for func_match in _XML_FUNC_RE.finditer(text):
+        pre_text = text[last_end:func_match.start()].strip()
+        if pre_text:
+            blocks.append({"type": "text", "text": pre_text})
+
+        func_body = func_match.group(1)
+        for invoke_match in _XML_INVOKE_RE.finditer(func_body):
+            tool_name = invoke_match.group(1)
+            invoke_body = invoke_match.group(2)
+            params: dict[str, Any] = {}
+            for param_match in _XML_PARAM_RE.finditer(invoke_body):
+                p_name = param_match.group(1)
+                p_value = param_match.group(2)
+                try:
+                    params[p_name] = json.loads(p_value)
+                except (json.JSONDecodeError, ValueError):
+                    params[p_name] = p_value
+            blocks.append({
+                "type": "tool_use",
+                "id": f"toolu_{uuid.uuid4().hex[:24]}",
+                "name": tool_name,
+                "input": params,
+            })
+
+        last_end = func_match.end()
+
+    post_text = text[last_end:].strip()
+    if post_text:
+        blocks.append({"type": "text", "text": post_text})
+
+    return blocks
+
+
+# ---------------------------------------------------------------
 # OpenAI tool_calls -> Anthropic content blocks
 # ---------------------------------------------------------------
 def openai_tool_calls_to_anthropic(
@@ -254,15 +347,23 @@ def flowith_result_to_claude_response(
     content: list[dict[str, Any]] = []
     if reasoning_text:
         content.append({"type": "thinking", "thinking": reasoning_text})
-    if content_text:
+
+    # Check for XML tool calls in content text (Flowith returns tool calls as XML)
+    has_xml_tool_calls = "<function_calls>" in content_text
+
+    if has_xml_tool_calls:
+        content.extend(split_text_and_xml_tool_calls(content_text))
+    elif content_text:
         content.append({"type": "text", "text": content_text})
+
     if tool_calls:
         content.extend(openai_tool_calls_to_anthropic(tool_calls))
 
     if not content:
         content.append({"type": "text", "text": ""})
 
-    stop_reason = "tool_use" if tool_calls else "end_turn"
+    has_any_tool_use = any(b.get("type") == "tool_use" for b in content)
+    stop_reason = "tool_use" if (tool_calls or has_any_tool_use) else "end_turn"
 
     return {
         "id": new_message_id(),
