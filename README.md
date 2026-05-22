@@ -35,6 +35,30 @@ the official Anthropic SDKs, Cline, etc. — talk to Flowith-hosted models
   V2Ray, etc.) via `FLOWITH_UPSTREAM_PROXY`.
 - Zero coupling: standalone project. Drop it anywhere and `pip install`.
 
+## Quick start
+
+**Windows** — double-click `start.ps1` or run:
+
+```powershell
+.\start.ps1
+```
+
+**Linux / macOS**:
+
+```bash
+./start.sh
+```
+
+**Docker**:
+
+```bash
+docker compose up -d
+```
+
+The script handles venv activation, dependency install, and `.env` setup automatically.
+
+---
+
 ## Install
 
 ```bash
@@ -160,6 +184,14 @@ FLOWITH_MODEL_ALIASES={"claude-3-5-sonnet-20241022":"claude-opus-4.7"}
 ```
 
 ## Docker
+
+One-command start with compose:
+
+```bash
+docker compose up -d
+```
+
+Or manual build and run:
 
 ```bash
 docker build -t flowith-claude-proxy .
