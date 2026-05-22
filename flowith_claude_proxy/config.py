@@ -47,6 +47,12 @@ UPSTREAM_PROXIES: dict[str, str] | None = None
 if _https_proxy:
     UPSTREAM_PROXIES = {"https": _https_proxy, "http": _http_proxy or _https_proxy}
 
+# Debug: dump raw upstream request/response to files. Set to "true" to enable.
+DEBUG_DUMP = os.environ.get("FLOWITH_DEBUG_DUMP", "false").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+DEBUG_DUMP_DIR = os.environ.get("FLOWITH_DEBUG_DUMP_DIR", str(_PROJECT_ROOT / "debug_dumps"))
+
 # Server bind defaults
 DEFAULT_HOST = os.environ.get("FLOWITH_API_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("FLOWITH_API_PORT", "8787"))

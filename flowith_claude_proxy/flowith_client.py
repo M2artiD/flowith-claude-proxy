@@ -7,11 +7,59 @@ blocking and streaming modes, returning a normalized dict.
 from __future__ import annotations
 
 import json
+import os
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 import requests
 from requests.exceptions import RequestException, SSLError
+
+from .config import DEBUG_DUMP, DEBUG_DUMP_DIR
+
+
+def _dump_intercept(
+    payload: dict[str, Any],
+    response_status: int,
+    response_headers: dict[str, str],
+    response_body: str,
+    is_stream: bool,
+    upstream_model: str | None,
+) -> None:
+    """Write a complete request/response dump to a timestamped JSON file."""
+    if not DEBUG_DUMP:
+        return
+
+    dump_dir = Path(DEBUG_DUMP_DIR)
+    dump_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    stream_label = "stream" if is_stream else "nonstream"
+    dump_path = dump_dir / f"flowith_{stream_label}_{ts}.json"
+
+    dump = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "request": {
+            "method": "POST",
+            "url": os.environ.get("FLOWITH_BASE_URL", "https://edge.flowith.io/external/use/llm"),
+            "payload": payload,
+        },
+        "response": {
+            "status": response_status,
+            "headers": response_headers,
+            "body": response_body,
+        },
+        "upstream_model": upstream_model,
+    }
+
+    with open(dump_path, "w", encoding="utf-8") as f:
+        json.dump(dump, f, ensure_ascii=False, indent=2)
+
+    print(
+        f"[intercept] Dumped upstream {stream_label} call → {dump_path}",
+        flush=True,
+    )
 
 
 class FlowithClient:
@@ -84,16 +132,38 @@ class FlowithClient:
                 elapsed_ms = (time.time() - start) * 1000
 
                 if response.status_code != 200:
+                    _dump_intercept(
+                        payload=payload,
+                        response_status=response.status_code,
+                        response_headers=dict(response.headers),
+                        response_body=response.text[:2000],
+                        is_stream=stream,
+                        upstream_model=None,
+                    )
                     last_error = Exception(
                         f"HTTP {response.status_code}: {response.text[:300]}"
                     )
                 else:
                     if stream:
                         return self._parse_stream(
-                            response, elapsed_ms, on_chunk, on_reasoning, on_tool_call
+                            response, elapsed_ms, payload,
+                            on_chunk, on_reasoning, on_tool_call,
                         )
 
+                    resp_body = response.text
                     result = response.json()
+                    upstream_model = result.get("model")
+
+                    # Dump non-streaming response
+                    _dump_intercept(
+                        payload=payload,
+                        response_status=response.status_code,
+                        response_headers=dict(response.headers),
+                        response_body=resp_body,
+                        is_stream=False,
+                        upstream_model=upstream_model,
+                    )
+
                     if result.get("choices"):
                         msg = result["choices"][0]["message"]
                         tool_calls = msg.get("tool_calls")
@@ -105,6 +175,7 @@ class FlowithClient:
                             "reasoning_content": msg.get("reasoning_content", "") or "",
                             "tool_calls": tool_calls,
                             "finish_reason": result["choices"][0].get("finish_reason"),
+                            "upstream_model": upstream_model,
                         }
                     last_error = Exception("Upstream response has no choices")
 
@@ -130,6 +201,7 @@ class FlowithClient:
         self,
         response: requests.Response,
         elapsed_ms: float,
+        payload: dict[str, Any],
         on_chunk: Callable[[str], None] | None,
         on_reasoning: Callable[[str], None] | None,
         on_tool_call: Callable[[dict[str, Any]], None] | None,
@@ -137,14 +209,17 @@ class FlowithClient:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         usage: dict[str, Any] = {}
-        # Accumulate tool_call fragments: index -> {id, function: {name, arguments}}
         tool_call_accum: dict[int, dict[str, Any]] = {}
         finish_reason: str | None = None
+        upstream_model: str | None = None
+        raw_lines: list[str] = []
 
         for raw_line in response.iter_lines(decode_unicode=True):
             if not raw_line:
                 continue
             line = raw_line.strip()
+            raw_lines.append(line)
+
             if line.startswith("data:"):
                 line = line[5:].strip()
             if line == "[DONE]":
@@ -153,6 +228,8 @@ class FlowithClient:
                 chunk = json.loads(line)
             except Exception:
                 continue
+            if "model" in chunk and not upstream_model:
+                upstream_model = chunk["model"]
             if "usage" in chunk:
                 usage = chunk.get("usage", {}) or usage
             for choice in chunk.get("choices", []) or []:
@@ -192,6 +269,16 @@ class FlowithClient:
                         if func_delta.get("arguments"):
                             entry["function"]["arguments"] += func_delta["arguments"]
 
+        # Dump streaming response (collect raw lines, not re-split)
+        _dump_intercept(
+            payload=payload,
+            response_status=response.status_code,
+            response_headers=dict(response.headers),
+            response_body="\n".join(raw_lines),
+            is_stream=True,
+            upstream_model=upstream_model,
+        )
+
         # Finalize tool calls and notify
         tool_calls: list[dict[str, Any]] | None = None
         if tool_call_accum:
@@ -208,4 +295,5 @@ class FlowithClient:
             "reasoning_content": "".join(reasoning_parts),
             "tool_calls": tool_calls,
             "finish_reason": finish_reason,
+            "upstream_model": upstream_model,
         }
