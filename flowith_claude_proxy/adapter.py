@@ -338,6 +338,25 @@ def _find_outside_cdata(text: str, needle: str, start: int = 0) -> int:
         return idx
 
 
+def _rfind_outside_cdata(text: str, needle: str, start: int = 0, end: int | None = None) -> int:
+    """Like rfind, but skip occurrences that lie inside a CDATA section."""
+    if end is None:
+        end = len(text)
+    pos = end
+    while True:
+        idx = text.rfind(needle, start, pos)
+        if idx == -1:
+            return -1
+        cdata_start = text.rfind(_CDATA_START, 0, idx)
+        if cdata_start != -1:
+            cdata_end = text.find(_CDATA_END, cdata_start)
+            if cdata_end != -1 and idx < cdata_end:
+                # Match is inside CDATA — search before this CDATA section
+                pos = cdata_start
+                continue
+        return idx
+
+
 def _extract_cdata_or_text(raw: str) -> str:
     """Extract value from CDATA or raw text with XML entity unescaping."""
     stripped = raw.strip()
@@ -542,8 +561,10 @@ def flowith_result_to_claude_response(
     if reasoning_text:
         content.append({"type": "thinking", "thinking": reasoning_text})
 
-    # Check for XML tool calls in content text (Flowith returns tool calls as XML)
-    has_xml_tool_calls = "<function_calls>" in content_text
+    # Check for XML tool calls in content text (Flowith returns tool calls as XML).
+    # Use CDATA-aware search so literal <function_calls> inside a parameter
+    # value is not mistaken for a structural block.
+    has_xml_tool_calls = _find_outside_cdata(content_text, "<function_calls>") != -1
 
     if has_xml_tool_calls:
         content.extend(split_text_and_xml_tool_calls(content_text))

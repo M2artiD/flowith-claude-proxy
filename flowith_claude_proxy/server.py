@@ -13,6 +13,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__
 from .adapter import (
+    _find_outside_cdata,
+    _rfind_outside_cdata,
     anthropic_tool_choice_to_openai,
     anthropic_tools_to_openai,
     claude_request_to_flowith_messages,
@@ -348,7 +350,10 @@ def _stream_claude_events(
             if tools:
                 for tool in tools:
                     yield from _emit_tool_use_block(tool)
-            last_close = buf.rfind("</function_calls>")
+            # Use CDATA-aware rfind so a </function_calls> literal inside
+            # a parameter value (e.g. echo "</function_calls>") is not
+            # mistaken for the structural close tag.
+            last_close = _rfind_outside_cdata(buf, "</function_calls>")
             if last_close != -1:
                 remaining = buf[last_close + len("</function_calls>"):]
                 xml_parsing = "<function_calls>" in remaining
@@ -478,10 +483,12 @@ def _stream_claude_events(
     finish_reason = res.get("finish_reason") or ""
 
     has_tool_calls = bool(res.get("tool_calls"))
-    # Also check for XML-parsed tool calls in the result content
-    result_content = res.get("content", "") or ""
-    if not has_tool_calls and "<function_calls>" in result_content:
-        has_tool_calls = True
+    # Also check for XML-parsed tool calls in the result content.
+    # Use CDATA-aware search so a literal <function_calls> inside a
+    # parameter value doesn't falsely trigger tool_use stop reason.
+    if not has_tool_calls:
+        result_content = res.get("content", "") or ""
+        has_tool_calls = _find_outside_cdata(result_content, "<function_calls>") != -1
 
     # Map OpenAI finish_reason to Anthropic stop_reason
     if has_tool_calls:
