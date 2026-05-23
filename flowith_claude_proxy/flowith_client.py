@@ -82,13 +82,24 @@ class FlowithClient:
         self.proxies = proxies
 
         self._session = requests.Session()
-        self._session.verify = ssl_verify
         self._session.proxies = proxies or {}
         self._session.headers.update({"Authorization": f"Bearer {self.api_key}"})
+        # Prevent system proxy/SSL env vars from interfering with explicit config
+        self._session.trust_env = False
 
         if not ssl_verify:
+            import ssl
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            # Use an explicit no-verify SSL context instead of verify=False.
+            # On Windows + HTTP proxy, urllib3 >= 2.0 with verify=False can
+            # intermittently raise FileNotFoundError on socket reuse.
+            _ctx = ssl.create_default_context()
+            _ctx.check_hostname = False
+            _ctx.verify_mode = ssl.CERT_NONE
+            self._session.verify = _ctx
+        else:
+            self._session.verify = True
 
     def call_api(
         self,
