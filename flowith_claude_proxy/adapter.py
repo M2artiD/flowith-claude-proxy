@@ -443,71 +443,170 @@ def _parse_invoke_elements(func_body: str, results: list[dict[str, Any]]) -> Non
 def parse_xml_tool_calls(text: str) -> list[dict[str, Any]]:
     """Parse Flowith-style XML tool calls with CDATA support.
 
-    Returns a list of dicts with keys: id, name, input.
-    Handles both CDATA-wrapped parameters and raw text (fallback).
-    Uses CDATA-aware search so structural tags inside CDATA values
-    (e.g. shell commands echoing XML-like strings) don't break parsing.
-    """
-    if _TAG_FUNC_OPEN not in text:
-        return []
+    Handles two upstream formats:
+      - <function_calls><invoke name="X"><parameter>...</invoke></function_calls>
+      - <tool_call>{"name":"X","parameters":{...}}</tool_call>  (DeepSeek native)
 
+    Returns a list of dicts with keys: id, name, input.
+    """
+    results: list[dict[str, Any]] = []
+
+    # ---- <function_calls> blocks ----
+    if _TAG_FUNC_OPEN in text:
+        pos = 0
+        while True:
+            start = text.find(_TAG_FUNC_OPEN, pos)
+            if start == -1:
+                break
+            content_start = start + len(_TAG_FUNC_OPEN)
+            end = _find_outside_cdata(text, _TAG_FUNC_CLOSE, content_start)
+            if end == -1:
+                break
+            func_body = text[content_start:end]
+            _parse_invoke_elements(func_body, results)
+            pos = end + len(_TAG_FUNC_CLOSE)
+
+    # ---- <tool_call> blocks ----
+    if _TAG_TOOL_CALL_OPEN in text:
+        pos = 0
+        while True:
+            start = text.find(_TAG_TOOL_CALL_OPEN, pos)
+            if start == -1:
+                break
+            content_start = start + len(_TAG_TOOL_CALL_OPEN)
+            end = text.find(_TAG_TOOL_CALL_CLOSE, content_start)
+            if end == -1:
+                break
+            json_text = text[content_start:end].strip()
+            try:
+                tc = json.loads(json_text)
+                results.append({
+                    "id": f"toolu_{uuid.uuid4().hex[:24]}",
+                    "name": tc.get("name", ""),
+                    "input": tc.get("parameters", tc.get("arguments", {})),
+                })
+            except json.JSONDecodeError:
+                pass
+            pos = end + len(_TAG_TOOL_CALL_CLOSE)
+
+    return results
+
+
+def _parse_tool_call_json(text: str) -> list[dict[str, Any]]:
+    """Parse <tool_call>{"name":..., "parameters":...}</tool_call> blocks.
+
+    Some upstream models (DeepSeek) use this format instead of the
+    <function_calls><invoke><parameter> XML format.
+    """
     results: list[dict[str, Any]] = []
     pos = 0
     while True:
-        start = text.find(_TAG_FUNC_OPEN, pos)
+        start = text.find("<tool_call>", pos)
         if start == -1:
             break
-        content_start = start + len(_TAG_FUNC_OPEN)
-        end = _find_outside_cdata(text, _TAG_FUNC_CLOSE, content_start)
+        content_start = start + len("<tool_call>")
+        end = text.find("</tool_call>", content_start)
         if end == -1:
             break
-        func_body = text[content_start:end]
-        _parse_invoke_elements(func_body, results)
-        pos = end + len(_TAG_FUNC_CLOSE)
+        json_text = text[content_start:end].strip()
+        try:
+            tc = json.loads(json_text)
+            results.append({
+                "type": "tool_use",
+                "id": f"toolu_{uuid.uuid4().hex[:24]}",
+                "name": tc.get("name", ""),
+                "input": tc.get("parameters", tc.get("arguments", {})),
+            })
+        except json.JSONDecodeError:
+            pass
+        pos = end + len("</tool_call>")
     return results
+
+
+_TAG_TOOL_CALL_OPEN = "<tool_call>"
+_TAG_TOOL_CALL_CLOSE = "</tool_call>"
 
 
 def split_text_and_xml_tool_calls(text: str) -> list[dict[str, Any]]:
     """Split text into Anthropic content blocks, extracting XML tool calls.
 
+    Handles two XML formats:
+      - <function_calls><invoke name="X"><parameter>...</invoke></function_calls>
+      - <tool_call>{"name":"X","parameters":{...}}</tool_call>  (DeepSeek native)
+
     Returns a list of content blocks: {"type": "text", "text": ...} and
     {"type": "tool_use", "id": ..., "name": ..., "input": ...}.
-    Uses the same robust CDATA-aware parser as parse_xml_tool_calls.
     """
-    if _TAG_FUNC_OPEN not in text:
+    has_func_calls = _TAG_FUNC_OPEN in text
+    has_tool_calls = _TAG_TOOL_CALL_OPEN in text
+
+    if not has_func_calls and not has_tool_calls:
         return [{"type": "text", "text": text}] if text else []
 
-    blocks: list[dict[str, Any]] = []
-    last_end = 0
+    # Collect all tool_use blocks with their text positions, then emit
+    # text blocks for the gaps between them.
+    spans: list[tuple[int, int, dict[str, Any]]] = []  # (start, end, content_block)
     pos = 0
 
+    # ---- <function_calls> blocks ----
     while True:
         start = text.find(_TAG_FUNC_OPEN, pos)
         if start == -1:
             break
-        # Text before this function_calls block
-        pre_text = text[last_end:start].strip()
-        if pre_text:
-            blocks.append({"type": "text", "text": pre_text})
-
         content_start = start + len(_TAG_FUNC_OPEN)
         end = _find_outside_cdata(text, _TAG_FUNC_CLOSE, content_start)
         if end == -1:
             break
+        block_end = end + len(_TAG_FUNC_CLOSE)
         func_body = text[content_start:end]
-        # Parse tool calls from this block
-        tool_results: list[dict[str, Any]] = []
-        _parse_invoke_elements(func_body, tool_results)
-        # Add type marker for content-block compatibility
-        for tr in tool_results:
-            tr["type"] = "tool_use"
-        blocks.extend(tool_results)
+        tool_blocks: list[dict[str, Any]] = []
+        _parse_invoke_elements(func_body, tool_blocks)
+        for tb in tool_blocks:
+            tb["type"] = "tool_use"
+            spans.append((start, block_end, tb))
+        pos = block_end
 
-        pos = end + len(_TAG_FUNC_CLOSE)
-        last_end = end + len(_TAG_FUNC_CLOSE)
+    # ---- <tool_call> blocks ----
+    pos = 0
+    while True:
+        start = text.find(_TAG_TOOL_CALL_OPEN, pos)
+        if start == -1:
+            break
+        content_start = start + len(_TAG_TOOL_CALL_OPEN)
+        end = text.find(_TAG_TOOL_CALL_CLOSE, content_start)
+        if end == -1:
+            break
+        block_end = end + len(_TAG_TOOL_CALL_CLOSE)
+        json_text = text[content_start:end].strip()
+        try:
+            tc = json.loads(json_text)
+            spans.append((start, block_end, {
+                "type": "tool_use",
+                "id": f"toolu_{uuid.uuid4().hex[:24]}",
+                "name": tc.get("name", ""),
+                "input": tc.get("parameters", tc.get("arguments", {})),
+            }))
+        except json.JSONDecodeError:
+            pass
+        pos = block_end
 
-    # Trailing text after all blocks
-    post_text = text[last_end:].strip()
+    if not spans:
+        return [{"type": "text", "text": text}] if text else []
+
+    # Sort spans by position and emit text+tool_use blocks
+    spans.sort(key=lambda s: s[0])
+    blocks: list[dict[str, Any]] = []
+    cursor = 0
+    for s_start, s_end, block in spans:
+        if s_start < cursor:
+            continue  # overlapping, skip
+        pre_text = text[cursor:s_start].strip()
+        if pre_text:
+            blocks.append({"type": "text", "text": pre_text})
+        blocks.append(block)
+        cursor = s_end
+
+    post_text = text[cursor:].strip()
     if post_text:
         blocks.append({"type": "text", "text": post_text})
 
@@ -561,10 +660,11 @@ def flowith_result_to_claude_response(
     if reasoning_text:
         content.append({"type": "thinking", "thinking": reasoning_text})
 
-    # Check for XML tool calls in content text (Flowith returns tool calls as XML).
-    # Use CDATA-aware search so literal <function_calls> inside a parameter
-    # value is not mistaken for a structural block.
-    has_xml_tool_calls = _find_outside_cdata(content_text, "<function_calls>") != -1
+    # Check for XML tool calls in content text (both supported formats).
+    has_xml_tool_calls = (
+        _find_outside_cdata(content_text, "<function_calls>") != -1
+        or "<tool_call>" in content_text
+    )
 
     if has_xml_tool_calls:
         content.extend(split_text_and_xml_tool_calls(content_text))

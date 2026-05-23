@@ -342,21 +342,27 @@ def _stream_claude_events(
 
     def _parse_and_emit_tools(buf: str) -> str:
         """Try to parse XML tool calls from buffer. Returns remaining text
-        after the last </function_calls> on success, or the original buffer
-        on parse failure (so text is emitted as-is, avoiding a hang)."""
+        after the last close-tag on success, or the original buffer on parse
+        failure (so text is emitted as-is, avoiding a hang).
+
+        Handles both <function_calls> and <tool_call> formats."""
         nonlocal xml_parsing
         try:
             tools = parse_xml_tool_calls(buf)
             if tools:
                 for tool in tools:
                     yield from _emit_tool_use_block(tool)
-            # Use CDATA-aware rfind so a </function_calls> literal inside
-            # a parameter value (e.g. echo "</function_calls>") is not
-            # mistaken for the structural close tag.
-            last_close = _rfind_outside_cdata(buf, "</function_calls>")
+            # Find the last structural close-tag, skipping CDATA regions.
+            # Check both <function_calls> and <tool_call> formats.
+            last_func = _rfind_outside_cdata(buf, "</function_calls>")
+            last_tool = buf.rfind("</tool_call>")  # <tool_call> has no nested tags, rfind is safe
+            last_close = max(last_func, last_tool)
             if last_close != -1:
-                remaining = buf[last_close + len("</function_calls>"):]
-                xml_parsing = "<function_calls>" in remaining
+                close_len = len("</function_calls>") if last_close == last_func else len("</tool_call>")
+                remaining = buf[last_close + close_len:]
+                xml_parsing = (
+                    "<function_calls>" in remaining or "<tool_call>" in remaining
+                )
                 return remaining
         except Exception:
             # Malformed XML — abandon parsing, emit buffer as plain text
@@ -399,15 +405,28 @@ def _stream_claude_events(
 
             text_buffer += payload
 
-            # Detect XML tool call start
-            if "<function_calls>" in text_buffer and not xml_parsing:
-                xml_parsing = True
-                pre_xml = text_buffer[:text_buffer.index("<function_calls>")]
-                if pre_xml.strip():
-                    yield from _flush_text_as_block(pre_xml.strip())
+            # Detect XML tool call start — handle both <function_calls>
+            # (injected prompt) and <tool_call> (DeepSeek native) formats.
+            if not xml_parsing:
+                func_idx = text_buffer.find("<function_calls>")
+                tool_idx = text_buffer.find("<tool_call>")
+                tag_start: int | None = None
+                # Use whichever appears first; prefer the non-CDATA one
+                if func_idx != -1:
+                    tag_start = func_idx
+                if tool_idx != -1 and (tag_start is None or tool_idx < tag_start):
+                    tag_start = tool_idx
+
+                if tag_start is not None:
+                    xml_parsing = True
+                    pre_xml = text_buffer[:tag_start]
+                    if pre_xml.strip():
+                        yield from _flush_text_as_block(pre_xml.strip())
 
             if xml_parsing:
-                if "</function_calls>" in text_buffer:
+                # Complete XML block(s) ready?
+                has_close = "</function_calls>" in text_buffer or "</tool_call>" in text_buffer
+                if has_close:
                     text_buffer = yield from _parse_and_emit_tools(text_buffer)
                     # Emit remaining non-XML text
                     if text_buffer and not xml_parsing:
@@ -415,10 +434,10 @@ def _stream_claude_events(
                             yield from _flush_text_as_block(text_buffer.strip())
                         text_buffer = ""
             else:
-                # Keep a trailing window so a <function_calls> tag split
-                # across SSE chunks isn't missed. The tag is 16 chars;
-                # 128-char window is generous enough for split attributes
-                # and long pre-tool text.
+                # Keep a trailing window so a <function_calls> / <tool_call>
+                # tag split across SSE chunks isn't missed.  <tool_call> is
+                # 10 chars; <function_calls> is 16 chars; 128-char window is
+                # generous enough for split attributes and long pre-tool text.
                 _TAG_WINDOW = 128
                 if len(text_buffer) > _TAG_WINDOW:
                     safe_text = text_buffer[:-_TAG_WINDOW]
@@ -483,12 +502,12 @@ def _stream_claude_events(
     finish_reason = res.get("finish_reason") or ""
 
     has_tool_calls = bool(res.get("tool_calls"))
-    # Also check for XML-parsed tool calls in the result content.
-    # Use CDATA-aware search so a literal <function_calls> inside a
-    # parameter value doesn't falsely trigger tool_use stop reason.
+    # Also check for XML-parsed tool calls (both supported formats).
     if not has_tool_calls:
         result_content = res.get("content", "") or ""
-        has_tool_calls = _find_outside_cdata(result_content, "<function_calls>") != -1
+        has_xml = _find_outside_cdata(result_content, "<function_calls>") != -1
+        has_native = "<tool_call>" in result_content
+        has_tool_calls = has_xml or has_native
 
     # Map OpenAI finish_reason to Anthropic stop_reason
     if has_tool_calls:
