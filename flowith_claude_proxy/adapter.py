@@ -288,49 +288,151 @@ def _build_assistant_msg(
 
 
 # ---------------------------------------------------------------
-# XML tool call parser (Flowith returns tool calls as XML text)
+# XML tool call parser (robust position-based, CDATA-aware)
 # ---------------------------------------------------------------
-_XML_FUNC_RE = re.compile(
-    r"<function_calls>(.*?)</function_calls>",
-    re.DOTALL,
-)
-_XML_INVOKE_RE = re.compile(
-    r"<invoke\s+name=\"([^\"]+)\">(.*?)</invoke>",
-    re.DOTALL,
-)
-_XML_PARAM_RE = re.compile(
-    r"<parameter\s+name=\"([^\"]+)\">(.*?)</parameter>",
-    re.DOTALL,
-)
+# Previous approach used non-greedy regex which breaks when parameter
+# values contain XML special characters (e.g. shell redirects, HTML).
+# This parser uses string.find + CDATA extraction, falling back to
+# regex patterns only for malformed XML that misses CDATA wrappers.
+
+_TAG_FUNC_OPEN = "<function_calls>"
+_TAG_FUNC_CLOSE = "</function_calls>"
+_TAG_INVOKE_OPEN = "<invoke"
+_TAG_INVOKE_CLOSE = "</invoke>"
+_TAG_PARAM_OPEN = "<parameter"
+_TAG_PARAM_CLOSE = "</parameter>"
+_CDATA_START = "<![CDATA["
+_CDATA_END = "]]>"
+_INVOKE_NAME_RE = re.compile(r'name="([^"]*)"')
+_PARAM_NAME_RE = re.compile(r'name="([^"]*)"')
+
+
+def _find_outside_cdata(text: str, needle: str, start: int = 0) -> int:
+    """Find *needle* in *text* skipping any occurrence that lies inside a
+    CDATA section.  Returns -1 when no CDATA-free match exists."""
+    pos = start
+    while True:
+        idx = text.find(needle, pos)
+        if idx == -1:
+            return -1
+        # Is this match inside a CDATA section?
+        cdata_start = text.rfind(_CDATA_START, start, idx)
+        if cdata_start != -1:
+            cdata_end = text.find(_CDATA_END, cdata_start)
+            if cdata_end != -1 and idx < cdata_end:
+                # Match is inside CDATA — skip past the CDATA section
+                pos = cdata_end + len(_CDATA_END)
+                continue
+        return idx
+
+
+def _extract_cdata_or_text(raw: str) -> str:
+    """Extract value from CDATA or raw text with XML entity unescaping."""
+    stripped = raw.strip()
+    if stripped.startswith(_CDATA_START) and stripped.endswith(_CDATA_END):
+        return stripped[len(_CDATA_START):-len(_CDATA_END)]
+    import html
+    return html.unescape(stripped)
+
+
+def _coerce_param_value(raw: str) -> Any:
+    """Try JSON parse, fall back to string."""
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return raw
+
+
+def _parse_parameter_elements(body: str) -> dict[str, Any]:
+    """Parse <parameter name=\"...\">...</parameter> from an invoke body.
+
+    Handles CDATA-wrapped values (preferred) and raw text (fallback).
+    Uses CDATA-aware search so that tags appearing inside CDATA sections
+    are never mistaken for structural markers.
+    """
+    params: dict[str, Any] = {}
+    pos = 0
+    while True:
+        tag_start = body.find(_TAG_PARAM_OPEN, pos)
+        if tag_start == -1:
+            break
+        # Extract name attribute from opening tag
+        tag_end = body.find(">", tag_start)
+        if tag_end == -1:
+            break
+        name_m = _PARAM_NAME_RE.search(body, tag_start, tag_end)
+        if not name_m:
+            pos = tag_end + 1
+            continue
+        p_name = name_m.group(1)
+        # Find matching close tag (skip any </parameter> inside CDATA)
+        close_start = _find_outside_cdata(body, _TAG_PARAM_CLOSE, tag_end + 1)
+        if close_start == -1:
+            break
+        raw_value = body[tag_end + 1:close_start]
+        p_value = _coerce_param_value(_extract_cdata_or_text(raw_value))
+        params[p_name] = p_value
+        pos = close_start + len(_TAG_PARAM_CLOSE)
+    return params
+
+
+def _parse_invoke_elements(func_body: str, results: list[dict[str, Any]]) -> None:
+    """Parse <invoke name=\"...\"> elements from a <function_calls> body.
+
+    Uses CDATA-aware search so that </invoke> inside a CDATA section is
+    never mistaken for a structural close-tag.
+    """
+    pos = 0
+    while True:
+        tag_start = func_body.find(_TAG_INVOKE_OPEN, pos)
+        if tag_start == -1:
+            break
+        tag_end = func_body.find(">", tag_start)
+        if tag_end == -1:
+            break
+        name_m = _INVOKE_NAME_RE.search(func_body, tag_start, tag_end)
+        if not name_m:
+            pos = tag_end + 1
+            continue
+        tool_name = name_m.group(1)
+        # Find matching </invoke> (skip any occurrence inside CDATA)
+        close_start = _find_outside_cdata(func_body, _TAG_INVOKE_CLOSE, tag_end + 1)
+        if close_start == -1:
+            break
+        invoke_body = func_body[tag_end + 1:close_start]
+        params = _parse_parameter_elements(invoke_body)
+        results.append({
+            "id": f"toolu_{uuid.uuid4().hex[:24]}",
+            "name": tool_name,
+            "input": params,
+        })
+        pos = close_start + len(_TAG_INVOKE_CLOSE)
 
 
 def parse_xml_tool_calls(text: str) -> list[dict[str, Any]]:
-    """Parse Flowith-style XML tool calls from text content.
+    """Parse Flowith-style XML tool calls with CDATA support.
 
     Returns a list of dicts with keys: id, name, input.
+    Handles both CDATA-wrapped parameters and raw text (fallback).
+    Uses CDATA-aware search so structural tags inside CDATA values
+    (e.g. shell commands echoing XML-like strings) don't break parsing.
     """
-    if "<function_calls>" not in text:
+    if _TAG_FUNC_OPEN not in text:
         return []
 
     results: list[dict[str, Any]] = []
-    for func_match in _XML_FUNC_RE.finditer(text):
-        func_body = func_match.group(1)
-        for invoke_match in _XML_INVOKE_RE.finditer(func_body):
-            tool_name = invoke_match.group(1)
-            invoke_body = invoke_match.group(2)
-            params: dict[str, Any] = {}
-            for param_match in _XML_PARAM_RE.finditer(invoke_body):
-                p_name = param_match.group(1)
-                p_value = param_match.group(2)
-                try:
-                    params[p_name] = json.loads(p_value)
-                except (json.JSONDecodeError, ValueError):
-                    params[p_name] = p_value
-            results.append({
-                "id": f"toolu_{uuid.uuid4().hex[:24]}",
-                "name": tool_name,
-                "input": params,
-            })
+    pos = 0
+    while True:
+        start = text.find(_TAG_FUNC_OPEN, pos)
+        if start == -1:
+            break
+        content_start = start + len(_TAG_FUNC_OPEN)
+        end = _find_outside_cdata(text, _TAG_FUNC_CLOSE, content_start)
+        if end == -1:
+            break
+        func_body = text[content_start:end]
+        _parse_invoke_elements(func_body, results)
+        pos = end + len(_TAG_FUNC_CLOSE)
     return results
 
 
@@ -339,39 +441,41 @@ def split_text_and_xml_tool_calls(text: str) -> list[dict[str, Any]]:
 
     Returns a list of content blocks: {"type": "text", "text": ...} and
     {"type": "tool_use", "id": ..., "name": ..., "input": ...}.
+    Uses the same robust CDATA-aware parser as parse_xml_tool_calls.
     """
-    if "<function_calls>" not in text:
+    if _TAG_FUNC_OPEN not in text:
         return [{"type": "text", "text": text}] if text else []
 
     blocks: list[dict[str, Any]] = []
     last_end = 0
+    pos = 0
 
-    for func_match in _XML_FUNC_RE.finditer(text):
-        pre_text = text[last_end:func_match.start()].strip()
+    while True:
+        start = text.find(_TAG_FUNC_OPEN, pos)
+        if start == -1:
+            break
+        # Text before this function_calls block
+        pre_text = text[last_end:start].strip()
         if pre_text:
             blocks.append({"type": "text", "text": pre_text})
 
-        func_body = func_match.group(1)
-        for invoke_match in _XML_INVOKE_RE.finditer(func_body):
-            tool_name = invoke_match.group(1)
-            invoke_body = invoke_match.group(2)
-            params: dict[str, Any] = {}
-            for param_match in _XML_PARAM_RE.finditer(invoke_body):
-                p_name = param_match.group(1)
-                p_value = param_match.group(2)
-                try:
-                    params[p_name] = json.loads(p_value)
-                except (json.JSONDecodeError, ValueError):
-                    params[p_name] = p_value
-            blocks.append({
-                "type": "tool_use",
-                "id": f"toolu_{uuid.uuid4().hex[:24]}",
-                "name": tool_name,
-                "input": params,
-            })
+        content_start = start + len(_TAG_FUNC_OPEN)
+        end = _find_outside_cdata(text, _TAG_FUNC_CLOSE, content_start)
+        if end == -1:
+            break
+        func_body = text[content_start:end]
+        # Parse tool calls from this block
+        tool_results: list[dict[str, Any]] = []
+        _parse_invoke_elements(func_body, tool_results)
+        # Add type marker for content-block compatibility
+        for tr in tool_results:
+            tr["type"] = "tool_use"
+        blocks.extend(tool_results)
 
-        last_end = func_match.end()
+        pos = end + len(_TAG_FUNC_CLOSE)
+        last_end = end + len(_TAG_FUNC_CLOSE)
 
+    # Trailing text after all blocks
     post_text = text[last_end:].strip()
     if post_text:
         blocks.append({"type": "text", "text": post_text})
