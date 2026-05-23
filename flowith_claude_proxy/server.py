@@ -185,12 +185,15 @@ async def create_message(
             content=flowith_result_to_claude_response(result, requested_model)
         )
 
+    has_tools = bool(openai_tools)
+
     return StreamingResponse(
         _stream_claude_events(
             client, messages, requested_model,
             openai_tools=openai_tools,
             openai_tool_choice=openai_tool_choice,
             enable_thinking=enable_thinking,
+            has_tools=has_tools,
         ),
         media_type="text/event-stream; charset=utf-8",
         headers={
@@ -211,6 +214,7 @@ def _stream_claude_events(
     openai_tools: list[dict[str, Any]] | None = None,
     openai_tool_choice: Any = None,
     enable_thinking: bool = False,
+    has_tools: bool = False,
 ) -> Generator[bytes, None, None]:
     q: "queue.Queue[Any]" = queue.Queue(maxsize=512)
     result_holder: dict[str, Any] = {}
@@ -258,7 +262,7 @@ def _stream_claude_events(
     last_ping = time.time()
 
     # XML tool call buffering: accumulate text chunks, detect XML patterns,
-    # then convert to tool_use content blocks instead of plain text
+    # then convert to tool_use content blocks instead of plain text.
     text_buffer = ""
     xml_parsing = False  # True once we detect <function_calls> start
 
@@ -285,7 +289,7 @@ def _stream_claude_events(
         yield sse_content_block_delta(text, current_block_index).encode("utf-8")
 
     def _emit_tool_use_block(tool: dict[str, Any]) -> None:
-        """Emit a complete tool_use content block."""
+        """Emit a tool_use content block with progressive input_json_delta."""
         nonlocal current_block_index, streamed_any
         yield from _close_block()
         yield from _open_block(
@@ -294,11 +298,38 @@ def _stream_claude_events(
             tool_name=tool["name"],
         )
         streamed_any = True
-        import json as _json
-        yield sse_tool_input_delta(
-            _json.dumps(tool["input"], ensure_ascii=False),
-            current_block_index,
-        ).encode("utf-8")
+        json_str = json.dumps(tool["input"], ensure_ascii=False)
+        # Progressive streaming: send in ~30 char chunks to mimic native
+        # Anthropic streaming behaviour. Single-chunk for very short JSON.
+        _CHUNK = 30
+        if len(json_str) <= _CHUNK * 2:
+            yield sse_tool_input_delta(json_str, current_block_index).encode("utf-8")
+        else:
+            for i in range(0, len(json_str), _CHUNK):
+                yield sse_tool_input_delta(
+                    json_str[i:i + _CHUNK], current_block_index
+                ).encode("utf-8")
+
+    def _parse_and_emit_tools(buf: str) -> str:
+        """Try to parse XML tool calls from buffer. Returns remaining text
+        after the last </function_calls> on success, or the original buffer
+        on parse failure (so text is emitted as-is, avoiding a hang)."""
+        nonlocal xml_parsing
+        try:
+            tools = parse_xml_tool_calls(buf)
+            if tools:
+                for tool in tools:
+                    yield from _emit_tool_use_block(tool)
+            last_close = buf.rfind("</function_calls>")
+            if last_close != -1:
+                remaining = buf[last_close + len("</function_calls>"):]
+                xml_parsing = "<function_calls>" in remaining
+                return remaining
+        except Exception:
+            # Malformed XML — abandon parsing, emit buffer as plain text
+            pass
+        xml_parsing = False
+        return buf
 
     while True:
         try:
@@ -324,42 +355,37 @@ def _stream_claude_events(
             yield sse_thinking_delta(payload, current_block_index).encode("utf-8")
 
         elif kind == "text":
+            # When no tools are present, forward chunks immediately.
+            if not has_tools:
+                if current_block_type != "text":
+                    yield from _close_block()
+                    yield from _open_block("text")
+                streamed_any = True
+                yield sse_content_block_delta(payload, current_block_index).encode("utf-8")
+                continue
+
             text_buffer += payload
 
             # Detect XML tool call start
             if "<function_calls>" in text_buffer and not xml_parsing:
                 xml_parsing = True
-                # Emit any text before the XML as a text block
                 pre_xml = text_buffer[:text_buffer.index("<function_calls>")]
                 if pre_xml.strip():
                     yield from _flush_text_as_block(pre_xml.strip())
 
             if xml_parsing:
-                # Wait until we have the complete XML block(s)
-                # Check if we have a closing tag
                 if "</function_calls>" in text_buffer:
-                    # Parse all complete XML tool calls
-                    tools = parse_xml_tool_calls(text_buffer)
-                    for tool in tools:
-                        yield from _emit_tool_use_block(tool)
-
-                    # Keep any trailing text after last </function_calls>
-                    last_close = text_buffer.rfind("</function_calls>") + len("</function_calls>")
-                    remaining = text_buffer[last_close:]
-                    text_buffer = remaining
-                    xml_parsing = "<function_calls>" in text_buffer
-
+                    text_buffer = yield from _parse_and_emit_tools(text_buffer)
                     # Emit remaining non-XML text
                     if text_buffer and not xml_parsing:
                         if text_buffer.strip():
                             yield from _flush_text_as_block(text_buffer.strip())
                         text_buffer = ""
-                # else: still buffering XML, don't emit yet
             else:
-                # No XML detected yet. Emit text safely but keep a trailing
-                # window in text_buffer so a <function_calls> tag split across
-                # SSE chunks isn't missed (tag is 16 chars, keep 24 for safety).
-                _TAG_WINDOW = 24
+                # Keep a trailing window so a <function_calls> tag split
+                # across SSE chunks isn't missed. The tag is 16 chars;
+                # 48-char window is generous enough for split attributes.
+                _TAG_WINDOW = 48
                 if len(text_buffer) > _TAG_WINDOW:
                     safe_text = text_buffer[:-_TAG_WINDOW]
                     if current_block_type != "text":
@@ -370,7 +396,7 @@ def _stream_claude_events(
                     text_buffer = text_buffer[-_TAG_WINDOW:]
 
         elif kind == "tool_call":
-            # Structured tool call from upstream (rare for Flowith)
+            # Structured tool call from upstream (native OpenAI tool_calls)
             yield from _close_block()
             tc_id = payload.get("id", f"toolu_{threading.get_ident()}")
             func = payload.get("function", {})
@@ -380,7 +406,14 @@ def _stream_claude_events(
             streamed_any = True
             raw_args = func.get("arguments", "{}")
             if raw_args:
-                yield sse_tool_input_delta(raw_args, current_block_index).encode("utf-8")
+                # Progressive JSON for native tool calls too
+                if len(raw_args) <= 60:
+                    yield sse_tool_input_delta(raw_args, current_block_index).encode("utf-8")
+                else:
+                    for i in range(0, len(raw_args), 30):
+                        yield sse_tool_input_delta(
+                            raw_args[i:i + 30], current_block_index
+                        ).encode("utf-8")
 
         if time.time() - last_ping > 15:
             yield sse_ping().encode("utf-8")
@@ -388,17 +421,9 @@ def _stream_claude_events(
 
     # Flush any remaining text buffer
     if text_buffer.strip():
-        # If still in XML parsing mode at stream end, try to parse what we have
         if xml_parsing:
-            tools = parse_xml_tool_calls(text_buffer)
-            for tool in tools:
-                yield from _emit_tool_use_block(tool)
-            # Any remaining text after parsing
-            import re
-            remaining = re.sub(r"<function_calls>.*?</function_calls>", "", text_buffer, flags=re.DOTALL).strip()
-            if remaining:
-                yield from _flush_text_as_block(remaining)
-        else:
+            text_buffer = yield from _parse_and_emit_tools(text_buffer)
+        if text_buffer.strip():
             yield from _flush_text_as_block(text_buffer.strip())
 
     # Close last content block
