@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 import requests
+from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException, SSLError
+from urllib3.util.retry import Retry
 
 from .config import DEBUG_DUMP, DEBUG_DUMP_DIR
 
@@ -62,6 +64,18 @@ def _dump_intercept(
     )
 
 
+_RETRY_STRATEGY = Retry(
+    total=3,
+    connect=2,          # retry TCP/TLS handshake failures
+    read=2,             # retry mid-stream read failures
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    # FileNotFoundError(2) on Windows is a connect-level failure —
+    # urllib3 will retry it because connect=2 covers socket errors.
+    raise_on_status=False,
+)
+
+
 class FlowithClient:
     def __init__(
         self,
@@ -81,25 +95,48 @@ class FlowithClient:
         self.ssl_verify = ssl_verify
         self.proxies = proxies
 
+        self._make_session()
+
+    def _make_session(self) -> None:
+        """Create (or recreate) a requests.Session with correct TLS & retry config."""
         self._session = requests.Session()
-        self._session.proxies = proxies or {}
+        self._session.proxies = self.proxies or {}
         self._session.headers.update({"Authorization": f"Bearer {self.api_key}"})
-        # Prevent system proxy/SSL env vars from interfering with explicit config
         self._session.trust_env = False
 
-        if not ssl_verify:
+        # Mount an adapter with urllib3-level retry.  Connection errors
+        # (including Windows FileNotFoundError on stale proxy sockets)
+        # are retried transparently inside urllib3 before ever surfacing.
+        adapter = HTTPAdapter(
+            max_retries=_RETRY_STRATEGY,
+            pool_maxsize=4,
+            pool_block=False,
+        )
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+
+        if not self.ssl_verify:
             import ssl
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            # Use an explicit no-verify SSL context instead of verify=False.
-            # On Windows + HTTP proxy, urllib3 >= 2.0 with verify=False can
-            # intermittently raise FileNotFoundError on socket reuse.
             _ctx = ssl.create_default_context()
             _ctx.check_hostname = False
             _ctx.verify_mode = ssl.CERT_NONE
             self._session.verify = _ctx
         else:
             self._session.verify = True
+
+    def _reset_session(self) -> None:
+        """Close the current session and create a fresh one.
+
+        Called when a fatal connection-level error is detected, so that
+        stale sockets can't poison subsequent requests.
+        """
+        try:
+            self._session.close()
+        except Exception:
+            pass
+        self._make_session()
 
     def call_api(
         self,
@@ -177,7 +214,6 @@ class FlowithClient:
                     result = response.json()
                     upstream_model = result.get("model")
 
-                    # Dump non-streaming response
                     _dump_intercept(
                         payload=payload,
                         response_status=response.status_code,
@@ -206,12 +242,20 @@ class FlowithClient:
                 last_error = Exception("Upstream request timed out")
             except SSLError as e:
                 last_error = Exception(
-                    "Upstream SSL error. If your network uses a proxy/VPN/firewall that intercepts TLS, "
-                    "try setting FLOWITH_SSL_VERIFY=false. Original error: "
-                    f"{e}"
+                    "Upstream SSL error; try FLOWITH_SSL_VERIFY=false. "
+                    f"Original: {e}"
                 )
             except RequestException as e:
+                # Connection-level error — reset session so stale sockets
+                # can't poison the next attempt.
+                self._reset_session()
                 last_error = Exception(f"Upstream request failed: {e}")
+            except OSError as e:
+                # Windows FileNotFoundError(2) and similar OS-level socket errors
+                # arrive here.  urllib3's Retry handles many of them, but when it
+                # can't (e.g. the entire pool is exhausted) we reset explicitly.
+                self._reset_session()
+                last_error = Exception(f"Upstream connection error: {e}")
             except Exception as e:
                 last_error = e
 
