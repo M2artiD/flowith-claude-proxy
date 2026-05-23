@@ -247,12 +247,19 @@ def _convert_tool_messages(
                 text_parts = []
                 tool_calls = []
 
-            # Flowith doesn't accept role="tool"; convert to user message
+            # Flowith may not accept role="tool"; use user message with
+            # structured markers the model can recognise.
             tool_id = block.get("tool_use_id", "")
+            is_error = block.get("is_error", False)
             result_text = _extract_text(block.get("content", ""))
+            status_tag = " error" if is_error else ""
             result.append({
                 "role": "user",
-                "content": f"[Tool Result (id={tool_id})]\n{result_text}",
+                "content": (
+                    f"<tool_result id=\"{tool_id}\"{status_tag}>\n"
+                    f"{result_text}\n"
+                    f"</tool_result>"
+                ),
             })
 
     if text_parts or tool_calls:

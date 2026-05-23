@@ -241,11 +241,35 @@ class TestRequestConversion:
             ],
         }
         msgs = claude_request_to_flowith_messages(body)
-        # assistant with tool_calls, then tool role message
-        assert any(m["role"] == "tool" for m in msgs)
-        tool_msg = next(m for m in msgs if m["role"] == "tool")
-        assert tool_msg["tool_call_id"] == "toolu_123"
+        # tool_result → user message with XML-style markers
+        assert any("tool_result" in str(m.get("content", "")) for m in msgs)
+        tool_msg = next(
+            m for m in msgs
+            if isinstance(m.get("content"), str) and "tool_result" in m["content"]
+        )
+        assert tool_msg["role"] == "user"
+        assert 'id="toolu_123"' in tool_msg["content"]
         assert "file1.txt" in tool_msg["content"]
+        assert "</tool_result>" in tool_msg["content"]
+
+    def test_tool_result_with_error_flag(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_err", "content": "Permission denied", "is_error": True},
+                    ],
+                },
+            ],
+        }
+        msgs = claude_request_to_flowith_messages(body)
+        tool_msg = next(
+            m for m in msgs
+            if isinstance(m.get("content"), str) and "tool_result" in m["content"]
+        )
+        assert "error" in tool_msg["content"]
+        assert "Permission denied" in tool_msg["content"]
 
     def test_mixed_text_and_tool_use(self):
         body = {
