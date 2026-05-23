@@ -102,6 +102,10 @@ class FlowithClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
         thinking: bool | None = None,
+        thinking_budget_tokens: int | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
     ) -> dict[str, Any]:
         use_model = model or self.model
         last_error: Exception | None = None
@@ -122,6 +126,14 @@ class FlowithClient:
                     payload["tools"] = tools
                 if tool_choice is not None:
                     payload["tool_choice"] = tool_choice
+                if thinking_budget_tokens is not None:
+                    payload["thinking_budget_tokens"] = thinking_budget_tokens
+                if max_tokens is not None:
+                    payload["max_tokens"] = max_tokens
+                if temperature is not None:
+                    payload["temperature"] = temperature
+                if top_p is not None:
+                    payload["top_p"] = top_p
 
                 response = self._session.post(
                     self.base_url,
@@ -227,6 +239,14 @@ class FlowithClient:
             try:
                 chunk = json.loads(line)
             except Exception:
+                continue
+            # Detect upstream error chunks (e.g. rate limits, auth errors)
+            if "error" in chunk and not chunk.get("choices"):
+                err_info = chunk["error"]
+                err_msg = err_info.get("message", str(err_info)) if isinstance(err_info, dict) else str(err_info)
+                # Surface the first error; continue parsing to collect any partial content
+                if finish_reason is None:
+                    finish_reason = f"error: {err_msg}"
                 continue
             if "model" in chunk and not upstream_model:
                 upstream_model = chunk["model"]

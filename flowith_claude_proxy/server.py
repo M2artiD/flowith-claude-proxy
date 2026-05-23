@@ -127,6 +127,9 @@ async def create_message(
     # Parse thinking config from Claude Code request
     raw_thinking = body.get("thinking")
     enable_thinking = isinstance(raw_thinking, dict) and raw_thinking.get("type") == "enabled"
+    thinking_budget_tokens = None
+    if enable_thinking and isinstance(raw_thinking, dict):
+        thinking_budget_tokens = raw_thinking.get("budget_tokens")
 
     # Convert tool definitions and tool_choice
     openai_tools = None
@@ -145,10 +148,10 @@ async def create_message(
             detail="At least one user/assistant message is required",
         )
 
-    # Reuse pooled client when using server API key; create fresh one for per-request keys
+    # Reuse pooled client when using server API key; create fresh one for per-request keys.
+    # Pass model to call_api() instead of mutating client.model to avoid races.
     if api_key == _SERVER_API_KEY:
         client = _get_default_client()
-        client.model = flowith_model
     else:
         client = FlowithClient(
             api_key=api_key,
@@ -158,15 +161,26 @@ async def create_message(
             ssl_verify=FLOWITH_SSL_VERIFY,
             proxies=UPSTREAM_PROXIES,
         )
+        flowith_model = None  # model already set on the per-request client
+
+    # Extract core generation parameters that the proxy would otherwise drop
+    max_tokens = body.get("max_tokens")
+    temperature = body.get("temperature")
+    top_p = body.get("top_p")
 
     if not stream:
         result = client.call_api(
             messages,
+            model=flowith_model,
             max_retries=2,
             stream=False,
             tools=openai_tools,
             tool_choice=openai_tool_choice,
             thinking=enable_thinking,
+            thinking_budget_tokens=thinking_budget_tokens,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
         )
         if not result.get("success"):
             return JSONResponse(
@@ -189,11 +203,15 @@ async def create_message(
 
     return StreamingResponse(
         _stream_claude_events(
-            client, messages, requested_model,
+            client, messages, requested_model, flowith_model,
             openai_tools=openai_tools,
             openai_tool_choice=openai_tool_choice,
             enable_thinking=enable_thinking,
             has_tools=has_tools,
+            thinking_budget_tokens=thinking_budget_tokens,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
         ),
         media_type="text/event-stream; charset=utf-8",
         headers={
@@ -211,10 +229,15 @@ def _stream_claude_events(
     client: FlowithClient,
     messages: list[dict[str, Any]],
     requested_model: str,
+    upstream_model: str | None = None,
     openai_tools: list[dict[str, Any]] | None = None,
     openai_tool_choice: Any = None,
     enable_thinking: bool = False,
     has_tools: bool = False,
+    thinking_budget_tokens: int | None = None,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
 ) -> Generator[bytes, None, None]:
     q: "queue.Queue[Any]" = queue.Queue(maxsize=512)
     result_holder: dict[str, Any] = {}
@@ -234,6 +257,7 @@ def _stream_claude_events(
         try:
             res = client.call_api(
                 messages,
+                model=upstream_model,  # None for per-request clients (uses self.model)
                 max_retries=1,
                 stream=True,
                 on_chunk=on_chunk,
@@ -242,6 +266,10 @@ def _stream_claude_events(
                 tools=openai_tools,
                 tool_choice=openai_tool_choice,
                 thinking=enable_thinking,
+                thinking_budget_tokens=thinking_budget_tokens,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
             )
             result_holder["result"] = res
         except Exception as e:  # pragma: no cover
@@ -384,8 +412,9 @@ def _stream_claude_events(
             else:
                 # Keep a trailing window so a <function_calls> tag split
                 # across SSE chunks isn't missed. The tag is 16 chars;
-                # 48-char window is generous enough for split attributes.
-                _TAG_WINDOW = 48
+                # 128-char window is generous enough for split attributes
+                # and long pre-tool text.
+                _TAG_WINDOW = 128
                 if len(text_buffer) > _TAG_WINDOW:
                     safe_text = text_buffer[:-_TAG_WINDOW]
                     if current_block_type != "text":
@@ -426,9 +455,9 @@ def _stream_claude_events(
         if text_buffer.strip():
             yield from _flush_text_as_block(text_buffer.strip())
 
-    # Close last content block
+    # Close last content block (use _close_block for proper index tracking)
     if current_block_type is not None:
-        yield sse_content_block_stop(current_block_index).encode("utf-8")
+        yield from _close_block()
 
     res = result_holder.get("result") or {}
     if not res.get("success"):
@@ -444,13 +473,23 @@ def _stream_claude_events(
         return
 
     usage = res.get("usage", {}) or {}
+    input_tokens = int(usage.get("prompt_tokens", 0) or 0)
     output_tokens = int(usage.get("completion_tokens", 0) or 0)
+    finish_reason = res.get("finish_reason") or ""
+
     has_tool_calls = bool(res.get("tool_calls"))
     # Also check for XML-parsed tool calls in the result content
     result_content = res.get("content", "") or ""
     if not has_tool_calls and "<function_calls>" in result_content:
         has_tool_calls = True
-    stop_reason = "tool_use" if has_tool_calls else "end_turn"
+
+    # Map OpenAI finish_reason to Anthropic stop_reason
+    if has_tool_calls:
+        stop_reason = "tool_use"
+    elif finish_reason == "length":
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "end_turn"
 
     yield sse_message_delta(output_tokens=output_tokens, stop_reason=stop_reason).encode("utf-8")
     yield sse_message_stop().encode("utf-8")
