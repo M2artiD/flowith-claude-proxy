@@ -4,7 +4,6 @@ import json
 import pytest
 
 from flowith_claude_proxy.adapter import (
-    MODEL_ALIASES,
     _extract_text,
     anthropic_tool_choice_to_openai,
     anthropic_tools_to_openai,
@@ -30,11 +29,11 @@ from flowith_claude_proxy.adapter import (
 # ── map_model ──────────────────────────────────────────────────
 
 class TestMapModel:
-    def test_known_alias(self):
-        assert map_model("claude-3-5-sonnet-20241022") == "claude-4.6-sonnet"
+    def test_passthrough_claude_sonnet(self):
+        assert map_model("claude-4.6-sonnet") == "claude-4.6-sonnet"
 
-    def test_opus_alias(self):
-        assert map_model("claude-opus-4-20250514") == "claude-opus-4.7"
+    def test_passthrough_claude_opus(self):
+        assert map_model("claude-opus-4.7") == "claude-opus-4.7"
 
     def test_passthrough_gpt(self):
         assert map_model("gpt-5.4") == "gpt-5.4"
@@ -51,8 +50,8 @@ class TestMapModel:
     def test_none_returns_default(self):
         assert map_model(None) == "claude-4.6-sonnet"
 
-    def test_unrecognized_non_claude(self):
-        assert map_model("llama-3") == "claude-4.6-sonnet"
+    def test_unrecognized_falls_back_to_default(self):
+        assert map_model("randomstring") == "claude-4.6-sonnet"
 
     def test_custom_default(self):
         assert map_model("", default="gpt-5.4") == "gpt-5.4"
@@ -334,11 +333,11 @@ class TestResultConversion:
     def test_basic(self):
         result = flowith_result_to_claude_response(
             {"content": "hi", "usage": {"prompt_tokens": 10, "completion_tokens": 5}},
-            "claude-3-5-sonnet-20241022",
+            "claude-4.6-sonnet",
         )
         assert result["type"] == "message"
         assert result["role"] == "assistant"
-        assert result["model"] == "claude-3-5-sonnet-20241022"
+        assert result["model"] == "claude-4.6-sonnet"
         assert result["content"][0]["text"] == "hi"
         assert result["stop_reason"] == "end_turn"
         assert result["usage"]["input_tokens"] == 10
@@ -369,7 +368,7 @@ class TestResultConversion:
                     }
                 ],
             },
-            "claude-3-5-sonnet-20241022",
+            "claude-4.6-sonnet",
         )
         assert result["stop_reason"] == "tool_use"
         tool_block = next(b for b in result["content"] if b["type"] == "tool_use")
@@ -389,7 +388,7 @@ class TestResultConversion:
                     }
                 ],
             },
-            "claude-3-5-sonnet-20241022",
+            "claude-4.6-sonnet",
         )
         assert result["stop_reason"] == "tool_use"
         text_block = next(b for b in result["content"] if b["type"] == "text")

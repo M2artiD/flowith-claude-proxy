@@ -50,7 +50,7 @@ class TestAuth:
         # The server may have FLOWITH_API_KEY from .env, so patch the resolver
         with patch("flowith_claude_proxy.server._resolve_api_key", return_value=None):
             r = client.post("/v1/messages", json={
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-4.6-sonnet",
                 "max_tokens": 10,
                 "messages": [{"role": "user", "content": "hi"}],
             })
@@ -63,7 +63,7 @@ class TestAuth:
             r = client.post(
                 "/v1/messages",
                 json={
-                    "model": "claude-3-5-sonnet-20241022",
+                    "model": "claude-4.6-sonnet",
                     "max_tokens": 10,
                     "messages": [{"role": "user", "content": "hi"}],
                 },
@@ -78,7 +78,7 @@ class TestAuth:
             r = client.post(
                 "/v1/messages",
                 json={
-                    "model": "claude-3-5-sonnet-20241022",
+                    "model": "claude-4.6-sonnet",
                     "max_tokens": 10,
                     "messages": [{"role": "user", "content": "hi"}],
                 },
@@ -97,7 +97,7 @@ class TestNonStreaming:
             r = client.post(
                 "/v1/messages",
                 json={
-                    "model": "claude-3-5-sonnet-20241022",
+                    "model": "claude-4.6-sonnet",
                     "max_tokens": 100,
                     "messages": [{"role": "user", "content": "hi"}],
                 },
@@ -116,7 +116,7 @@ class TestNonStreaming:
             r = client.post(
                 "/v1/messages",
                 json={
-                    "model": "claude-3-5-sonnet-20241022",
+                    "model": "claude-4.6-sonnet",
                     "max_tokens": 10,
                     "messages": [{"role": "user", "content": "hi"}],
                 },
@@ -138,7 +138,7 @@ class TestNonStreaming:
             r = client.post(
                 "/v1/messages",
                 json={
-                    "model": "claude-3-5-sonnet-20241022",
+                    "model": "claude-4.6-sonnet",
                     "max_tokens": 100,
                     "messages": [{"role": "user", "content": "run ls"}],
                 },
@@ -158,7 +158,7 @@ class TestNonStreaming:
             r = client.post(
                 "/v1/messages",
                 json={
-                    "model": "claude-3-5-sonnet-20241022",
+                    "model": "claude-4.6-sonnet",
                     "max_tokens": 100,
                     "messages": [{"role": "user", "content": "hi"}],
                     "tools": [
@@ -201,7 +201,7 @@ class TestStreaming:
             r = client.post(
                 "/v1/messages",
                 json={
-                    "model": "claude-3-5-sonnet-20241022",
+                    "model": "claude-4.6-sonnet",
                     "max_tokens": 100,
                     "stream": True,
                     "messages": [{"role": "user", "content": "hi"}],
@@ -244,7 +244,7 @@ class TestStreaming:
             r = client.post(
                 "/v1/messages",
                 json={
-                    "model": "claude-3-5-sonnet-20241022",
+                    "model": "claude-4.6-sonnet",
                     "max_tokens": 100,
                     "stream": True,
                     "messages": [{"role": "user", "content": "run ls"}],
@@ -277,7 +277,7 @@ class TestValidation:
         r = client.post(
             "/v1/messages",
             json={
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-4.6-sonnet",
                 "max_tokens": 10,
                 "messages": [],
             },
