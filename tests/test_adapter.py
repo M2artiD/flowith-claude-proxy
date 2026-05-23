@@ -13,6 +13,8 @@ from flowith_claude_proxy.adapter import (
     map_model,
     new_message_id,
     openai_tool_calls_to_anthropic,
+    parse_xml_tool_calls,
+    split_text_and_xml_tool_calls,
     sse_content_block_delta,
     sse_content_block_start,
     sse_content_block_stop,
@@ -394,6 +396,225 @@ class TestResultConversion:
         assert text_block["text"] == "Running that for you."
         tool_block = next(b for b in result["content"] if b["type"] == "tool_use")
         assert tool_block["name"] == "bash"
+
+
+# ── XML tool call parser (robust CDATA-aware) ───────────────────
+
+class TestParseXmlToolCalls:
+    def test_empty_string(self):
+        assert parse_xml_tool_calls("") == []
+
+    def test_no_xml(self):
+        assert parse_xml_tool_calls("plain text") == []
+
+    def test_simple_cdata_tool_call(self):
+        xml = (
+            "<function_calls>\n"
+            '<invoke name="bash">\n'
+            '<parameter name="command"><![CDATA[ls -la]]></parameter>\n'
+            "</invoke>\n"
+            "</function_calls>"
+        )
+        results = parse_xml_tool_calls(xml)
+        assert len(results) == 1
+        assert results[0]["name"] == "bash"
+        assert results[0]["input"] == {"command": "ls -la"}
+
+    def test_multiple_params(self):
+        xml = (
+            "<function_calls>\n"
+            '<invoke name="write">\n'
+            '<parameter name="file_path"><![CDATA[/tmp/test.txt]]></parameter>\n'
+            '<parameter name="content"><![CDATA[hello world]]></parameter>\n'
+            "</invoke>\n"
+            "</function_calls>"
+        )
+        results = parse_xml_tool_calls(xml)
+        assert len(results) == 1
+        assert results[0]["input"]["file_path"] == "/tmp/test.txt"
+        assert results[0]["input"]["content"] == "hello world"
+
+    def test_json_param_value(self):
+        xml = (
+            "<function_calls>\n"
+            '<invoke name="edit">\n'
+            '<parameter name="filters"><![CDATA[{"pattern":"*.py","caseSensitive":false}]]></parameter>\n'
+            "</invoke>\n"
+            "</function_calls>"
+        )
+        results = parse_xml_tool_calls(xml)
+        assert results[0]["input"]["filters"] == {"pattern": "*.py", "caseSensitive": False}
+
+    def test_special_chars_shell_redirect(self):
+        """Shell commands with <, >, | inside CDATA must parse correctly."""
+        xml = (
+            "<function_calls>\n"
+            '<invoke name="bash">\n'
+            '<parameter name="command"><![CDATA[cat file.txt | grep "error" > /tmp/errors.log]]></parameter>\n'
+            "</invoke>\n"
+            "</function_calls>"
+        )
+        results = parse_xml_tool_calls(xml)
+        assert results[0]["input"]["command"] == 'cat file.txt | grep "error" > /tmp/errors.log'
+
+    def test_special_chars_xml_like(self):
+        """CDATA value containing text that looks like closing tags."""
+        xml = (
+            "<function_calls>\n"
+            '<invoke name="bash">\n'
+            '<parameter name="command"><![CDATA[echo "</function_calls></invoke></parameter>"]]></parameter>\n'
+            "</invoke>\n"
+            "</function_calls>"
+        )
+        results = parse_xml_tool_calls(xml)
+        assert results[0]["input"]["command"] == 'echo "</function_calls></invoke></parameter>"'
+
+    def test_special_chars_windows_paths(self):
+        """Windows paths with backslashes inside CDATA."""
+        xml = (
+            "<function_calls>\n"
+            '<invoke name="read">\n'
+            '<parameter name="file_path"><![CDATA[C:\\Users\\test\\file.txt]]></parameter>\n'
+            "</invoke>\n"
+            "</function_calls>"
+        )
+        results = parse_xml_tool_calls(xml)
+        assert results[0]["input"]["file_path"] == "C:\\Users\\test\\file.txt"
+
+    def test_multiple_invokes_in_one_block(self):
+        xml = (
+            "<function_calls>\n"
+            '<invoke name="bash">\n'
+            '<parameter name="command"><![CDATA[pwd]]></parameter>\n'
+            "</invoke>\n"
+            '<invoke name="read">\n'
+            '<parameter name="file_path"><![CDATA[/tmp/out.txt]]></parameter>\n'
+            "</invoke>\n"
+            "</function_calls>"
+        )
+        results = parse_xml_tool_calls(xml)
+        assert len(results) == 2
+        assert results[0]["name"] == "bash"
+        assert results[1]["name"] == "read"
+
+    def test_multiple_function_calls_blocks(self):
+        xml = (
+            "<function_calls>"
+            '<invoke name="bash"><parameter name="command"><![CDATA[ls]]></parameter></invoke>'
+            "</function_calls>"
+            " some text "
+            "<function_calls>"
+            '<invoke name="read"><parameter name="file_path"><![CDATA[/tmp/x.txt]]></parameter></invoke>'
+            "</function_calls>"
+        )
+        results = parse_xml_tool_calls(xml)
+        assert len(results) == 2
+        assert results[0]["name"] == "bash"
+        assert results[1]["name"] == "read"
+
+    def test_number_coercion(self):
+        xml = (
+            "<function_calls>\n"
+            '<invoke name="count">\n'
+            '<parameter name="limit"><![CDATA[42]]></parameter>\n'
+            "</invoke>\n"
+            "</function_calls>"
+        )
+        results = parse_xml_tool_calls(xml)
+        assert results[0]["input"]["limit"] == 42
+
+    def test_bool_coercion(self):
+        xml = (
+            "<function_calls>\n"
+            '<invoke name="toggle">\n'
+            '<parameter name="verbose"><![CDATA[true]]></parameter>\n'
+            '<parameter name="quiet"><![CDATA[false]]></parameter>\n'
+            "</invoke>\n"
+            "</function_calls>"
+        )
+        results = parse_xml_tool_calls(xml)
+        assert results[0]["input"]["verbose"] is True
+        assert results[0]["input"]["quiet"] is False
+
+    def test_malformed_xml_recovers(self):
+        """Malformed XML should not crash — just return no tool calls."""
+        # Missing close tag
+        xml = (
+            "<function_calls>\n"
+            '<invoke name="bash">\n'
+            '<parameter name="command"><![CDATA[ls]]></parameter>\n'
+            "</invoke>\n"
+        )
+        results = parse_xml_tool_calls(xml)
+        # Should handle gracefully — no crash
+        assert isinstance(results, list)
+
+    def test_fallback_raw_text_no_cdata(self):
+        """Raw text (no CDATA) with XML entities should still parse."""
+        xml = (
+            "<function_calls>"
+            '<invoke name="bash">'
+            '<parameter name="command">ls &amp;&amp; echo done</parameter>'
+            "</invoke>"
+            "</function_calls>"
+        )
+        results = parse_xml_tool_calls(xml)
+        assert len(results) == 1
+        assert results[0]["input"]["command"] == "ls && echo done"
+
+
+class TestSplitTextAndXmlToolCalls:
+    def test_text_before_tool_call(self):
+        text = "Let me run that for you.\n<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\"><![CDATA[ls]]></parameter>\n</invoke>\n</function_calls>"
+        blocks = split_text_and_xml_tool_calls(text)
+        assert len(blocks) == 2
+        assert blocks[0]["type"] == "text"
+        assert "Let me run that" in blocks[0]["text"]
+        assert blocks[1]["type"] == "tool_use"
+        assert blocks[1]["name"] == "bash"
+
+    def test_text_after_tool_call(self):
+        text = "<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\"><![CDATA[ls]]></parameter>\n</invoke>\n</function_calls>\nDone."
+        blocks = split_text_and_xml_tool_calls(text)
+        assert len(blocks) == 2
+        assert blocks[0]["type"] == "tool_use"
+        assert blocks[1]["type"] == "text"
+        assert blocks[1]["text"] == "Done."
+
+    def test_text_between_and_after(self):
+        text = (
+            "Before.\n"
+            "<function_calls>"
+            '<invoke name="bash"><parameter name="command"><![CDATA[ls]]></parameter></invoke>'
+            "</function_calls>"
+            "Between.\n"
+            "<function_calls>"
+            '<invoke name="read"><parameter name="file_path"><![CDATA[/tmp/x.txt]]></parameter></invoke>'
+            "</function_calls>"
+            "After."
+        )
+        blocks = split_text_and_xml_tool_calls(text)
+        # Before | bash | Between | read | After = 5 blocks
+        assert len(blocks) == 5
+        assert blocks[0]["type"] == "text"
+        assert blocks[0]["text"] == "Before."
+        assert blocks[1]["type"] == "tool_use"
+        assert blocks[1]["name"] == "bash"
+        assert blocks[2]["type"] == "text"
+        assert blocks[2]["text"] == "Between."
+        assert blocks[3]["type"] == "tool_use"
+        assert blocks[3]["name"] == "read"
+        assert blocks[4]["type"] == "text"
+        assert blocks[4]["text"] == "After."
+
+    def test_no_xml_returns_single_text_block(self):
+        blocks = split_text_and_xml_tool_calls("just text")
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "text"
+        assert blocks[0]["text"] == "just text"
+
+    def test_empty_string(self):
+        assert split_text_and_xml_tool_calls("") == []
 
 
 # ── SSE helpers ────────────────────────────────────────────────
