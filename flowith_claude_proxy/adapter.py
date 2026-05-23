@@ -129,7 +129,8 @@ def _build_tool_xml_prompt(anthropic_tools: list[dict[str, Any]]) -> str:
     """Generate XML-format tool-use instructions from Anthropic tool definitions.
 
     Injects into the system prompt so the upstream model (which may not
-    support native function calling) knows to output <function_calls> XML.
+    support native function calling) knows to output <function_calls> XML
+    with CDATA-wrapped parameter values for safe parsing.
     """
     if not anthropic_tools:
         return ""
@@ -162,15 +163,22 @@ def _build_tool_xml_prompt(anthropic_tools: list[dict[str, Any]]) -> str:
         "in this EXACT XML format inside your response:\n\n"
         "<function_calls>\n"
         "<invoke name=\"TOOL_NAME\">\n"
-        "<parameter name=\"PARAM_NAME\">PARAM_VALUE</parameter>\n"
+        "<parameter name=\"PARAM_NAME\"><![CDATA[PARAM_VALUE]]></parameter>\n"
         "</invoke>\n"
         "</function_calls>\n\n"
-        "Rules:\n"
-        "- NEVER output <function_calls> XML unless you are actually calling a tool.\n"
+        "CRITICAL parameter formatting rules:\n"
+        "- ALWAYS wrap every parameter value in <![CDATA[...]]>, even for "
+        "simple values. This is MANDATORY — never output a raw parameter "
+        "value without CDATA.\n"
+        "- Simple strings: <parameter name=\"cmd\"><![CDATA[ls -la]]></parameter>\n"
+        "- Numbers/booleans: <parameter name=\"n\"><![CDATA[42]]></parameter>\n"
+        "- JSON objects/arrays: <parameter name=\"filters\"><![CDATA[{\"key\":\"val\"}]]></parameter>\n"
+        "- Multi-line or special-char content (code, shell commands, paths "
+        "with backslashes, XML/HTML): always safe inside CDATA.\n"
+        "- NEVER output <function_calls> XML unless you are actually "
+        "calling a tool.\n"
         "- Each <function_calls> block can contain multiple <invoke> elements.\n"
-        "- Parameter values should be literal strings (not JSON-encoded) unless the "
-        "parameter description says otherwise.\n"
-        "- After outputting a tool call, STOP — the tool result will be provided.\n\n"
+        "- After outputting tool calls, STOP — the tool result will be provided.\n\n"
         f"{tool_list}\n"
     )
 
