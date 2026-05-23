@@ -19,9 +19,22 @@ import uuid
 from typing import Any
 
 # ---------------------------------------------------------------
-# Model alias table: Claude-style names -> Flowith model ids.
+# Available Flowith upstream models and client-facing aliases.
+# Custom overrides via FLOWITH_MODEL_ALIASES env var.
+# Any model name containing "-" or "/" is passed through as-is.
 # ---------------------------------------------------------------
-MODEL_ALIASES: dict[str, str] = {}
+MODEL_ALIASES: dict[str, str] = {
+    # Upstream identity mappings
+    "claude-4.6-sonnet": "claude-4.6-sonnet",
+    "claude-opus-4.7": "claude-opus-4.7",
+    "claude-haiku-4.5": "claude-haiku-4.5",
+    "gpt-5.5": "gpt-5.5",
+    "gpt-5.4": "gpt-5.4",
+    "gemini-2.5-pro": "gemini-2.5-pro",
+    # Client-facing aliases -> upstream models
+    "claude-sonnet-4.6": "claude-4.6-sonnet",
+    "claude-sonnet-4-20250514": "claude-4.6-sonnet",
+}
 
 
 def map_model(claude_model: str, default: str = "claude-4.6-sonnet") -> str:

@@ -29,19 +29,28 @@ from flowith_claude_proxy.adapter import (
 # ── map_model ──────────────────────────────────────────────────
 
 class TestMapModel:
-    def test_passthrough_claude_sonnet(self):
+    def test_known_upstream_sonnet(self):
         assert map_model("claude-4.6-sonnet") == "claude-4.6-sonnet"
 
-    def test_passthrough_claude_opus(self):
+    def test_known_upstream_opus(self):
         assert map_model("claude-opus-4.7") == "claude-opus-4.7"
 
-    def test_passthrough_gpt(self):
-        assert map_model("gpt-5.4") == "gpt-5.4"
+    def test_known_upstream_haiku(self):
+        assert map_model("claude-haiku-4.5") == "claude-haiku-4.5"
 
-    def test_passthrough_gemini(self):
+    def test_known_upstream_gpt(self):
+        assert map_model("gpt-5.5") == "gpt-5.5"
+
+    def test_known_upstream_gemini(self):
         assert map_model("gemini-2.5-pro") == "gemini-2.5-pro"
 
-    def test_passthrough_unknown_claude(self):
+    def test_alias_sonnet_4_6_to_upstream(self):
+        assert map_model("claude-sonnet-4.6") == "claude-4.6-sonnet"
+
+    def test_alias_sonnet_date_to_upstream(self):
+        assert map_model("claude-sonnet-4-20250514") == "claude-4.6-sonnet"
+
+    def test_passthrough_unknown_model(self):
         assert map_model("claude-future-model") == "claude-future-model"
 
     def test_empty_returns_default(self):
