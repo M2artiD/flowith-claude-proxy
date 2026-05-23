@@ -21,20 +21,7 @@ from typing import Any
 # ---------------------------------------------------------------
 # Model alias table: Claude-style names -> Flowith model ids.
 # ---------------------------------------------------------------
-MODEL_ALIASES: dict[str, str] = {
-    "claude-3-5-sonnet-20241022": "claude-4.6-sonnet",
-    "claude-3-5-sonnet-latest": "claude-4.6-sonnet",
-    "claude-3-5-sonnet": "claude-4.6-sonnet",
-    "claude-3-7-sonnet-20250219": "claude-4.6-sonnet",
-    "claude-3-7-sonnet-latest": "claude-4.6-sonnet",
-    "claude-sonnet-4-20250514": "claude-4.6-sonnet",
-    "claude-sonnet-4-5": "claude-4.6-sonnet",
-    "claude-opus-4-20250514": "claude-opus-4.7",
-    "claude-opus-4-1": "claude-opus-4.7",
-    "claude-opus-4-5": "claude-opus-4.7",
-    "claude-3-opus-20240229": "claude-opus-4.7",
-    "claude-3-haiku-20240307": "claude-4.6-sonnet",
-}
+MODEL_ALIASES: dict[str, str] = {}
 
 
 def map_model(claude_model: str, default: str = "claude-4.6-sonnet") -> str:
@@ -44,7 +31,9 @@ def map_model(claude_model: str, default: str = "claude-4.6-sonnet") -> str:
     merged = {**MODEL_ALIASES, **CUSTOM_MODEL_ALIASES}
     if claude_model in merged:
         return merged[claude_model]
-    if claude_model.startswith(("gpt-", "gemini-", "claude-")):
+    # Pass through any model id that looks like a real model name
+    # (contains a dash or slash, typical of provider/model patterns)
+    if "/" in claude_model or "-" in claude_model:
         return claude_model
     return default
 
@@ -72,12 +61,20 @@ def anthropic_tools_to_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any
 
 
 def anthropic_tool_choice_to_openai(tool_choice: Any) -> Any:
-    if tool_choice is None or tool_choice == "auto":
+    if tool_choice is None:
+        return "auto"
+    if isinstance(tool_choice, dict):
+        tc_type = tool_choice.get("type")
+        if tc_type == "tool":
+            return {"type": "function", "function": {"name": tool_choice["name"]}}
+        if tc_type == "any":
+            return "required"
+        # "auto" or unknown dict → let model decide
+        return "auto"
+    if tool_choice == "auto":
         return "auto"
     if tool_choice == "any":
         return "required"
-    if isinstance(tool_choice, dict) and tool_choice.get("type") == "tool":
-        return {"type": "function", "function": {"name": tool_choice["name"]}}
     return "auto"
 
 
@@ -315,8 +312,10 @@ def _find_outside_cdata(text: str, needle: str, start: int = 0) -> int:
         idx = text.find(needle, pos)
         if idx == -1:
             return -1
-        # Is this match inside a CDATA section?
-        cdata_start = text.rfind(_CDATA_START, start, idx)
+        # Check whether idx lies inside a CDATA section.
+        # Search from position 0 (not *start*) to cover CDATA that
+        # opened before the search window but still spans across idx.
+        cdata_start = text.rfind(_CDATA_START, 0, idx)
         if cdata_start != -1:
             cdata_end = text.find(_CDATA_END, cdata_start)
             if cdata_end != -1 and idx < cdata_end:
@@ -522,6 +521,7 @@ def flowith_result_to_claude_response(
     reasoning_text = flowith_result.get("reasoning_content", "") or ""
     tool_calls = flowith_result.get("tool_calls") or []
     usage = flowith_result.get("usage", {}) or {}
+    finish_reason = flowith_result.get("finish_reason") or ""
     input_tokens = int(usage.get("prompt_tokens", 0) or 0)
     output_tokens = int(usage.get("completion_tokens", 0) or 0)
 
@@ -543,8 +543,18 @@ def flowith_result_to_claude_response(
     if not content:
         content.append({"type": "text", "text": ""})
 
-    has_any_tool_use = any(b.get("type") == "tool_use" for b in content)
-    stop_reason = "tool_use" if (tool_calls or has_any_tool_use) else "end_turn"
+    # Map OpenAI finish_reason to Anthropic stop_reason
+    has_any_tool_use = bool(tool_calls) or any(
+        b.get("type") == "tool_use" for b in content
+    )
+    if has_any_tool_use:
+        stop_reason = "tool_use"
+    elif finish_reason == "length":
+        stop_reason = "max_tokens"
+    elif finish_reason == "content_filter":
+        stop_reason = "end_turn"  # closest meaningful equivalent
+    else:
+        stop_reason = "end_turn"
 
     return {
         "id": new_message_id(),
