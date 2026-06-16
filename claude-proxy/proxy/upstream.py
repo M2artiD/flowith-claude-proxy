@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +16,15 @@ from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException, SSLError
 from urllib3.util.retry import Retry
 
-from .config import DEBUG_DUMP, DEBUG_DUMP_DIR
+from .config import (
+    DEBUG_DUMP,
+    DEBUG_DUMP_DIR,
+    FLOWITH_MAX_CONCURRENCY,
+    FLOWITH_POOL_MAXSIZE,
+    FLOWITH_RETRY_BACKOFF,
+    FLOWITH_RETRY_JITTER,
+    FLOWITH_RETRY_TOTAL,
+)
 
 
 def _dump_intercept(
@@ -52,13 +62,25 @@ def _dump_intercept(
 
 
 _RETRY_STRATEGY = Retry(
-    total=3,
-    connect=2,
-    read=2,
-    backoff_factor=0.5,
+    total=FLOWITH_RETRY_TOTAL,
+    connect=FLOWITH_RETRY_TOTAL,
+    read=FLOWITH_RETRY_TOTAL,
+    backoff_factor=FLOWITH_RETRY_BACKOFF,
+    backoff_jitter=FLOWITH_RETRY_JITTER,
     status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=None,
     raise_on_status=False,
 )
+
+_UPSTREAM_SEMAPHORE = (
+    threading.BoundedSemaphore(FLOWITH_MAX_CONCURRENCY)
+    if FLOWITH_MAX_CONCURRENCY > 0
+    else None
+)
+
+
+def _retry_delay(attempt: int) -> float:
+    return FLOWITH_RETRY_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, FLOWITH_RETRY_JITTER)
 
 
 class FlowithClient:
@@ -92,8 +114,8 @@ class FlowithClient:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         adapter = HTTPAdapter(
             max_retries=_RETRY_STRATEGY,
-            pool_maxsize=4,
-            pool_block=False,
+            pool_maxsize=FLOWITH_POOL_MAXSIZE,
+            pool_block=True,
         )
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
@@ -126,8 +148,15 @@ class FlowithClient:
         use_model = model or self.model
         last_error: Exception | None = None
 
-        for attempt in range(1, max_retries + 1):
+        total_attempts = max(1, max_retries)
+
+        for attempt in range(1, total_attempts + 1):
+            acquired = False
             try:
+                if _UPSTREAM_SEMAPHORE is not None:
+                    _UPSTREAM_SEMAPHORE.acquire()
+                    acquired = True
+
                 start = time.time()
                 use_thinking = thinking if thinking is not None else self.thinking
 
@@ -208,10 +237,13 @@ class FlowithClient:
                     last_error = Exception("Upstream response has no choices")
 
             except requests.exceptions.Timeout:
+                self._reset_session()
                 last_error = Exception("Upstream request timed out")
             except SSLError as e:
+                self._reset_session()
                 last_error = Exception(
-                    "Upstream SSL error; try FLOWITH_SSL_VERIFY=false. "
+                    "Upstream SSL error after retries; try lowering FLOWITH_MAX_CONCURRENCY "
+                    "or temporarily set FLOWITH_SSL_VERIFY=false for diagnosis. "
                     f"Original: {e}"
                 )
             except RequestException as e:
@@ -222,9 +254,12 @@ class FlowithClient:
                 last_error = Exception(f"Upstream connection error: {e}")
             except Exception as e:
                 last_error = e
+            finally:
+                if acquired and _UPSTREAM_SEMAPHORE is not None:
+                    _UPSTREAM_SEMAPHORE.release()
 
-            if attempt < max_retries:
-                time.sleep(attempt * 2)
+            if attempt < total_attempts:
+                time.sleep(_retry_delay(attempt))
 
         return {"success": False, "error": str(last_error) if last_error else "unknown error"}
 

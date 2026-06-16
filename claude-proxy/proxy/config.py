@@ -24,6 +24,13 @@ DEFAULT_MODEL = os.environ.get("FLOWITH_DEFAULT_MODEL", "claude-4.6-sonnet")
 
 API_TIMEOUT = int(os.environ.get("FLOWITH_TIMEOUT", "120"))
 
+# Upstream stability tuning
+FLOWITH_MAX_CONCURRENCY = int(os.environ.get("FLOWITH_MAX_CONCURRENCY", "3"))
+FLOWITH_POOL_MAXSIZE = int(os.environ.get("FLOWITH_POOL_MAXSIZE", str(max(4, FLOWITH_MAX_CONCURRENCY))))
+FLOWITH_RETRY_TOTAL = int(os.environ.get("FLOWITH_RETRY_TOTAL", "3"))
+FLOWITH_RETRY_BACKOFF = float(os.environ.get("FLOWITH_RETRY_BACKOFF", "0.75"))
+FLOWITH_RETRY_JITTER = float(os.environ.get("FLOWITH_RETRY_JITTER", "0.5"))
+
 FLOWITH_TOOL_MODE = os.environ.get("FLOWITH_TOOL_MODE", "xml").strip().lower()
 if FLOWITH_TOOL_MODE not in {"xml", "native"}:
     FLOWITH_TOOL_MODE = "xml"
