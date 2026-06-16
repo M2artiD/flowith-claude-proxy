@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
@@ -13,17 +14,19 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__
 from .adapter import (
-    _find_outside_cdata,
-    _rfind_outside_cdata,
+    REACT_TOOL_STOP_SEQUENCE,
     anthropic_tool_choice_to_openai,
     anthropic_tools_to_openai,
     claude_request_to_flowith_messages,
+    find_xml_tool_call_consumed_end,
+    find_xml_tool_call_end,
+    find_xml_tool_call_start,
     flowith_result_to_claude_response,
+    has_xml_tool_call_marker,
     map_model,
     new_message_id,
-    openai_tool_calls_to_anthropic,
+    normalize_tool_use_id,
     parse_xml_tool_calls,
-    split_text_and_xml_tool_calls,
     sse_content_block_delta,
     sse_content_block_start,
     sse_content_block_stop,
@@ -35,15 +38,17 @@ from .adapter import (
     sse_thinking_delta,
     sse_tool_input_delta,
 )
+from .codex import create_router as create_codex_router
 from .config import (
     API_TIMEOUT,
     DEFAULT_MODEL,
     FLOWITH_BASE_URL,
     FLOWITH_SSL_VERIFY,
+    FLOWITH_TOOL_MODE,
     UPSTREAM_PROXIES,
     load_api_key,
 )
-from .flowith_client import FlowithClient
+from .upstream import FlowithClient
 
 app = FastAPI(
     title="Flowith Claude-Compatible Proxy",
@@ -52,8 +57,18 @@ app = FastAPI(
 
 _SERVER_API_KEY = load_api_key()
 
-# Reusable client for server-side API key requests (connection pooling)
 _default_client: FlowithClient | None = None
+
+
+def _api_profile() -> str:
+    profile = os.environ.get("FLOWITH_API_PROFILE", "all").strip().lower()
+    return profile if profile in {"all", "claude", "codex", "openai"} else "all"
+
+
+def _require_profile(*allowed: str) -> None:
+    profile = _api_profile()
+    if profile != "all" and profile not in allowed:
+        raise HTTPException(status_code=404, detail="Endpoint not enabled for this proxy profile")
 
 
 def _get_default_client() -> FlowithClient:
@@ -81,13 +96,54 @@ def _resolve_api_key(
     return _SERVER_API_KEY
 
 
+def _get_client_for_key(api_key: str, flowith_model: str) -> tuple[FlowithClient, str | None]:
+    if api_key == _SERVER_API_KEY:
+        return _get_default_client(), flowith_model
+    return (
+        FlowithClient(
+            api_key=api_key,
+            model=flowith_model,
+            base_url=FLOWITH_BASE_URL,
+            timeout=API_TIMEOUT,
+            ssl_verify=FLOWITH_SSL_VERIFY,
+            proxies=UPSTREAM_PROXIES,
+        ),
+        None,
+    )
+
+
+async def _read_json_object(request: Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    return body
+
+
+def _require_api_key(x_api_key: str | None, authorization: str | None) -> str:
+    api_key = _resolve_api_key(x_api_key, authorization)
+    if not api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing API key. Send x-api-key or Authorization: Bearer <key>, or set FLOWITH_API_KEY on the server.",
+        )
+    return api_key
+
+
 @app.get("/")
 def root() -> dict[str, Any]:
     return {
         "service": "flowith-claude-proxy",
         "version": __version__,
         "upstream": FLOWITH_BASE_URL,
-        "endpoints": ["POST /v1/messages"],
+        "endpoints": [
+            "POST /v1/messages",
+            "POST /v1/chat/completions",
+            "POST /v1/responses",
+            "GET /v1/models",
+        ],
     }
 
 
@@ -96,62 +152,77 @@ def health() -> dict[str, Any]:
     return {"ok": True}
 
 
+app.include_router(create_codex_router(
+    require_profile=_require_profile,
+    read_json_object=_read_json_object,
+    require_api_key=_require_api_key,
+    get_client_for_key=_get_client_for_key,
+    with_xml_tool_stop_sequence=lambda stop_sequences: _with_xml_tool_stop_sequence(stop_sequences),
+))
+
+
 @app.post("/v1/messages")
 async def create_message(
     request: Request,
     x_api_key: str | None = Header(default=None, alias="x-api-key"),
     authorization: str | None = Header(default=None),
 ) -> Any:
+    _require_profile("claude")
     try:
         body = await request.json()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
     if not isinstance(body, dict):
-        raise HTTPException(
-            status_code=400, detail="Request body must be a JSON object"
-        )
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    # ===== REQUEST LOG =====
+    requested_model = body.get("model", "?")
+    tool_count = len(body.get("tools") or [])
+    sys_len = len(str(body.get("system") or ""))
+    msg_count = len(body.get("messages") or [])
+    print(f"[REQ] model={requested_model}  tools={tool_count}  system_len={sys_len}  msgs={msg_count}  stream={body.get('stream')}", flush=True)
 
     api_key = _resolve_api_key(x_api_key, authorization)
     if not api_key:
         raise HTTPException(
             status_code=401,
-            detail=(
-                "Missing API key. Send x-api-key or "
-                "Authorization: Bearer <key>, or set FLOWITH_API_KEY on the server."
-            ),
+            detail="Missing API key. Send x-api-key or Authorization: Bearer <key>, or set FLOWITH_API_KEY on the server.",
         )
 
-    requested_model = body.get("model") or DEFAULT_MODEL
+    requested_model = requested_model if requested_model != "?" else DEFAULT_MODEL
     flowith_model = map_model(requested_model, default=DEFAULT_MODEL)
     stream = bool(body.get("stream"))
 
-    # Parse thinking config from Claude Code request
     raw_thinking = body.get("thinking")
     enable_thinking = isinstance(raw_thinking, dict) and raw_thinking.get("type") == "enabled"
     thinking_budget_tokens = None
     if enable_thinking and isinstance(raw_thinking, dict):
         thinking_budget_tokens = raw_thinking.get("budget_tokens")
 
-    # Convert tool definitions and tool_choice
-    openai_tools = None
-    openai_tool_choice = None
-    raw_tools = body.get("tools")
-    if raw_tools:
-        openai_tools = anthropic_tools_to_openai(raw_tools)
-        tc = body.get("tool_choice")
-        if tc is not None:
-            openai_tool_choice = anthropic_tool_choice_to_openai(tc)
+    raw_tools = body.get("tools") or []
+    # Never pass native OpenAI tools to Flowith — the upstream model may
+    # either reject them (claude-fable-5) or get confused by the dual
+    # native+XML instruction.  Tool guidance is injected exclusively via
+    # the system-prompt XML block in claude_request_to_flowith_messages().
+    has_tools = bool(raw_tools)
+    tool_mode = FLOWITH_TOOL_MODE if has_tools else "xml"
+    native_tools = anthropic_tools_to_openai(raw_tools) if tool_mode == "native" else None
+    native_tool_choice = (
+        anthropic_tool_choice_to_openai(body.get("tool_choice"))
+        if native_tools
+        else None
+    )
 
-    messages = claude_request_to_flowith_messages(body, anthropic_tools=raw_tools)
+    messages = claude_request_to_flowith_messages(
+        body,
+        anthropic_tools=raw_tools if has_tools and tool_mode == "xml" else None,
+        tool_mode=tool_mode,
+        tool_choice=body.get("tool_choice"),
+    )
     if not messages or all(m["role"] == "system" for m in messages):
-        raise HTTPException(
-            status_code=400,
-            detail="At least one user/assistant message is required",
-        )
+        raise HTTPException(status_code=400, detail="At least one user/assistant message is required")
 
-    # Reuse pooled client when using server API key; create fresh one for per-request keys.
-    # Pass model to call_api() instead of mutating client.model to avoid races.
     if api_key == _SERVER_API_KEY:
         client = _get_default_client()
     else:
@@ -163,12 +234,14 @@ async def create_message(
             ssl_verify=FLOWITH_SSL_VERIFY,
             proxies=UPSTREAM_PROXIES,
         )
-        flowith_model = None  # model already set on the per-request client
+        flowith_model = None
 
-    # Extract core generation parameters that the proxy would otherwise drop
     max_tokens = body.get("max_tokens")
     temperature = body.get("temperature")
     top_p = body.get("top_p")
+    stop_sequences = body.get("stop_sequences")
+    if has_tools and tool_mode == "xml":
+        stop_sequences = _with_xml_tool_stop_sequence(stop_sequences)
 
     if not stream:
         result = client.call_api(
@@ -176,13 +249,14 @@ async def create_message(
             model=flowith_model,
             max_retries=2,
             stream=False,
-            tools=openai_tools,
-            tool_choice=openai_tool_choice,
+            tools=native_tools,
+            tool_choice=native_tool_choice,
             thinking=enable_thinking,
             thinking_budget_tokens=thinking_budget_tokens,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            stop_sequences=stop_sequences,
         )
         if not result.get("success"):
             return JSONResponse(
@@ -191,29 +265,24 @@ async def create_message(
                     "type": "error",
                     "error": {
                         "type": "upstream_error",
-                        "message": str(
-                            result.get("error", "unknown upstream error")
-                        ),
+                        "message": str(result.get("error", "unknown upstream error")),
                     },
                 },
             )
-        return JSONResponse(
-            content=flowith_result_to_claude_response(result, requested_model)
-        )
-
-    has_tools = bool(openai_tools)
+        return JSONResponse(content=flowith_result_to_claude_response(result, requested_model))
 
     return StreamingResponse(
         _stream_claude_events(
             client, messages, requested_model, flowith_model,
-            openai_tools=openai_tools,
-            openai_tool_choice=openai_tool_choice,
             enable_thinking=enable_thinking,
             has_tools=has_tools,
+            native_tools=native_tools,
+            native_tool_choice=native_tool_choice,
             thinking_budget_tokens=thinking_budget_tokens,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            stop_sequences=stop_sequences,
         ),
         media_type="text/event-stream; charset=utf-8",
         headers={
@@ -225,6 +294,59 @@ async def create_message(
 
 
 _SENTINEL_DONE = object()
+_THINK_OPEN_TAG = "<think>"
+_THINK_CLOSE_TAG = "</think>"
+
+
+def _filter_stream_think_tags(raw: str, in_think: bool) -> tuple[str, str, bool]:
+    clean_parts: list[str] = []
+    pos = 0
+
+    while pos < len(raw):
+        if in_think:
+            close_idx = raw.find(_THINK_CLOSE_TAG, pos)
+            if close_idx >= 0:
+                pos = close_idx + len(_THINK_CLOSE_TAG)
+                in_think = False
+                continue
+
+            remainder = raw[pos:]
+            for i in range(min(len(_THINK_CLOSE_TAG) - 1, len(remainder)), 0, -1):
+                if remainder.endswith(_THINK_CLOSE_TAG[:i]):
+                    return "".join(clean_parts), remainder[-i:], True
+            return "".join(clean_parts), "", True
+
+        open_idx = raw.find(_THINK_OPEN_TAG, pos)
+        if open_idx >= 0:
+            clean_parts.append(raw[pos:open_idx])
+            pos = open_idx + len(_THINK_OPEN_TAG)
+            in_think = True
+            continue
+
+        remainder = raw[pos:]
+        for i in range(min(len(_THINK_OPEN_TAG) - 1, len(remainder)), 0, -1):
+            if remainder.endswith(_THINK_OPEN_TAG[:i]):
+                clean_parts.append(remainder[:-i])
+                return "".join(clean_parts), remainder[-i:], False
+        clean_parts.append(remainder)
+        return "".join(clean_parts), "", False
+
+    return "".join(clean_parts), "", in_think
+
+
+def _with_xml_tool_stop_sequence(
+    stop_sequences: list[str] | str | None,
+) -> list[str]:
+    if stop_sequences is None:
+        sequences: list[str] = []
+    elif isinstance(stop_sequences, str):
+        sequences = [stop_sequences]
+    else:
+        sequences = list(stop_sequences)
+
+    if REACT_TOOL_STOP_SEQUENCE not in sequences:
+        sequences.append(REACT_TOOL_STOP_SEQUENCE)
+    return sequences
 
 
 def _stream_claude_events(
@@ -232,14 +354,15 @@ def _stream_claude_events(
     messages: list[dict[str, Any]],
     requested_model: str,
     upstream_model: str | None = None,
-    openai_tools: list[dict[str, Any]] | None = None,
-    openai_tool_choice: Any = None,
     enable_thinking: bool = False,
     has_tools: bool = False,
+    native_tools: list[dict[str, Any]] | None = None,
+    native_tool_choice: Any = None,
     thinking_budget_tokens: int | None = None,
     max_tokens: int | None = None,
     temperature: float | None = None,
     top_p: float | None = None,
+    stop_sequences: list[str] | str | None = None,
 ) -> Generator[bytes, None, None]:
     q: "queue.Queue[Any]" = queue.Queue(maxsize=512)
     result_holder: dict[str, Any] = {}
@@ -259,22 +382,23 @@ def _stream_claude_events(
         try:
             res = client.call_api(
                 messages,
-                model=upstream_model,  # None for per-request clients (uses self.model)
+                model=upstream_model,
                 max_retries=1,
                 stream=True,
                 on_chunk=on_chunk,
                 on_reasoning=on_reasoning,
                 on_tool_call=on_tool_call,
-                tools=openai_tools,
-                tool_choice=openai_tool_choice,
+                tools=native_tools,
+                tool_choice=native_tool_choice,
                 thinking=enable_thinking,
                 thinking_budget_tokens=thinking_budget_tokens,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                stop_sequences=stop_sequences,
             )
             result_holder["result"] = res
-        except Exception as e:  # pragma: no cover
+        except Exception as e:
             result_holder["result"] = {"success": False, "error": str(e)}
         finally:
             q.put(_SENTINEL_DONE)
@@ -285,16 +409,16 @@ def _stream_claude_events(
     yield sse_message_start(message_id, requested_model, input_tokens=0).encode("utf-8")
     yield sse_ping().encode("utf-8")
 
-    # Track content block state
     current_block_index = 0
-    current_block_type: str | None = None  # "text", "thinking", or "tool_use"
+    current_block_type: str | None = None
     streamed_any = False
+    emitted_tool_use = False
     last_ping = time.time()
 
-    # XML tool call buffering: accumulate text chunks, detect XML patterns,
-    # then convert to tool_use content blocks instead of plain text.
     text_buffer = ""
-    xml_parsing = False  # True once we detect <function_calls> start
+    xml_parsing = False
+    think_tail = ""
+    in_think_text = False
 
     def _close_block() -> None:
         nonlocal current_block_type, current_block_index
@@ -309,7 +433,6 @@ def _stream_claude_events(
         current_block_type = btype
 
     def _flush_text_as_block(text: str) -> None:
-        """Emit a complete text content block for the given text."""
         nonlocal current_block_index, streamed_any
         if not text:
             return
@@ -319,53 +442,34 @@ def _stream_claude_events(
         yield sse_content_block_delta(text, current_block_index).encode("utf-8")
 
     def _emit_tool_use_block(tool: dict[str, Any]) -> None:
-        """Emit a tool_use content block with progressive input_json_delta."""
-        nonlocal current_block_index, streamed_any
+        nonlocal current_block_index, streamed_any, emitted_tool_use
         yield from _close_block()
-        yield from _open_block(
-            "tool_use",
-            tool_id=tool["id"],
-            tool_name=tool["name"],
-        )
+        yield from _open_block("tool_use", tool_id=tool["id"], tool_name=tool["name"])
         streamed_any = True
+        emitted_tool_use = True
         json_str = json.dumps(tool["input"], ensure_ascii=False)
-        # Progressive streaming: send in ~30 char chunks to mimic native
-        # Anthropic streaming behaviour. Single-chunk for very short JSON.
         _CHUNK = 30
         if len(json_str) <= _CHUNK * 2:
             yield sse_tool_input_delta(json_str, current_block_index).encode("utf-8")
         else:
             for i in range(0, len(json_str), _CHUNK):
-                yield sse_tool_input_delta(
-                    json_str[i:i + _CHUNK], current_block_index
-                ).encode("utf-8")
+                yield sse_tool_input_delta(json_str[i:i + _CHUNK], current_block_index).encode("utf-8")
 
     def _parse_and_emit_tools(buf: str) -> str:
-        """Try to parse XML tool calls from buffer. Returns remaining text
-        after the last close-tag on success, or the original buffer on parse
-        failure (so text is emitted as-is, avoiding a hang).
-
-        Handles both <function_calls> and <tool_call> formats."""
         nonlocal xml_parsing
         try:
             tools = parse_xml_tool_calls(buf)
             if tools:
                 for tool in tools:
                     yield from _emit_tool_use_block(tool)
-            # Find the last structural close-tag, skipping CDATA regions.
-            # Check both <function_calls> and <tool_call> formats.
-            last_func = _rfind_outside_cdata(buf, "</function_calls>")
-            last_tool = buf.rfind("</tool_call>")  # <tool_call> has no nested tags, rfind is safe
-            last_close = max(last_func, last_tool)
-            if last_close != -1:
-                close_len = len("</function_calls>") if last_close == last_func else len("</tool_call>")
-                remaining = buf[last_close + close_len:]
-                xml_parsing = (
-                    "<function_calls>" in remaining or "<tool_call>" in remaining
-                )
+            consumed_end = find_xml_tool_call_consumed_end(buf)
+            if consumed_end == -1:
+                consumed_end = find_xml_tool_call_end(buf)
+            if consumed_end != -1:
+                remaining = buf[consumed_end:]
+                xml_parsing = has_xml_tool_call_marker(remaining)
                 return remaining
         except Exception:
-            # Malformed XML — abandon parsing, emit buffer as plain text
             pass
         xml_parsing = False
         return buf
@@ -394,7 +498,14 @@ def _stream_claude_events(
             yield sse_thinking_delta(payload, current_block_index).encode("utf-8")
 
         elif kind == "text":
-            # When no tools are present, forward chunks immediately.
+            think_tail += payload
+            payload, think_tail, in_think_text = _filter_stream_think_tags(
+                think_tail,
+                in_think_text,
+            )
+            if not payload:
+                continue
+
             if not has_tools:
                 if current_block_type != "text":
                     yield from _close_block()
@@ -405,39 +516,24 @@ def _stream_claude_events(
 
             text_buffer += payload
 
-            # Detect XML tool call start — handle both <function_calls>
-            # (injected prompt) and <tool_call> (DeepSeek native) formats.
             if not xml_parsing:
-                func_idx = text_buffer.find("<function_calls>")
-                tool_idx = text_buffer.find("<tool_call>")
-                tag_start: int | None = None
-                # Use whichever appears first; prefer the non-CDATA one
-                if func_idx != -1:
-                    tag_start = func_idx
-                if tool_idx != -1 and (tag_start is None or tool_idx < tag_start):
-                    tag_start = tool_idx
+                tag_start = find_xml_tool_call_start(text_buffer)
 
-                if tag_start is not None:
+                if tag_start != -1:
                     xml_parsing = True
                     pre_xml = text_buffer[:tag_start]
                     if pre_xml.strip():
                         yield from _flush_text_as_block(pre_xml.strip())
 
             if xml_parsing:
-                # Complete XML block(s) ready?
-                has_close = "</function_calls>" in text_buffer or "</tool_call>" in text_buffer
+                has_close = find_xml_tool_call_end(text_buffer) != -1
                 if has_close:
                     text_buffer = yield from _parse_and_emit_tools(text_buffer)
-                    # Emit remaining non-XML text
                     if text_buffer and not xml_parsing:
                         if text_buffer.strip():
                             yield from _flush_text_as_block(text_buffer.strip())
                         text_buffer = ""
             else:
-                # Keep a trailing window so a <function_calls> / <tool_call>
-                # tag split across SSE chunks isn't missed.  <tool_call> is
-                # 10 chars; <function_calls> is 16 chars; 128-char window is
-                # generous enough for split attributes and long pre-tool text.
                 _TAG_WINDOW = 128
                 if len(text_buffer) > _TAG_WINDOW:
                     safe_text = text_buffer[:-_TAG_WINDOW]
@@ -449,37 +545,32 @@ def _stream_claude_events(
                     text_buffer = text_buffer[-_TAG_WINDOW:]
 
         elif kind == "tool_call":
-            # Structured tool call from upstream (native OpenAI tool_calls)
             yield from _close_block()
-            tc_id = payload.get("id", f"toolu_{threading.get_ident()}")
+            tc_id = normalize_tool_use_id(payload.get("id", f"toolu_{threading.get_ident()}"))
             func = payload.get("function", {})
             tc_name = func.get("name", "")
             yield from _open_block("tool_use", tool_id=tc_id, tool_name=tc_name)
             current_block_type = "tool_use"
             streamed_any = True
+            emitted_tool_use = True
             raw_args = func.get("arguments", "{}")
             if raw_args:
-                # Progressive JSON for native tool calls too
                 if len(raw_args) <= 60:
                     yield sse_tool_input_delta(raw_args, current_block_index).encode("utf-8")
                 else:
                     for i in range(0, len(raw_args), 30):
-                        yield sse_tool_input_delta(
-                            raw_args[i:i + 30], current_block_index
-                        ).encode("utf-8")
+                        yield sse_tool_input_delta(raw_args[i:i + 30], current_block_index).encode("utf-8")
 
         if time.time() - last_ping > 15:
             yield sse_ping().encode("utf-8")
             last_ping = time.time()
 
-    # Flush any remaining text buffer
     if text_buffer.strip():
         if xml_parsing:
             text_buffer = yield from _parse_and_emit_tools(text_buffer)
         if text_buffer.strip():
             yield from _flush_text_as_block(text_buffer.strip())
 
-    # Close last content block (use _close_block for proper index tracking)
     if current_block_type is not None:
         yield from _close_block()
 
@@ -488,28 +579,21 @@ def _stream_claude_events(
         err_msg = str(res.get("error", "upstream error"))
         if not streamed_any:
             yield sse_content_block_start(0, block_type="text").encode("utf-8")
-            yield sse_content_block_delta(
-                f"[upstream error] {err_msg}", 0
-            ).encode("utf-8")
+            yield sse_content_block_delta(f"[upstream error] {err_msg}", 0).encode("utf-8")
             yield sse_content_block_stop(0).encode("utf-8")
         yield sse_error(err_msg).encode("utf-8")
         yield sse_message_stop().encode("utf-8")
         return
 
     usage = res.get("usage", {}) or {}
-    input_tokens = int(usage.get("prompt_tokens", 0) or 0)
     output_tokens = int(usage.get("completion_tokens", 0) or 0)
     finish_reason = res.get("finish_reason") or ""
 
-    has_tool_calls = bool(res.get("tool_calls"))
-    # Also check for XML-parsed tool calls (both supported formats).
+    has_tool_calls = emitted_tool_use or bool(res.get("tool_calls"))
     if not has_tool_calls:
         result_content = res.get("content", "") or ""
-        has_xml = _find_outside_cdata(result_content, "<function_calls>") != -1
-        has_native = "<tool_call>" in result_content
-        has_tool_calls = has_xml or has_native
+        has_tool_calls = has_xml_tool_call_marker(result_content)
 
-    # Map OpenAI finish_reason to Anthropic stop_reason
     if has_tool_calls:
         stop_reason = "tool_use"
     elif finish_reason == "length":

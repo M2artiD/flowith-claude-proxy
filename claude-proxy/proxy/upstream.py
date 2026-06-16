@@ -1,8 +1,4 @@
-"""Minimal HTTP client for the Flowith LLM endpoint.
-
-Mirrors only what the proxy needs: a ``call_api`` that supports both
-blocking and streaming modes, returning a normalized dict.
-"""
+"""Minimal HTTP client for the Flowith LLM endpoint."""
 
 from __future__ import annotations
 
@@ -29,17 +25,13 @@ def _dump_intercept(
     is_stream: bool,
     upstream_model: str | None,
 ) -> None:
-    """Write a complete request/response dump to a timestamped JSON file."""
     if not DEBUG_DUMP:
         return
-
     dump_dir = Path(DEBUG_DUMP_DIR)
     dump_dir.mkdir(parents=True, exist_ok=True)
-
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     stream_label = "stream" if is_stream else "nonstream"
     dump_path = dump_dir / f"flowith_{stream_label}_{ts}.json"
-
     dump = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "request": {
@@ -54,24 +46,17 @@ def _dump_intercept(
         },
         "upstream_model": upstream_model,
     }
-
     with open(dump_path, "w", encoding="utf-8") as f:
         json.dump(dump, f, ensure_ascii=False, indent=2)
-
-    print(
-        f"[intercept] Dumped upstream {stream_label} call → {dump_path}",
-        flush=True,
-    )
+    print(f"[intercept] Dumped upstream {stream_label} call -> {dump_path}", flush=True)
 
 
 _RETRY_STRATEGY = Retry(
     total=3,
-    connect=2,          # retry TCP/TLS handshake failures
-    read=2,             # retry mid-stream read failures
+    connect=2,
+    read=2,
     backoff_factor=0.5,
     status_forcelist=[429, 500, 502, 503, 504],
-    # FileNotFoundError(2) on Windows is a connect-level failure —
-    # urllib3 will retry it because connect=2 covers socket errors.
     raise_on_status=False,
 )
 
@@ -94,19 +79,17 @@ class FlowithClient:
         self.thinking = thinking
         self.ssl_verify = ssl_verify
         self.proxies = proxies
-
         self._make_session()
 
     def _make_session(self) -> None:
-        """Create (or recreate) a requests.Session with correct TLS & retry config."""
         self._session = requests.Session()
         self._session.proxies = self.proxies or {}
         self._session.headers.update({"Authorization": f"Bearer {self.api_key}"})
         self._session.trust_env = False
-
-        # Mount an adapter with urllib3-level retry.  Connection errors
-        # (including Windows FileNotFoundError on stale proxy sockets)
-        # are retried transparently inside urllib3 before ever surfacing.
+        self._session.verify = self.ssl_verify
+        if not self.ssl_verify:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         adapter = HTTPAdapter(
             max_retries=_RETRY_STRATEGY,
             pool_maxsize=4,
@@ -115,23 +98,7 @@ class FlowithClient:
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
 
-        if not self.ssl_verify:
-            import ssl
-            import urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            _ctx = ssl.create_default_context()
-            _ctx.check_hostname = False
-            _ctx.verify_mode = ssl.CERT_NONE
-            self._session.verify = _ctx
-        else:
-            self._session.verify = True
-
     def _reset_session(self) -> None:
-        """Close the current session and create a fresh one.
-
-        Called when a fatal connection-level error is detected, so that
-        stale sockets can't poison subsequent requests.
-        """
         try:
             self._session.close()
         except Exception:
@@ -154,6 +121,7 @@ class FlowithClient:
         max_tokens: int | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
+        stop_sequences: list[str] | str | None = None,
     ) -> dict[str, Any]:
         use_model = model or self.model
         last_error: Exception | None = None
@@ -161,7 +129,6 @@ class FlowithClient:
         for attempt in range(1, max_retries + 1):
             try:
                 start = time.time()
-
                 use_thinking = thinking if thinking is not None else self.thinking
 
                 payload: dict[str, Any] = {
@@ -182,6 +149,8 @@ class FlowithClient:
                     payload["temperature"] = temperature
                 if top_p is not None:
                     payload["top_p"] = top_p
+                if stop_sequences:
+                    payload["stop"] = stop_sequences
 
                 response = self._session.post(
                     self.base_url,
@@ -246,14 +215,9 @@ class FlowithClient:
                     f"Original: {e}"
                 )
             except RequestException as e:
-                # Connection-level error — reset session so stale sockets
-                # can't poison the next attempt.
                 self._reset_session()
                 last_error = Exception(f"Upstream request failed: {e}")
             except OSError as e:
-                # Windows FileNotFoundError(2) and similar OS-level socket errors
-                # arrive here.  urllib3's Retry handles many of them, but when it
-                # can't (e.g. the entire pool is exhausted) we reset explicitly.
                 self._reset_session()
                 last_error = Exception(f"Upstream connection error: {e}")
             except Exception as e:
@@ -295,18 +259,19 @@ class FlowithClient:
                 chunk = json.loads(line)
             except Exception:
                 continue
-            # Detect upstream error chunks (e.g. rate limits, auth errors)
+
             if "error" in chunk and not chunk.get("choices"):
                 err_info = chunk["error"]
                 err_msg = err_info.get("message", str(err_info)) if isinstance(err_info, dict) else str(err_info)
-                # Surface the first error; continue parsing to collect any partial content
                 if finish_reason is None:
                     finish_reason = f"error: {err_msg}"
                 continue
+
             if "model" in chunk and not upstream_model:
                 upstream_model = chunk["model"]
             if "usage" in chunk:
                 usage = chunk.get("usage", {}) or usage
+
             for choice in chunk.get("choices", []) or []:
                 delta = choice.get("delta", {}) or {}
                 fr = choice.get("finish_reason")
@@ -318,13 +283,13 @@ class FlowithClient:
                     content_parts.append(piece)
                     if on_chunk:
                         on_chunk(piece)
+
                 reasoning = delta.get("reasoning_content")
                 if reasoning:
                     reasoning_parts.append(reasoning)
                     if on_reasoning:
                         on_reasoning(reasoning)
 
-                # Accumulate tool call deltas
                 tc_deltas = delta.get("tool_calls")
                 if tc_deltas:
                     for tc in tc_deltas:
@@ -344,7 +309,6 @@ class FlowithClient:
                         if func_delta.get("arguments"):
                             entry["function"]["arguments"] += func_delta["arguments"]
 
-        # Dump streaming response (collect raw lines, not re-split)
         _dump_intercept(
             payload=payload,
             response_status=response.status_code,
@@ -354,7 +318,6 @@ class FlowithClient:
             upstream_model=upstream_model,
         )
 
-        # Finalize tool calls and notify
         tool_calls: list[dict[str, Any]] | None = None
         if tool_call_accum:
             tool_calls = [tool_call_accum[i] for i in sorted(tool_call_accum)]

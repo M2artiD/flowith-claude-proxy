@@ -6,11 +6,8 @@ import json
 import os
 from pathlib import Path
 
-# Project root (one level above this package)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Load .env into os.environ before reading any env vars.
-# python-dotenv is optional: if not installed, rely on system env vars only.
 try:
     from dotenv import load_dotenv
     load_dotenv(_PROJECT_ROOT / ".env", override=False)
@@ -23,42 +20,36 @@ FLOWITH_BASE_URL = os.environ.get(
     "https://edge.flowith.io/external/use/llm",
 )
 
-# Default model used when the client doesn't request anything we recognize.
 DEFAULT_MODEL = os.environ.get("FLOWITH_DEFAULT_MODEL", "claude-4.6-sonnet")
 
-# Upstream request timeout (seconds)
 API_TIMEOUT = int(os.environ.get("FLOWITH_TIMEOUT", "120"))
 
-# Upstream TLS verification. Set FLOWITH_SSL_VERIFY=false only as a workaround
-# when a local proxy/VPN/firewall breaks TLS handshakes.
+FLOWITH_TOOL_MODE = os.environ.get("FLOWITH_TOOL_MODE", "xml").strip().lower()
+if FLOWITH_TOOL_MODE not in {"xml", "native"}:
+    FLOWITH_TOOL_MODE = "xml"
+
 FLOWITH_SSL_VERIFY = os.environ.get("FLOWITH_SSL_VERIFY", "true").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
+    "0", "false", "no", "off",
 }
 
-# HTTP/SOCKS proxy for upstream requests (e.g., Clash: http://127.0.0.1:7890)
-# Falls back to HTTPS_PROXY / HTTP_PROXY env vars if set.
-# Use socks5://127.0.0.1:7891 for SOCKS5 proxies.
+# HTTP/SOCKS proxy
 _https_proxy = os.environ.get("FLOWITH_UPSTREAM_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
 _http_proxy = os.environ.get("FLOWITH_UPSTREAM_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or ""
 UPSTREAM_PROXIES: dict[str, str] | None = None
 if _https_proxy:
     UPSTREAM_PROXIES = {"https": _https_proxy, "http": _http_proxy or _https_proxy}
 
-# Debug: dump raw upstream request/response to files. Set to "true" to enable.
+# Debug dump
 DEBUG_DUMP = os.environ.get("FLOWITH_DEBUG_DUMP", "false").strip().lower() in {
     "1", "true", "yes", "on",
 }
 DEBUG_DUMP_DIR = os.environ.get("FLOWITH_DEBUG_DUMP_DIR", str(_PROJECT_ROOT / "debug_dumps"))
 
-# Server bind defaults
+# Server bind
 DEFAULT_HOST = os.environ.get("FLOWITH_API_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("FLOWITH_API_PORT", "8787"))
 
-# Custom model aliases: JSON string, merged with built-in aliases (user ones win).
-# e.g. FLOWITH_MODEL_ALIASES={"claude-3-5-sonnet-20241022":"claude-4.6-sonnet"}
+# Custom model aliases
 CUSTOM_MODEL_ALIASES: dict[str, str] = {}
 _raw_aliases = os.environ.get("FLOWITH_MODEL_ALIASES", "").strip()
 if _raw_aliases:
@@ -69,17 +60,11 @@ if _raw_aliases:
     except (json.JSONDecodeError, AttributeError):
         pass
 
-def load_api_key() -> str | None:
-    """Resolve a Flowith API key.
 
-    Order:
-      1. FLOWITH_API_KEY env var (now includes .env values via load_dotenv)
-      2. Fallback: manually scan .env in project root or CWD
-    """
+def load_api_key() -> str | None:
     key = os.environ.get("FLOWITH_API_KEY")
     if key:
         return key.strip()
-
     for candidate in (_PROJECT_ROOT / ".env", Path.cwd() / ".env"):
         if not candidate.exists():
             continue

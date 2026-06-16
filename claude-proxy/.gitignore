@@ -27,12 +27,3 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
-
-# Pytest
-.pytest_cache/
-
-# 旧项目遗留
-output_*.py
-output_*.txt
-output_*.json
-output_*.env
