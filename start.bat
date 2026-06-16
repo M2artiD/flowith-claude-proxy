@@ -9,15 +9,41 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-if not exist venv\Scripts\activate.bat (
+set "INSTALL_LOCK=%CD%\.install.lock"
+
+:wait_install_lock
+mkdir "%INSTALL_LOCK%" >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo [INFO] Another launcher is installing dependencies. Waiting...
+    timeout /t 2 /nobreak >nul
+    goto wait_install_lock
+)
+
+if exist venv\Scripts\python.exe (
+    venv\Scripts\python.exe -c "import pip" >nul 2>&1
+    if %ERRORLEVEL% NEQ 0 (
+        echo [WARN] Existing venv has broken pip. Recreating venv...
+        rd /s /q venv
+    )
+)
+
+if not exist venv\Scripts\python.exe (
     echo [INFO] Creating venv...
     python -m venv venv
 )
 
-call venv\Scripts\activate.bat
-
 echo [INFO] Installing dependencies...
-pip install -q -r requirements.txt >nul 2>&1
+venv\Scripts\python.exe -m ensurepip --upgrade >nul 2>&1
+venv\Scripts\python.exe -m pip install -q -r requirements.txt
+set "PIP_EXIT=%ERRORLEVEL%"
+rmdir "%INSTALL_LOCK%" >nul 2>&1
+if %PIP_EXIT% NEQ 0 (
+    echo [ERROR] Dependency install failed.
+    pause
+    exit /b %PIP_EXIT%
+)
+
+call venv\Scripts\activate.bat
 
 if not exist .env (
     if exist .env.example (
