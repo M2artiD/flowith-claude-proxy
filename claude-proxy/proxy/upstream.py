@@ -19,10 +19,12 @@ from urllib3.util.retry import Retry
 from .config import (
     DEBUG_DUMP,
     DEBUG_DUMP_DIR,
+    FLOWITH_CONNECT_TIMEOUT,
     FLOWITH_MAX_CONCURRENCY,
     FLOWITH_POOL_MAXSIZE,
     FLOWITH_RETRY_BACKOFF,
     FLOWITH_RETRY_JITTER,
+    FLOWITH_RETRY_MAX_DELAY,
     FLOWITH_RETRY_TOTAL,
 )
 
@@ -80,7 +82,13 @@ _UPSTREAM_SEMAPHORE = (
 
 
 def _retry_delay(attempt: int) -> float:
-    return FLOWITH_RETRY_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, FLOWITH_RETRY_JITTER)
+    delay = FLOWITH_RETRY_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, FLOWITH_RETRY_JITTER)
+    return min(delay, FLOWITH_RETRY_MAX_DELAY)
+
+
+def _request_timeout(read_timeout: int | float) -> tuple[float, int | float]:
+    connect_timeout = max(1.0, min(float(FLOWITH_CONNECT_TIMEOUT), float(read_timeout)))
+    return (connect_timeout, read_timeout)
 
 
 class FlowithClient:
@@ -148,7 +156,7 @@ class FlowithClient:
         use_model = model or self.model
         last_error: Exception | None = None
 
-        total_attempts = max(1, max_retries)
+        total_attempts = max(1, max_retries, FLOWITH_RETRY_TOTAL)
 
         for attempt in range(1, total_attempts + 1):
             acquired = False
@@ -184,7 +192,7 @@ class FlowithClient:
                 response = self._session.post(
                     self.base_url,
                     json=payload,
-                    timeout=self.timeout,
+                    timeout=_request_timeout(self.timeout),
                     stream=stream,
                 )
                 elapsed_ms = (time.time() - start) * 1000
@@ -201,6 +209,8 @@ class FlowithClient:
                     last_error = Exception(
                         f"HTTP {response.status_code}: {response.text[:300]}"
                     )
+                    if response.status_code in {429, 500, 502, 503, 504}:
+                        self._reset_session()
                 else:
                     if stream:
                         return self._parse_stream(
@@ -243,7 +253,7 @@ class FlowithClient:
                 self._reset_session()
                 last_error = Exception(
                     "Upstream SSL error after retries; try lowering FLOWITH_MAX_CONCURRENCY "
-                    "or temporarily set FLOWITH_SSL_VERIFY=false for diagnosis. "
+                    "and check local proxy, firewall, or CA certificate settings. "
                     f"Original: {e}"
                 )
             except RequestException as e:

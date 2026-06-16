@@ -22,14 +22,16 @@ FLOWITH_BASE_URL = os.environ.get(
 
 DEFAULT_MODEL = os.environ.get("FLOWITH_DEFAULT_MODEL", "claude-4.6-sonnet")
 
-API_TIMEOUT = int(os.environ.get("FLOWITH_TIMEOUT", "120"))
+API_TIMEOUT = int(os.environ.get("FLOWITH_TIMEOUT", "300"))
 
 # Upstream stability tuning
+FLOWITH_CONNECT_TIMEOUT = float(os.environ.get("FLOWITH_CONNECT_TIMEOUT", "30"))
 FLOWITH_MAX_CONCURRENCY = int(os.environ.get("FLOWITH_MAX_CONCURRENCY", "3"))
-FLOWITH_POOL_MAXSIZE = int(os.environ.get("FLOWITH_POOL_MAXSIZE", str(max(4, FLOWITH_MAX_CONCURRENCY))))
-FLOWITH_RETRY_TOTAL = int(os.environ.get("FLOWITH_RETRY_TOTAL", "3"))
-FLOWITH_RETRY_BACKOFF = float(os.environ.get("FLOWITH_RETRY_BACKOFF", "0.75"))
-FLOWITH_RETRY_JITTER = float(os.environ.get("FLOWITH_RETRY_JITTER", "0.5"))
+FLOWITH_POOL_MAXSIZE = int(os.environ.get("FLOWITH_POOL_MAXSIZE", str(max(8, FLOWITH_MAX_CONCURRENCY * 2))))
+FLOWITH_RETRY_TOTAL = int(os.environ.get("FLOWITH_RETRY_TOTAL", "5"))
+FLOWITH_RETRY_BACKOFF = float(os.environ.get("FLOWITH_RETRY_BACKOFF", "0.5"))
+FLOWITH_RETRY_JITTER = float(os.environ.get("FLOWITH_RETRY_JITTER", "0.25"))
+FLOWITH_RETRY_MAX_DELAY = float(os.environ.get("FLOWITH_RETRY_MAX_DELAY", "8"))
 
 FLOWITH_TOOL_MODE = os.environ.get("FLOWITH_TOOL_MODE", "xml").strip().lower()
 if FLOWITH_TOOL_MODE not in {"xml", "native"}:

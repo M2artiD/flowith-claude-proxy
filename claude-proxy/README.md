@@ -104,3 +104,26 @@ FLOWITH_MODEL_ALIASES={"claude-4.6-sonnet":"claude-4.6-sonnet","claude-opus-4.7"
 ```powershell
 python -m pytest -q
 ```
+## 上游稳定性配置
+
+代理默认会对 Flowith 上游请求做连接复用、限流和自动重试。常用参数：
+
+```env
+FLOWITH_TIMEOUT=300
+FLOWITH_CONNECT_TIMEOUT=30
+FLOWITH_MAX_CONCURRENCY=3
+FLOWITH_POOL_MAXSIZE=8
+FLOWITH_RETRY_TOTAL=5
+FLOWITH_RETRY_BACKOFF=0.5
+FLOWITH_RETRY_JITTER=0.25
+FLOWITH_RETRY_MAX_DELAY=8
+FLOWITH_SSL_VERIFY=true
+```
+
+说明：
+
+- `FLOWITH_TIMEOUT` 是读取响应的最长等待时间，适合长回答或流式输出。
+- `FLOWITH_CONNECT_TIMEOUT` 是建立连接的等待时间，连接失败会更快进入重试。
+- `FLOWITH_RETRY_TOTAL` 是全局最小请求尝试次数；即使某些流式入口传入较低重试次数，也会使用该下限。
+- `FLOWITH_RETRY_MAX_DELAY` 会限制指数退避的最大等待时间，避免重连间隔过长。
+- `FLOWITH_SSL_VERIFY` 默认保持 `true`；SSL EOF 或临时网络错误会重建 session 后重试，不建议为了规避偶发错误关闭证书校验。
