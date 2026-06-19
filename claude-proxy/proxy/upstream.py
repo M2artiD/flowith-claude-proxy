@@ -20,12 +20,14 @@ from .config import (
     DEBUG_DUMP,
     DEBUG_DUMP_DIR,
     FLOWITH_CONNECT_TIMEOUT,
+    FLOWITH_DISABLE_KEEPALIVE,
     FLOWITH_MAX_CONCURRENCY,
     FLOWITH_POOL_MAXSIZE,
     FLOWITH_RETRY_BACKOFF,
     FLOWITH_RETRY_JITTER,
     FLOWITH_RETRY_MAX_DELAY,
     FLOWITH_RETRY_TOTAL,
+    FLOWITH_SSL_RETRY_EXTRA,
 )
 
 
@@ -109,31 +111,51 @@ class FlowithClient:
         self.thinking = thinking
         self.ssl_verify = ssl_verify
         self.proxies = proxies
-        self._make_session()
+        self._thread_local = threading.local()
+        self._session: requests.Session | None = None
 
-    def _make_session(self) -> None:
-        self._session = requests.Session()
-        self._session.proxies = self.proxies or {}
-        self._session.headers.update({"Authorization": f"Bearer {self.api_key}"})
-        self._session.trust_env = False
-        self._session.verify = self.ssl_verify
+    def _make_session(self) -> requests.Session:
+        session = requests.Session()
+        session.proxies = self.proxies or {}
+        session.headers.update({"Authorization": f"Bearer {self.api_key}"})
+        if FLOWITH_DISABLE_KEEPALIVE:
+            session.headers.update({"Connection": "close"})
+        session.trust_env = False
+        session.verify = self.ssl_verify
         if not self.ssl_verify:
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         adapter = HTTPAdapter(
-            max_retries=_RETRY_STRATEGY,
+            # Keep retries in call_api so SSL EOFs rebuild the Session between attempts.
+            max_retries=0,
+            pool_connections=FLOWITH_POOL_MAXSIZE,
             pool_maxsize=FLOWITH_POOL_MAXSIZE,
             pool_block=True,
         )
-        self._session.mount("https://", adapter)
-        self._session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def _get_session(self) -> requests.Session:
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = self._make_session()
+            self._thread_local.session = session
+            if threading.current_thread() is threading.main_thread():
+                self._session = session
+        return session
 
     def _reset_session(self) -> None:
-        try:
-            self._session.close()
-        except Exception:
-            pass
-        self._make_session()
+        session = getattr(self._thread_local, "session", None)
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+        session = self._make_session()
+        self._thread_local.session = session
+        if threading.current_thread() is threading.main_thread():
+            self._session = session
 
     def call_api(
         self,
@@ -156,10 +178,14 @@ class FlowithClient:
         use_model = model or self.model
         last_error: Exception | None = None
 
-        total_attempts = max(1, max_retries, FLOWITH_RETRY_TOTAL)
+        base_attempts = max(1, max_retries, FLOWITH_RETRY_TOTAL)
+        attempt = 0
+        ssl_extra_used = 0
 
-        for attempt in range(1, total_attempts + 1):
+        while attempt < base_attempts + ssl_extra_used:
+            attempt += 1
             acquired = False
+            retryable_ssl_error = False
             try:
                 if _UPSTREAM_SEMAPHORE is not None:
                     _UPSTREAM_SEMAPHORE.acquire()
@@ -189,7 +215,7 @@ class FlowithClient:
                 if stop_sequences:
                     payload["stop"] = stop_sequences
 
-                response = self._session.post(
+                response = self._get_session().post(
                     self.base_url,
                     json=payload,
                     timeout=_request_timeout(self.timeout),
@@ -251,9 +277,11 @@ class FlowithClient:
                 last_error = Exception("Upstream request timed out")
             except SSLError as e:
                 self._reset_session()
+                retryable_ssl_error = True
                 last_error = Exception(
-                    "Upstream SSL error after retries; try lowering FLOWITH_MAX_CONCURRENCY "
-                    "and check local proxy, firewall, or CA certificate settings. "
+                    "Upstream SSL error after retries; retried with fresh TLS sessions. "
+                    "If it persists, check local proxy, firewall, CA certificate settings, "
+                    "or tune FLOWITH_MAX_CONCURRENCY for your network. "
                     f"Original: {e}"
                 )
             except RequestException as e:
@@ -268,7 +296,14 @@ class FlowithClient:
                 if acquired and _UPSTREAM_SEMAPHORE is not None:
                     _UPSTREAM_SEMAPHORE.release()
 
-            if attempt < total_attempts:
+            if (
+                retryable_ssl_error
+                and attempt >= base_attempts + ssl_extra_used
+                and ssl_extra_used < FLOWITH_SSL_RETRY_EXTRA
+            ):
+                ssl_extra_used += 1
+
+            if attempt < base_attempts + ssl_extra_used:
                 time.sleep(_retry_delay(attempt))
 
         return {"success": False, "error": str(last_error) if last_error else "unknown error"}

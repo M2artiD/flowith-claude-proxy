@@ -201,6 +201,129 @@ class UpstreamStabilityTests(unittest.TestCase):
 
             self.assertEqual(_retry_delay(4), 8)
 
+
+    def test_concurrent_calls_use_isolated_sessions(self):
+        import threading
+
+        sessions = []
+        sessions_lock = threading.Lock()
+        barrier = threading.Barrier(2)
+
+        class BlockingSession(FakeSession):
+            def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                barrier.wait(timeout=2)
+                return FakeResponse()
+
+        def make_session():
+            session = BlockingSession([FakeResponse()])
+            with sessions_lock:
+                sessions.append(session)
+            return session
+
+        with patch.object(requests, "Session", side_effect=make_session):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            results = []
+
+            def worker():
+                results.append(client.call_api([{"role": "user", "content": "ping"}], max_retries=1))
+
+            threads = [threading.Thread(target=worker), threading.Thread(target=worker)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result["success"] for result in results))
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual(sum(len(session.calls) for session in sessions), 2)
+
+    def test_keepalive_is_disabled_by_default_to_avoid_stale_tls_reuse(self):
+        sessions = []
+
+        def make_session():
+            session = FakeSession([FakeResponse()])
+            sessions.append(session)
+            return session
+
+        with patch.object(requests, "Session", side_effect=make_session):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api([{"role": "user", "content": "ping"}], max_retries=1)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(sessions[0].headers["Connection"], "close")
+
+    def test_ssl_eof_uses_extra_attempt_budget_for_transient_handshake_failures(self):
+        outcomes = [
+            SSLError("EOF occurred in violation of protocol"),
+            SSLError("EOF occurred in violation of protocol"),
+            SSLError("EOF occurred in violation of protocol"),
+            FakeResponse(),
+        ]
+        sessions = []
+
+        def make_session():
+            session = FakeSession(outcomes)
+            sessions.append(session)
+            return session
+
+        with (
+            patch.object(requests, "Session", side_effect=make_session),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 2),
+            patch("proxy.upstream.FLOWITH_SSL_RETRY_EXTRA", 2),
+            patch("proxy.upstream.time.sleep"),
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api([{"role": "user", "content": "ping"}], max_retries=1)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["content"], "pong")
+        self.assertEqual(len(sessions), 4)
+
+    def test_ssl_eof_reconnects_ten_times_by_default(self):
+        outcomes = [SSLError("EOF occurred in violation of protocol") for _ in range(10)]
+        outcomes.append(FakeResponse())
+        sessions = []
+
+        def make_session():
+            session = FakeSession(outcomes)
+            sessions.append(session)
+            return session
+
+        with (
+            patch.object(requests, "Session", side_effect=make_session),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 1),
+            patch("proxy.upstream.time.sleep"),
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api([{"role": "user", "content": "ping"}], max_retries=1)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["content"], "pong")
+        self.assertEqual(len(sessions), 11)
+        self.assertTrue(all(session.closed for session in sessions[:-1]))
+
     def test_ssl_error_message_keeps_certificate_verification_enabled_by_default(self):
         outcomes = [SSLError("EOF occurred in violation of protocol")]
         sessions = []
@@ -213,6 +336,7 @@ class UpstreamStabilityTests(unittest.TestCase):
         with (
             patch.object(requests, "Session", side_effect=make_session),
             patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 1),
+            patch("proxy.upstream.FLOWITH_SSL_RETRY_EXTRA", 0),
             patch("proxy.upstream.time.sleep"),
         ):
             client = FlowithClient(
