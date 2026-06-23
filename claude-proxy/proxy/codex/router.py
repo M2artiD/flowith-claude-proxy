@@ -20,6 +20,7 @@ from ..adapter import (
     new_message_id,
     parse_xml_tool_calls,
 )
+from .. import __version__
 from ..config import DEFAULT_MODEL
 from ..upstream import FlowithClient
 
@@ -58,6 +59,54 @@ def create_router(
             ],
         }
 
+    @router.get("/api/v1/models")
+    def list_api_v1_models() -> dict[str, Any]:
+        return list_models()
+
+    @router.get("/api/tags")
+    def list_ollama_tags() -> dict[str, Any]:
+        require_profile("codex", "openai")
+        from ..config import CUSTOM_MODEL_ALIASES
+
+        model_ids = sorted(set(CUSTOM_MODEL_ALIASES.values()) | {DEFAULT_MODEL})
+        return {
+            "models": [
+                {
+                    "name": model_id,
+                    "model": model_id,
+                    "modified_at": "1970-01-01T00:00:00Z",
+                    "size": 0,
+                    "digest": "",
+                    "details": {"family": "flowith", "parameter_size": "", "quantization_level": ""},
+                }
+                for model_id in model_ids
+            ]
+        }
+
+    @router.get("/version")
+    @router.get("/api/version")
+    def version() -> dict[str, Any]:
+        require_profile("codex", "openai")
+        return {"version": __version__}
+
+    @router.get("/props")
+    @router.get("/v1/props")
+    @router.get("/api/props")
+    def props() -> dict[str, Any]:
+        require_profile("codex", "openai")
+        return {
+            "service": "flowith-claude-proxy",
+            "version": __version__,
+            "capabilities": {
+                "chat_completions": True,
+                "responses": True,
+                "models": True,
+                "streaming": True,
+            },
+        }
+
+    @router.post("/chat/completions")
+    @router.post("/api/chat/completions")
     @router.post("/v1/chat/completions")
     async def create_chat_completion(
         request: Request,
@@ -72,8 +121,19 @@ def create_router(
         flowith_model = map_model(requested_model, default=DEFAULT_MODEL)
         client, upstream_model = get_client_for_key(api_key, flowith_model)
         messages = _chat_messages_from_body(body)
+        chat_tools = _openai_tools_to_anthropic(body.get("tools") or [])
+        if chat_tools:
+            messages = _inject_responses_tool_prompt(
+                messages,
+                chat_tools,
+                tool_choice=body.get("tool_choice"),
+            )
         if not messages:
             raise HTTPException(status_code=400, detail="At least one message is required")
+
+        stop_sequences = body.get("stop")
+        if chat_tools:
+            stop_sequences = with_xml_tool_stop_sequence(stop_sequences)
 
         if bool(body.get("stream")):
             return StreamingResponse(
@@ -85,9 +145,9 @@ def create_router(
                     max_tokens=body.get("max_tokens"),
                     temperature=body.get("temperature"),
                     top_p=body.get("top_p"),
-                    tools=body.get("tools"),
+                    tools=chat_tools,
                     tool_choice=body.get("tool_choice"),
-                    stop_sequences=body.get("stop"),
+                    stop_sequences=stop_sequences,
                 ),
                 media_type="text/event-stream; charset=utf-8",
                 headers={
@@ -102,12 +162,12 @@ def create_router(
             model=upstream_model,
             max_retries=2,
             stream=False,
-            tools=body.get("tools"),
-            tool_choice=body.get("tool_choice"),
+            tools=None if chat_tools else body.get("tools"),
+            tool_choice=None if chat_tools else body.get("tool_choice"),
             max_tokens=body.get("max_tokens"),
             temperature=body.get("temperature"),
             top_p=body.get("top_p"),
-            stop_sequences=body.get("stop"),
+            stop_sequences=stop_sequences,
         )
         if not result.get("success"):
             return _upstream_error_response(result)
@@ -396,9 +456,49 @@ def _usage_responses(usage: dict[str, Any]) -> dict[str, int]:
     }
 
 
+def _chat_tool_call_item(tool: dict[str, Any]) -> dict[str, Any]:
+    _, call_id = _responses_call_ids(tool.get("id"))
+    arguments = json.dumps(
+        tool.get("input", {}) if isinstance(tool.get("input"), dict) else {},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": tool.get("name", ""),
+            "arguments": arguments,
+        },
+    }
+
+
+def _chat_tool_calls_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
+    content = result.get("content", "") or ""
+    items = [_chat_tool_call_item(tool) for tool in parse_xml_tool_calls(content)]
+
+    for raw_tool in result.get("tool_calls") or []:
+        if not isinstance(raw_tool, dict):
+            continue
+        func = raw_tool.get("function", {}) if isinstance(raw_tool.get("function"), dict) else {}
+        items.append(_chat_tool_call_item({
+            "id": raw_tool.get("id"),
+            "name": func.get("name", ""),
+            "input": _json_arguments(func.get("arguments", "{}")),
+        }))
+
+    return items
+
+
 def _chat_completion_response(result: dict[str, Any], requested_model: str) -> dict[str, Any]:
     now = int(time.time())
     content = result.get("content", "") or ""
+    tool_calls = _chat_tool_calls_from_result(result)
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    finish_reason = _finish_reason_openai(result.get("finish_reason"))
+    if tool_calls:
+        message = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+        finish_reason = "tool_calls"
     return {
         "id": "chatcmpl_" + new_message_id()[4:],
         "object": "chat.completion",
@@ -407,8 +507,8 @@ def _chat_completion_response(result: dict[str, Any], requested_model: str) -> d
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": _finish_reason_openai(result.get("finish_reason")),
+                "message": message,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": _usage_openai(result.get("usage", {}) or {}),
@@ -432,6 +532,9 @@ def _chat_stream_events(
     q: "queue.Queue[Any]" = queue.Queue(maxsize=512)
     result_holder: dict[str, Any] = {}
 
+    has_tools = bool(tools)
+    buffered_tool_mode_text: list[str] = []
+
     def on_chunk(piece: str) -> None:
         if piece:
             q.put(("text", piece))
@@ -444,8 +547,8 @@ def _chat_stream_events(
                 max_retries=1,
                 stream=True,
                 on_chunk=on_chunk,
-                tools=tools,
-                tool_choice=tool_choice,
+                tools=None if has_tools else tools,
+                tool_choice=None if has_tools else tool_choice,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
@@ -476,6 +579,9 @@ def _chat_stream_events(
         kind, payload = item
         if kind != "text":
             continue
+        if has_tools:
+            buffered_tool_mode_text.append(str(payload))
+            continue
         chunk = {
             "id": completion_id,
             "object": "chat.completion.chunk",
@@ -494,6 +600,79 @@ def _chat_stream_events(
         yield _openai_sse(None, "[DONE]").encode("utf-8")
         return
 
+    tool_calls = _chat_tool_calls_from_result(result)
+    if has_tools and not tool_calls:
+        content = result.get("content", "") or "".join(buffered_tool_mode_text)
+        if content:
+            chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": now,
+                "model": requested_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": content},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield _openai_sse(None, chunk).encode("utf-8")
+
+    if has_tools and tool_calls:
+        for index, tool_call in enumerate(tool_calls):
+            tool_id = tool_call.get("id", f"call_{index}")
+            func = tool_call.get("function", {}) if isinstance(tool_call.get("function"), dict) else {}
+            yield _openai_sse(
+                None,
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": now,
+                    "model": requested_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": index,
+                                        "id": tool_id,
+                                        "type": "function",
+                                        "function": {"name": func.get("name", ""), "arguments": ""},
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+            ).encode("utf-8")
+            yield _openai_sse(
+                None,
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": now,
+                    "model": requested_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": index,
+                                        "function": {"arguments": func.get("arguments", "{}")},
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+            ).encode("utf-8")
+
+    final_reason = "tool_calls" if has_tools and tool_calls else _finish_reason_openai(result.get("finish_reason"))
     final_chunk = {
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -503,7 +682,7 @@ def _chat_stream_events(
             {
                 "index": 0,
                 "delta": {},
-                "finish_reason": _finish_reason_openai(result.get("finish_reason")),
+                "finish_reason": final_reason,
             }
         ],
         "usage": _usage_openai(result.get("usage", {}) or {}),

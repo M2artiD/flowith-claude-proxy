@@ -105,6 +105,34 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn('"finish_reason": "stop"', events)
         self.assertIn("data: [DONE]", events)
 
+    def test_chat_completions_streaming_with_tools_preserves_plain_text(self) -> None:
+        response = self.client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "claude-4.6-sonnet",
+                "messages": [{"role": "user", "content": "say hello"}],
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "description": "Run a shell command",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        events = response.text
+        self.assertIn('"content": "hello"', events)
+        self.assertIn('"finish_reason": "stop"', events)
+        self.assertIn("data: [DONE]", events)
+        self.assertNotIn('"finish_reason": "tool_calls"', events)
+
     def test_responses_non_streaming(self) -> None:
         response = self.client.post(
             "/v1/responses",
@@ -253,6 +281,28 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn("event: response.function_call_arguments.done", events)
         self.assertIn("event: response.completed", events)
         self.assertNotIn("<tool_call>", events)
+
+    def test_hermes_root_chat_completions_alias(self) -> None:
+        response = self.client.post(
+            "/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "claude-4.6-sonnet",
+                "messages": [{"role": "user", "content": "say hello"}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["object"], "chat.completion")
+        self.assertEqual(body["choices"][0]["message"]["content"], "hello")
+        self.assertEqual(self.fake_client.calls[0]["messages"], [{"role": "user", "content": "say hello"}])
+
+    def test_hermes_probe_endpoints_do_not_404(self) -> None:
+        for path in ["/api/v1/models", "/api/tags", "/version", "/props", "/v1/props"]:
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 200)
 
 
 if __name__ == "__main__":
