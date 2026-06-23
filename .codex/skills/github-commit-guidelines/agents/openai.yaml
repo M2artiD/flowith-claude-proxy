@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub Commit Guidelines"
+  short_description: "Small, reviewable GitHub commits"
+  default_prompt: "Use -commit-guidelines to split my changes into small Conventional Commits."

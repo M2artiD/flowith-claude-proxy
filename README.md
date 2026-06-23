@@ -1,15 +1,17 @@
-# Flowith Claude/Codex Proxy
+﻿# Flowith Claude/Codex Proxy
 
-本项目把 Flowith 上游接口包装成本地代理。现在按两个脚本使用：
+This project wraps the Flowith upstream LLM endpoint as local Claude/Anthropic-compatible and OpenAI-compatible proxy services.
 
-- Claude Code / Anthropic: `start.bat`, 默认 `http://127.0.0.1:8787`
-- Codex / OpenAI-compatible: `start-codex.bat`, 默认 `http://127.0.0.1:8788/v1`
+There are two launch modes:
 
-这样不用把 Claude Code 和 Codex 混在同一个启动入口里。需要哪个就开哪个；如果两个都要用，就开两个窗口。
+- **Claude Code / Anthropic-compatible**: `start.bat`, default base URL `http://127.0.0.1:8787`
+- **Codex / OpenAI-compatible**: `start-codex.bat`, default base URL `http://127.0.0.1:8788/v1`
 
-## 启动
+Use the script for the client you are configuring. If you need both clients at the same time, run both scripts in separate terminal windows.
 
-Claude Code:
+## Start
+
+Claude Code / Anthropic-compatible:
 
 ```powershell
 .\start.bat
@@ -21,66 +23,61 @@ Codex / OpenAI-compatible:
 .\start-codex.bat
 ```
 
-两个脚本都会进入 `claude-proxy/`，创建/启用 venv，安装依赖，然后启动 `python -m proxy`。
+Both scripts enter `claude-proxy\`, create or reuse `venv`, install dependencies, and then run `python -m proxy`.
 
-- `start.bat` 设置 `FLOWITH_API_PROFILE=claude`，只启用 Claude/Anthropic 入口
-- `start-codex.bat` 设置 `FLOWITH_API_PROFILE=codex`，只启用 Codex/OpenAI 入口，并临时把端口覆盖成 `8788`
+- `start.bat` temporarily sets `FLOWITH_API_PROFILE=claude` and enables only Claude/Anthropic routes.
+- `start-codex.bat` temporarily sets `FLOWITH_API_PROFILE=codex`, overrides the port to `8788`, and enables only Codex/OpenAI routes.
 
-这些设置只作用于当前窗口，不会修改你的 `.env`。
+These environment changes apply only to the launched process and do not rewrite `.env`.
 
-## Claude Code 配置
+## Claude Code / Anthropic configuration
 
-Claude Code 或 CC Switch 的 Anthropic-compatible provider 填：
+Use this mode for Claude Code or any Anthropic-compatible client.
 
 ```text
 Name: Flowith Claude Proxy
-API Key: 你的 Flowith API Key
+API Key: your Flowith API key
 Base URL: http://127.0.0.1:8787
 Model: claude-4.6-sonnet
 ```
 
-环境变量方式：
+PowerShell example:
 
 ```powershell
 $env:ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
-$env:ANTHROPIC_API_KEY="你的 Flowith API Key"
+$env:ANTHROPIC_API_KEY="your Flowith API key"
 claude
 ```
 
-Claude Code 工具调用参考 `vibheksoni/UniClaudeProxy` 的 ReAct/XML fallback：
+Main route:
 
-1. 接收 Anthropic `tools`
-2. 注入 XML 工具说明到 system prompt
-3. 上游输出 `<tool_call>`
-4. 代理转换回 Anthropic `tool_use`
-5. `tool_result` 转成 `<observation>` 继续对话
+```text
+POST /v1/messages
+```
 
-## Codex / OpenAI 配置
+Important: `/v1/models` is intentionally disabled in the Claude profile. If `http://127.0.0.1:8787/v1/models` returns `404 {"detail":"Endpoint not enabled for this proxy profile"}`, the Claude proxy is behaving as designed.
 
-Codex 或 CC Switch 的 OpenAI-compatible provider 填：
+Tool calls use an XML/ReAct bridge: client tools are injected into the prompt as XML instructions, upstream `<tool_call>` output is converted back into client-native tool calls, and tool results are returned as `<observation>` blocks.
+
+## Codex / OpenAI-compatible configuration
+
+Use this mode for Codex or OpenAI-compatible clients.
 
 ```text
 Name: Flowith Codex Proxy
-API Key: 你的 Flowith API Key
+API Key: your Flowith API key
 Base URL: http://127.0.0.1:8788/v1
 Model: claude-4.6-sonnet
 ```
 
-也可以直接填：
-
-```text
-Model: gpt-5.5
-Model: gpt-5.4
-```
-
-环境变量方式：
+PowerShell example:
 
 ```powershell
 $env:OPENAI_BASE_URL="http://127.0.0.1:8788/v1"
-$env:OPENAI_API_KEY="你的 Flowith API Key"
+$env:OPENAI_API_KEY="your Flowith API key"
 ```
 
-Codex 脚本使用的主要接口：
+Main routes:
 
 ```text
 POST /v1/responses
@@ -88,24 +85,26 @@ POST /v1/chat/completions
 GET  /v1/models
 ```
 
-Codex 工具调用也走 `vibheksoni/UniClaudeProxy` 同类的 ReAct/XML fallback：
-1. 接收 OpenAI Responses `tools`
-2. 转成 XML 工具说明注入 system prompt
-3. 上游只输出 `<tool_call>`
-4. 代理转换回 Responses `function_call`
-5. `function_call_output` 转成 `<observation>` 继续对话
+Do not point Codex/OpenAI clients at `8787`; that port is for the Claude profile and will reject OpenAI-only routes.
 
-也就是说，Codex/CC Switch 侧仍然按 OpenAI-compatible 填 `http://127.0.0.1:8788/v1`，不需要 Flowith 上游原生支持工具。
+## `.env`
 
-## `.env` 是否还能用
-
-可以。旧 `.env` 仍然兼容。建议保留或补上：
+Keep `.env` in `claude-proxy\`. Recommended baseline:
 
 ```env
 FLOWITH_API_KEY=flo-your-key
 FLOWITH_BASE_URL=https://edge.flowith.io/external/use/llm
 FLOWITH_DEFAULT_MODEL=claude-4.6-sonnet
-FLOWITH_TIMEOUT=120
+FLOWITH_TIMEOUT=300
+FLOWITH_CONNECT_TIMEOUT=30
+FLOWITH_MAX_CONCURRENCY=8
+FLOWITH_POOL_MAXSIZE=16
+FLOWITH_RETRY_TOTAL=6
+FLOWITH_RETRY_BACKOFF=0.5
+FLOWITH_RETRY_JITTER=0.25
+FLOWITH_RETRY_MAX_DELAY=8
+FLOWITH_SSL_RETRY_EXTRA=10
+FLOWITH_DISABLE_KEEPALIVE=true
 FLOWITH_SSL_VERIFY=true
 FLOWITH_API_HOST=127.0.0.1
 FLOWITH_API_PORT=8787
@@ -114,9 +113,9 @@ FLOWITH_MODEL_ALIASES={"claude-4.6-sonnet":"claude-4.6-sonnet","claude-opus-4.7"
 FLOWITH_DEBUG_DUMP=false
 ```
 
-`start-codex.bat` 会在进程内临时使用 `FLOWITH_API_PROFILE=codex` 和 `FLOWITH_API_PORT=8788`，不会写回 `.env`。
+`start-codex.bat` overrides `FLOWITH_API_PROFILE=codex` and `FLOWITH_API_PORT=8788` only for that process.
 
-## 可用模型
+## Available model aliases
 
 - `claude-fable-5`
 - `claude-4.6-sonnet`
@@ -129,17 +128,17 @@ FLOWITH_DEBUG_DUMP=false
 - `gemini-2.5-pro`
 - `deepseek-chat`
 
-## 调试与测试
+## Debugging and tests
 
-开启 dump:
+Enable upstream request/response dumps:
 
 ```env
 FLOWITH_DEBUG_DUMP=true
 ```
 
-运行测试：
+Run tests:
 
 ```powershell
 cd C:\Users\qiyan\Desktop\flowith-claude-proxy\claude-proxy
-python -m pytest -q
+.\venv\Scripts\python.exe -m pytest -q
 ```
