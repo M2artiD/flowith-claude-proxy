@@ -105,6 +105,35 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn('"finish_reason": "stop"', events)
         self.assertIn("data: [DONE]", events)
 
+    def test_chat_completions_streaming_with_tools_does_not_duplicate_streamed_plain_text(self) -> None:
+        self.fake_client.next_stream_chunks = ["hello"]
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "claude-4.6-sonnet",
+                "messages": [{"role": "user", "content": "say hello"}],
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "description": "Run a shell command",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        events = response.text
+        self.assertEqual(events.count('\"content\": \"hello\"'), 1)
+        self.assertIn('\"finish_reason\": \"stop\"', events)
+        self.assertIn('data: [DONE]', events)
+
     def test_chat_completions_streaming_with_tools_preserves_plain_text(self) -> None:
         response = self.client.post(
             "/v1/chat/completions",
@@ -128,10 +157,128 @@ class OpenAIProxyTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         events = response.text
-        self.assertIn('"content": "hello"', events)
+        self.assertIn('"content": "hel"', events)
+        self.assertIn('"content": "lo"', events)
         self.assertIn('"finish_reason": "stop"', events)
         self.assertIn("data: [DONE]", events)
         self.assertNotIn('"finish_reason": "tool_calls"', events)
+
+    def test_chat_completions_streaming_with_tools_xml_tool_call_does_not_leak_raw_xml(self) -> None:
+        self.fake_client.next_stream_chunks = [
+            "<tool_call>\n<name>shell</name>\n",
+            "<parameters>\n",
+            '{"command":"pwd"}',
+            "\n</parameters>\n</tool_call>",
+        ]
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "claude-4.6-sonnet",
+                "messages": [{"role": "user", "content": "check cwd"}],
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "description": "Run a shell command",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        events = response.text
+        self.assertIn('"tool_calls"', events)
+        self.assertIn('"name": "shell"', events)
+        self.assertIn('"{\\"command\\":\\"pwd\\"}"', events)
+        self.assertIn('"finish_reason": "tool_calls"', events)
+        self.assertNotIn("<tool_call>", events)
+        self.assertNotIn('"content": "<tool_call>', events)
+
+    def test_openai_streaming_preserves_unicode_text(self) -> None:
+        self.fake_client.next_stream_chunks = ["??", "???"]
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "claude-4.6-sonnet",
+                "messages": [{"role": "user", "content": "say hello"}],
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        events = response.text
+        self.assertIn('??', events)
+        self.assertIn('???', events)
+
+    def test_responses_streaming_preserves_unicode_text(self) -> None:
+        self.fake_client.next_stream_chunks = ["??", "???"]
+
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "claude-4.6-sonnet",
+                "input": "say hello",
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        events = response.text
+        self.assertIn('??', events)
+        self.assertIn('???', events)
+
+    def test_chat_completions_tool_history_becomes_xml(self) -> None:
+        response = self.client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.5",
+                "messages": [
+                    {"role": "user", "content": "check cwd"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_abc",
+                                "type": "function",
+                                "function": {
+                                    "name": "shell",
+                                    "arguments": '{"command":"pwd"}',
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_abc",
+                        "content": "C:\\Users\\qiyan\\Desktop\\flowith-claude-proxy",
+                    },
+                ],
+                "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        messages = self.fake_client.calls[0]["messages"]
+        self.assertEqual(messages[1]["role"], "user")
+        self.assertEqual(messages[1]["content"], "check cwd")
+        self.assertEqual(messages[2]["role"], "assistant")
+        self.assertIn("<tool_call>", messages[2]["content"])
+        self.assertIn("<name>shell</name>", messages[2]["content"])
+        self.assertIn('"command":"pwd"', messages[2]["content"])
+        self.assertEqual(messages[3]["role"], "user")
+        self.assertIn("<observation>", messages[3]["content"])
+        self.assertIn("flowith-claude-proxy", messages[3]["content"])
 
     def test_responses_non_streaming(self) -> None:
         response = self.client.post(
@@ -279,6 +426,57 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn("event: response.function_call_arguments.delta", events)
         self.assertIn('"delta": "{\\"command\\":\\"dir\\"}"', events)
         self.assertIn("event: response.function_call_arguments.done", events)
+        self.assertIn("event: response.completed", events)
+        self.assertNotIn("<tool_call>", events)
+
+    def test_responses_streaming_with_tools_preserves_plain_text_deltas(self) -> None:
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "claude-4.6-sonnet",
+                "input": "say hello",
+                "stream": True,
+                "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        events = response.text
+        self.assertIn("event: response.created", events)
+        self.assertIn("event: response.output_text.delta", events)
+        self.assertIn('"delta": "hel"', events)
+        self.assertIn('"delta": "lo"', events)
+        self.assertIn("event: response.output_text.done", events)
+        self.assertIn("event: response.completed", events)
+        self.assertNotIn('"type": "function_call"', events)
+        self.assertNotIn('"text": "hello"', events)
+        self.assertNotIn('"output_text": "hello"', events)
+
+    def test_responses_streaming_with_tools_xml_tool_call_does_not_leak_raw_xml(self) -> None:
+        self.fake_client.next_stream_chunks = [
+            "<tool_call>\n<name>shell</name>\n",
+            "<parameters>\n",
+            '{"command":"pwd"}',
+            "\n</parameters>\n</tool_call>",
+        ]
+
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "claude-4.6-sonnet",
+                "input": "check cwd",
+                "stream": True,
+                "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        events = response.text
+        self.assertIn('"type": "function_call"', events)
+        self.assertIn('"name": "shell"', events)
+        self.assertIn('"delta": "{\\"command\\":\\"pwd\\"}"', events)
         self.assertIn("event: response.completed", events)
         self.assertNotIn("<tool_call>", events)
 

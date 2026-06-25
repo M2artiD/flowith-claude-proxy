@@ -1,4 +1,4 @@
-﻿"""Codex/OpenAI-compatible routes for the Flowith proxy."""
+"""Codex/OpenAI-compatible routes for the Flowith proxy."""
 
 from __future__ import annotations
 
@@ -14,6 +14,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..adapter import (
     build_tool_xml_prompt,
+    find_xml_tool_call_consumed_end,
+    find_xml_tool_call_end,
+    find_xml_tool_call_start,
     format_observation_xml,
     format_tool_call_xml,
     map_model,
@@ -21,8 +24,16 @@ from ..adapter import (
     parse_xml_tool_calls,
 )
 from .. import __version__
-from ..config import DEFAULT_MODEL
+from ..config import DEFAULT_MODEL, FLOWITH_TRACE_HERMES
 from ..upstream import FlowithClient
+
+
+_TRACE_HERMES = FLOWITH_TRACE_HERMES
+
+
+def _trace_hermes(message: str) -> None:
+    if _TRACE_HERMES:
+        print(f"[HERMES-TRACE] {message}", flush=True)
 
 _SENTINEL_DONE = object()
 
@@ -118,6 +129,14 @@ def create_router(
         api_key = require_api_key(x_api_key, authorization)
 
         requested_model = body.get("model") or DEFAULT_MODEL
+        _trace_hermes(
+            "route=chat_completions "
+            f"path={request.url.path} "
+            f"stream={bool(body.get('stream'))} "
+            f"tools={len(body.get('tools') or [])} "
+            f"tool_choice={body.get('tool_choice')!r} "
+            f"model={requested_model!r}"
+        )
         flowith_model = map_model(requested_model, default=DEFAULT_MODEL)
         client, upstream_model = get_client_for_key(api_key, flowith_model)
         messages = _chat_messages_from_body(body)
@@ -184,6 +203,14 @@ def create_router(
         api_key = require_api_key(x_api_key, authorization)
 
         requested_model = body.get("model") or DEFAULT_MODEL
+        _trace_hermes(
+            "route=responses "
+            f"path={request.url.path} "
+            f"stream={bool(body.get('stream'))} "
+            f"tools={len(body.get('tools') or [])} "
+            f"tool_choice={body.get('tool_choice')!r} "
+            f"model={requested_model!r}"
+        )
         flowith_model = map_model(requested_model, default=DEFAULT_MODEL)
         client, upstream_model = get_client_for_key(api_key, flowith_model)
         messages = _responses_messages_from_input(body.get("input", ""))
@@ -280,6 +307,27 @@ def _chat_messages_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
         role = raw_msg.get("role", "user")
         if role not in {"system", "user", "assistant", "tool"}:
             role = "user"
+
+        if role == "assistant" and isinstance(raw_msg.get("tool_calls"), list):
+            tool_call_parts: list[str] = []
+            for tool_call in raw_msg.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+                name = function.get("name") or tool_call.get("name", "")
+                arguments = _json_arguments(function.get("arguments", tool_call.get("arguments", "{}")))
+                tool_call_parts.append(format_tool_call_xml(name, arguments))
+            content = _extract_openai_text(raw_msg.get("content"))
+            if tool_call_parts:
+                if content:
+                    tool_call_parts.insert(0, content)
+                messages.append({"role": "assistant", "content": "\n".join(tool_call_parts)})
+                continue
+
+        if role == "tool":
+            messages.append({"role": "user", "content": format_observation_xml(_extract_openai_text(raw_msg.get("content")))})
+            continue
+
         messages.append({"role": role, "content": _extract_openai_text(raw_msg.get("content"))})
     return messages
 
@@ -515,6 +563,67 @@ def _chat_completion_response(result: dict[str, Any], requested_model: str) -> d
     }
 
 
+_XML_STREAM_OPEN_MARKERS = ("<tool_call", "<function_calls>")
+
+
+def _safe_non_xml_prefix(buffer: str, *, final: bool = False) -> tuple[str, str]:
+    if not buffer:
+        return "", ""
+    if final:
+        return buffer, ""
+
+    keep = 0
+    max_prefix_len = max(len(marker) for marker in _XML_STREAM_OPEN_MARKERS) - 1
+    for size in range(1, min(len(buffer), max_prefix_len) + 1):
+        suffix = buffer[-size:]
+        if any(marker.startswith(suffix) for marker in _XML_STREAM_OPEN_MARKERS):
+            keep = size
+
+    if keep:
+        return buffer[:-keep], buffer[-keep:]
+    return buffer, ""
+
+
+def _drain_xml_tool_stream_buffer(
+    buffer: str,
+    *,
+    final: bool = False,
+) -> tuple[list[tuple[str, Any]], str]:
+    segments: list[tuple[str, Any]] = []
+
+    while buffer:
+        xml_start = find_xml_tool_call_start(buffer)
+        if xml_start == -1:
+            text, buffer = _safe_non_xml_prefix(buffer, final=final)
+            if text:
+                segments.append(("text", text))
+            break
+
+        if xml_start > 0:
+            segments.append(("text", buffer[:xml_start]))
+            buffer = buffer[xml_start:]
+
+        xml_end = find_xml_tool_call_end(buffer)
+        if xml_end == -1 and not final:
+            break
+
+        xml_source = buffer if xml_end == -1 else buffer[:xml_end]
+        tools = parse_xml_tool_calls(xml_source)
+        consumed_end = find_xml_tool_call_consumed_end(xml_source)
+        if tools and consumed_end != -1:
+            segments.append(("tools", tools))
+            buffer = buffer[consumed_end:]
+            continue
+
+        if final:
+            # A malformed tool marker should not leak back as assistant text.
+            buffer = ""
+            break
+        break
+
+    return segments, buffer
+
+
 def _chat_stream_events(
     client: FlowithClient,
     messages: list[dict[str, Any]],
@@ -533,7 +642,10 @@ def _chat_stream_events(
     result_holder: dict[str, Any] = {}
 
     has_tools = bool(tools)
-    buffered_tool_mode_text: list[str] = []
+    raw_stream_chunks = 0
+    streamed_text_chunks = 0
+    xml_buffer = ""
+    emitted_tool_calls: list[dict[str, Any]] = []
 
     def on_chunk(piece: str) -> None:
         if piece:
@@ -570,6 +682,85 @@ def _chat_stream_events(
     }
     yield _openai_sse(None, first_chunk).encode("utf-8")
 
+    def _emit_text_delta(text: str) -> Generator[bytes, None, None]:
+        nonlocal streamed_text_chunks
+        if not text:
+            return
+        streamed_text_chunks += 1
+        yield _openai_sse(
+            None,
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": now,
+                "model": requested_model,
+                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+            },
+        ).encode("utf-8")
+
+    def _emit_tool_call_delta(tool_call: dict[str, Any]) -> Generator[bytes, None, None]:
+        index = len(emitted_tool_calls)
+        emitted_tool_calls.append(tool_call)
+        tool_id = tool_call.get("id", f"call_{index}")
+        func = tool_call.get("function", {}) if isinstance(tool_call.get("function"), dict) else {}
+        yield _openai_sse(
+            None,
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": now,
+                "model": requested_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": index,
+                                    "id": tool_id,
+                                    "type": "function",
+                                    "function": {"name": func.get("name", ""), "arguments": ""},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+        ).encode("utf-8")
+        yield _openai_sse(
+            None,
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": now,
+                "model": requested_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": index,
+                                    "function": {"arguments": func.get("arguments", "{}")},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+        ).encode("utf-8")
+
+    def _emit_tool_segments(segments: list[tuple[str, Any]]) -> Generator[bytes, None, None]:
+        for kind, payload in segments:
+            if kind == "text":
+                yield from _emit_text_delta(str(payload))
+                continue
+            if kind == "tools":
+                for raw_tool in payload:
+                    yield from _emit_tool_call_delta(_chat_tool_call_item(raw_tool))
+
     while True:
         item = q.get()
         if item is _SENTINEL_DONE:
@@ -579,19 +770,23 @@ def _chat_stream_events(
         kind, payload = item
         if kind != "text":
             continue
+        raw_stream_chunks += 1
         if has_tools:
-            buffered_tool_mode_text.append(str(payload))
+            xml_buffer += str(payload)
+            segments, xml_buffer = _drain_xml_tool_stream_buffer(xml_buffer)
+            yield from _emit_tool_segments(segments)
             continue
-        chunk = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": now,
-            "model": requested_model,
-            "choices": [{"index": 0, "delta": {"content": payload}, "finish_reason": None}],
-        }
-        yield _openai_sse(None, chunk).encode("utf-8")
+        yield from _emit_text_delta(str(payload))
 
     result = result_holder.get("result") or {}
+    _trace_hermes(
+        "chat_stream_summary "
+        f"has_tools={has_tools} "
+        f"raw_stream_chunks={raw_stream_chunks} "
+        f"streamed_text_chunks={streamed_text_chunks} "
+        f"emitted_tool_calls={len(emitted_tool_calls)} "
+        f"result_success={result.get('success')}"
+    )
     if not result.get("success"):
         yield _openai_sse(
             None,
@@ -600,79 +795,25 @@ def _chat_stream_events(
         yield _openai_sse(None, "[DONE]").encode("utf-8")
         return
 
-    tool_calls = _chat_tool_calls_from_result(result)
-    if has_tools and not tool_calls:
-        content = result.get("content", "") or "".join(buffered_tool_mode_text)
-        if content:
-            chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": now,
-                "model": requested_model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": content},
-                        "finish_reason": None,
-                    }
-                ],
-            }
-            yield _openai_sse(None, chunk).encode("utf-8")
+    if has_tools:
+        if raw_stream_chunks == 0 and result.get("content"):
+            xml_buffer += str(result.get("content") or "")
+        segments, xml_buffer = _drain_xml_tool_stream_buffer(xml_buffer, final=True)
+        yield from _emit_tool_segments(segments)
+        native_tool_calls = _chat_tool_calls_from_result({
+            "content": "",
+            "tool_calls": result.get("tool_calls") or [],
+        })
+        for tool_call in native_tool_calls:
+            yield from _emit_tool_call_delta(tool_call)
 
-    if has_tools and tool_calls:
-        for index, tool_call in enumerate(tool_calls):
-            tool_id = tool_call.get("id", f"call_{index}")
-            func = tool_call.get("function", {}) if isinstance(tool_call.get("function"), dict) else {}
-            yield _openai_sse(
-                None,
-                {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": now,
-                    "model": requested_model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "tool_calls": [
-                                    {
-                                        "index": index,
-                                        "id": tool_id,
-                                        "type": "function",
-                                        "function": {"name": func.get("name", ""), "arguments": ""},
-                                    }
-                                ]
-                            },
-                            "finish_reason": None,
-                        }
-                    ],
-                },
-            ).encode("utf-8")
-            yield _openai_sse(
-                None,
-                {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": now,
-                    "model": requested_model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "tool_calls": [
-                                    {
-                                        "index": index,
-                                        "function": {"arguments": func.get("arguments", "{}")},
-                                    }
-                                ]
-                            },
-                            "finish_reason": None,
-                        }
-                    ],
-                },
-            ).encode("utf-8")
-
-    final_reason = "tool_calls" if has_tools and tool_calls else _finish_reason_openai(result.get("finish_reason"))
+    _trace_hermes(
+        "chat_stream_final "
+        f"tool_calls={len(emitted_tool_calls)} "
+        f"result_finish_reason={result.get('finish_reason')!r} "
+        f"final_reason={('tool_calls' if has_tools and emitted_tool_calls else _finish_reason_openai(result.get('finish_reason')))!r}"
+    )
+    final_reason = "tool_calls" if has_tools and emitted_tool_calls else _finish_reason_openai(result.get("finish_reason"))
     final_chunk = {
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -723,8 +864,10 @@ def _responses_function_call_item(tool: dict[str, Any]) -> dict[str, Any]:
 
 def _responses_function_calls_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
     content = result.get("content", "") or ""
-    items = [_responses_function_call_item(tool) for tool in parse_xml_tool_calls(content)]
+    xml_tools = parse_xml_tool_calls(content)
+    items = [_responses_function_call_item(tool) for tool in xml_tools]
 
+    native_count = 0
     for raw_tool in result.get("tool_calls") or []:
         if not isinstance(raw_tool, dict):
             continue
@@ -734,6 +877,15 @@ def _responses_function_calls_from_result(result: dict[str, Any]) -> list[dict[s
             "name": func.get("name", ""),
             "input": _json_arguments(func.get("arguments", "{}")),
         }))
+        native_count += 1
+
+    _trace_hermes(
+        "responses_function_calls "
+        f"xml_count={len(xml_tools)} "
+        f"native_count={native_count} "
+        f"total={len(items)} "
+        f"content_has_xml={('<tool_call>' in content)}"
+    )
 
     return items
 
@@ -847,17 +999,22 @@ def _responses_stream_events(
 
     has_tools = bool(tools)
     text_item_started = False
+    trace_id = response_id[-6:]
+    _trace_hermes(f"responses_stream_start trace={trace_id} has_tools={has_tools}")
 
     def _emit_text_start() -> Generator[bytes, None, None]:
-        nonlocal text_item_started
+        nonlocal next_output_index, text_item_started, text_output_index
         if text_item_started:
             return
         text_item_started = True
+        text_output_index = next_output_index
+        next_output_index += 1
+        _trace_hermes(f"responses_stream_event trace={trace_id} event=response.output_item.added kind=text")
         yield _openai_sse(
             "response.output_item.added",
             {
                 "type": "response.output_item.added",
-                "output_index": 0,
+                "output_index": text_output_index,
                 "item": {"id": message_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []},
             },
         ).encode("utf-8")
@@ -866,16 +1023,152 @@ def _responses_stream_events(
             {
                 "type": "response.content_part.added",
                 "item_id": message_id,
-                "output_index": 0,
+                "output_index": text_output_index,
                 "content_index": 0,
                 "part": {"type": "output_text", "text": "", "annotations": []},
             },
         ).encode("utf-8")
 
+    output_text = ""
+    xml_buffer = ""
+    text_done_emitted = False
+    emitted_function_calls: list[dict[str, Any]] = []
+    completed_items: dict[int, dict[str, Any]] = {}
+    next_output_index = 0
+    text_output_index: int | None = None
+    raw_stream_chunks = 0
+    streamed_text_chunks = 0
+
+    def _emit_text_delta(text: str) -> Generator[bytes, None, None]:
+        nonlocal output_text, streamed_text_chunks
+        if not text:
+            return
+        yield from _emit_text_start()
+        output_text += text
+        streamed_text_chunks += 1
+        yield _openai_sse(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "item_id": message_id,
+                "output_index": text_output_index if text_output_index is not None else 0,
+                "content_index": 0,
+                "delta": text,
+            },
+        ).encode("utf-8")
+
+    def _emit_text_done(*, final_text: str | None = None) -> Generator[bytes, None, None]:
+        nonlocal text_done_emitted
+        if text_done_emitted or not text_item_started:
+            return
+        text_done_emitted = True
+        reported_text = output_text if final_text is None else final_text
+        output_index = text_output_index if text_output_index is not None else 0
+        _trace_hermes(f"responses_stream_event trace={trace_id} event=response.output_text.done text_len={len(reported_text)}")
+        yield _openai_sse(
+            "response.output_text.done",
+            {
+                "type": "response.output_text.done",
+                "item_id": message_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "text": reported_text,
+            },
+        ).encode("utf-8")
+        yield _openai_sse(
+            "response.content_part.done",
+            {
+                "type": "response.content_part.done",
+                "item_id": message_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": reported_text, "annotations": []},
+            },
+        ).encode("utf-8")
+        message_item = {
+            "id": message_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": reported_text, "annotations": []}],
+        }
+        completed_items[output_index] = message_item
+        yield _openai_sse(
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": message_item,
+            },
+        ).encode("utf-8")
+
+    def _emit_function_call(function_call: dict[str, Any]) -> Generator[bytes, None, None]:
+        nonlocal next_output_index
+        output_index = next_output_index
+        next_output_index += 1
+        emitted_function_calls.append(function_call)
+        completed_items[output_index] = function_call
+        added_item = dict(function_call)
+        added_item["status"] = "in_progress"
+        added_item["arguments"] = ""
+        _trace_hermes(
+            f"responses_stream_event trace={trace_id} event=response.output_item.added kind=function_call output_index={output_index}"
+        )
+        yield _openai_sse(
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": added_item,
+            },
+        ).encode("utf-8")
+        arguments = function_call.get("arguments", "") or "{}"
+        yield _openai_sse(
+            "response.function_call_arguments.delta",
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": function_call["id"],
+                "output_index": output_index,
+                "delta": arguments,
+            },
+        ).encode("utf-8")
+        _trace_hermes(
+            f"responses_stream_event trace={trace_id} event=response.function_call_arguments.done output_index={output_index} args_len={len(arguments)}"
+        )
+        yield _openai_sse(
+            "response.function_call_arguments.done",
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": function_call["id"],
+                "output_index": output_index,
+                "arguments": arguments,
+            },
+        ).encode("utf-8")
+        yield _openai_sse(
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": function_call,
+            },
+        ).encode("utf-8")
+
+    def _emit_response_segments(segments: list[tuple[str, Any]]) -> Generator[bytes, None, None]:
+        for kind, payload in segments:
+            if kind == "text":
+                yield from _emit_text_delta(str(payload))
+                continue
+            if kind == "tools":
+                function_calls = [_responses_function_call_item(tool) for tool in payload]
+                _trace_hermes(
+                    f"responses_stream_tool_mode trace={trace_id} function_calls={len(function_calls)}"
+                )
+                for function_call in function_calls:
+                    yield from _emit_function_call(function_call)
+
     if not has_tools:
         yield from _emit_text_start()
 
-    output_text = ""
     while True:
         item = q.get()
         if item is _SENTINEL_DONE:
@@ -885,21 +1178,29 @@ def _responses_stream_events(
         kind, payload = item
         if kind != "text":
             continue
-        output_text += payload
+        raw_stream_chunks += 1
         if has_tools:
+            xml_buffer += str(payload)
+            segments, xml_buffer = _drain_xml_tool_stream_buffer(xml_buffer)
+            yield from _emit_response_segments(segments)
             continue
-        yield _openai_sse(
-            "response.output_text.delta",
-            {
-                "type": "response.output_text.delta",
-                "item_id": message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "delta": payload,
-            },
-        ).encode("utf-8")
+        yield from _emit_text_delta(str(payload))
+
+    if has_tools:
+        if raw_stream_chunks == 0 and result_holder.get("result", {}).get("content"):
+            xml_buffer += str(result_holder.get("result", {}).get("content") or "")
+        segments, xml_buffer = _drain_xml_tool_stream_buffer(xml_buffer, final=True)
+        yield from _emit_response_segments(segments)
 
     result = result_holder.get("result") or {}
+    _trace_hermes(
+        f"responses_stream_summary trace={trace_id} "
+        f"raw_stream_chunks={raw_stream_chunks} "
+        f"streamed_text_chunks={streamed_text_chunks} "
+        f"output_text_len={len(output_text)} "
+        f"emitted_function_calls={len(emitted_function_calls)} "
+        f"result_success={result.get('success')}"
+    )
     if not result.get("success"):
         yield _openai_sse(
             "error",
@@ -911,119 +1212,27 @@ def _responses_stream_events(
         return
 
     usage = _usage_responses(result.get("usage", {}) or {})
-    function_calls = _responses_function_calls_from_result({
-        "content": output_text,
+    native_function_calls = _responses_function_calls_from_result({
+        "content": "",
         "tool_calls": result.get("tool_calls") or [],
     })
 
-    if has_tools and function_calls:
-        for output_index, function_call in enumerate(function_calls):
-            added_item = dict(function_call)
-            added_item["status"] = "in_progress"
-            added_item["arguments"] = ""
-            yield _openai_sse(
-                "response.output_item.added",
-                {
-                    "type": "response.output_item.added",
-                    "output_index": output_index,
-                    "item": added_item,
-                },
-            ).encode("utf-8")
-            arguments = function_call.get("arguments", "") or "{}"
-            yield _openai_sse(
-                "response.function_call_arguments.delta",
-                {
-                    "type": "response.function_call_arguments.delta",
-                    "item_id": function_call["id"],
-                    "output_index": output_index,
-                    "delta": arguments,
-                },
-            ).encode("utf-8")
-            yield _openai_sse(
-                "response.function_call_arguments.done",
-                {
-                    "type": "response.function_call_arguments.done",
-                    "item_id": function_call["id"],
-                    "output_index": output_index,
-                    "arguments": arguments,
-                },
-            ).encode("utf-8")
-            yield _openai_sse(
-                "response.output_item.done",
-                {
-                    "type": "response.output_item.done",
-                    "output_index": output_index,
-                    "item": function_call,
-                },
-            ).encode("utf-8")
+    if has_tools and native_function_calls:
+        _trace_hermes(
+            f"responses_stream_tool_mode trace={trace_id} function_calls={len(native_function_calls)}"
+        )
+        for function_call in native_function_calls:
+            yield from _emit_function_call(function_call)
 
-        yield _openai_sse(
-            "response.completed",
-            {
-                "type": "response.completed",
-                "response": {
-                    "id": response_id,
-                    "object": "response",
-                    "created_at": now,
-                    "status": "completed",
-                    "model": requested_model,
-                    "output": function_calls,
-                    "output_text": "",
-                    "usage": usage,
-                },
-            },
-        ).encode("utf-8")
-        yield _openai_sse(None, "[DONE]").encode("utf-8")
-        return
-
-    if has_tools and not text_item_started:
+    if not text_item_started and not emitted_function_calls:
         yield from _emit_text_start()
-        if output_text:
-            yield _openai_sse(
-                "response.output_text.delta",
-                {
-                    "type": "response.output_text.delta",
-                    "item_id": message_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "delta": output_text,
-                },
-            ).encode("utf-8")
 
-    yield _openai_sse(
-        "response.output_text.done",
-        {
-            "type": "response.output_text.done",
-            "item_id": message_id,
-            "output_index": 0,
-            "content_index": 0,
-            "text": output_text,
-        },
-    ).encode("utf-8")
-    yield _openai_sse(
-        "response.content_part.done",
-        {
-            "type": "response.content_part.done",
-            "item_id": message_id,
-            "output_index": 0,
-            "content_index": 0,
-            "part": {"type": "output_text", "text": output_text, "annotations": []},
-        },
-    ).encode("utf-8")
-    yield _openai_sse(
-        "response.output_item.done",
-        {
-            "type": "response.output_item.done",
-            "output_index": 0,
-            "item": {
-                "id": message_id,
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": output_text, "annotations": []}],
-            },
-        },
-    ).encode("utf-8")
+    yield from _emit_text_done(final_text="" if has_tools else None)
+
+    completed_output = [completed_items[index] for index in sorted(completed_items)]
+
+    completed_mode = "function_calls" if emitted_function_calls else "text"
+    _trace_hermes(f"responses_stream_event trace={trace_id} event=response.completed mode={completed_mode}")
     yield _openai_sse(
         "response.completed",
         {
@@ -1034,16 +1243,8 @@ def _responses_stream_events(
                 "created_at": now,
                 "status": "completed",
                 "model": requested_model,
-                "output": [
-                    {
-                        "id": message_id,
-                        "type": "message",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": output_text, "annotations": []}],
-                    }
-                ],
-                "output_text": output_text,
+                "output": completed_output,
+                "output_text": "" if has_tools else output_text,
                 "usage": usage,
             },
         },

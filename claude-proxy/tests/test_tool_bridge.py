@@ -300,6 +300,41 @@ class ToolBridgeTests(unittest.TestCase):
         self.assertNotIn("<tool_call>", events)
         self.assertIn('"stop_reason": "tool_use"', events)
 
+    def test_streaming_with_tools_preserves_plain_text_before_and_after_xml_tool_call(self) -> None:
+        class StreamingFakeFlowithClient:
+            def call_api(self, messages, **kwargs):
+                kwargs["on_chunk"]("Need cwd. ")
+                kwargs["on_chunk"](
+                    '<tool_call>\n'
+                    '<name>Bash</name>\n'
+                    '<parameters>\n'
+                    '{"command":"pwd"}\n'
+                    '</parameters>\n'
+                    '</tool_call>'
+                )
+                kwargs["on_chunk"](" Done.")
+                return {
+                    "success": True,
+                    "content": "",
+                    "usage": {},
+                    "finish_reason": "stop",
+                }
+
+        events = b"".join(
+            server._stream_claude_events(
+                StreamingFakeFlowithClient(),
+                messages=[{"role": "user", "content": "print cwd"}],
+                requested_model="claude-3-5-sonnet-20241022",
+                has_tools=True,
+            )
+        ).decode("utf-8")
+
+        self.assertIn("Need cwd. ", events)
+        self.assertIn(" Done.", events)
+        self.assertIn('"type": "tool_use"', events)
+        self.assertIn('"name": "Bash"', events)
+        self.assertNotIn("<tool_call>", events)
+
 
 if __name__ == "__main__":
     unittest.main()

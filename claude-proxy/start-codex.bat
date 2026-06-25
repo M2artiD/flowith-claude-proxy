@@ -45,6 +45,10 @@ if %PIP_EXIT% NEQ 0 (
 
 call venv\Scripts\activate.bat
 
+chcp 65001 >nul
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+
 if not exist .env (
     if exist .env.example (
         echo [INFO] .env not found. Creating from .env.example...
@@ -67,6 +71,7 @@ echo =====================================
 echo   Flowith Codex/OpenAI Proxy
 echo   http://127.0.0.1:8788/v1
 echo   Endpoints: /v1/responses, /v1/chat/completions
+echo   Streaming: text/tool stream guard enabled
 echo =====================================
 echo.
 

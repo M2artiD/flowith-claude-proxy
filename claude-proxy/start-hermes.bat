@@ -45,6 +45,10 @@ if %PIP_EXIT% NEQ 0 (
 
 call venv\Scripts\activate.bat
 
+chcp 65001 >nul
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+
 if not exist .env (
     if exist .env.example (
         echo [INFO] .env not found. Creating from .env.example...
@@ -70,6 +74,7 @@ echo   Base URL:  http://127.0.0.1:8788
 echo   OpenAI:    http://127.0.0.1:8788/v1
 echo   Chat:      /chat/completions, /v1/chat/completions
 echo   Tools:     OpenAI tools -^> XML tool bridge
+echo   Streaming: text/tool stream guard enabled
 echo =====================================
 echo.
 echo Hermes setting example:

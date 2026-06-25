@@ -45,6 +45,10 @@ if %PIP_EXIT% NEQ 0 (
 
 call venv\Scripts\activate.bat
 
+chcp 65001 >nul
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+
 if not exist .env (
     if exist .env.example (
         echo [INFO] .env not found. Creating from .env.example...
@@ -66,7 +70,7 @@ echo =====================================
 echo   Flowith Claude Code Proxy
 echo   http://127.0.0.1:8787
 echo   Endpoint: /v1/messages
-echo   Tool bridge: XML/ReAct
+echo   Tool bridge: XML/ReAct text/tool stream guard
 echo =====================================
 echo.
 

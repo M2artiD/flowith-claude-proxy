@@ -522,16 +522,15 @@ def _stream_claude_events(
                 if tag_start != -1:
                     xml_parsing = True
                     pre_xml = text_buffer[:tag_start]
-                    if pre_xml.strip():
-                        yield from _flush_text_as_block(pre_xml.strip())
+                    if pre_xml:
+                        yield from _flush_text_as_block(pre_xml)
 
             if xml_parsing:
                 has_close = find_xml_tool_call_end(text_buffer) != -1
                 if has_close:
                     text_buffer = yield from _parse_and_emit_tools(text_buffer)
                     if text_buffer and not xml_parsing:
-                        if text_buffer.strip():
-                            yield from _flush_text_as_block(text_buffer.strip())
+                        yield from _flush_text_as_block(text_buffer)
                         text_buffer = ""
             else:
                 _TAG_WINDOW = 128
@@ -565,11 +564,11 @@ def _stream_claude_events(
             yield sse_ping().encode("utf-8")
             last_ping = time.time()
 
-    if text_buffer.strip():
+    if text_buffer:
         if xml_parsing:
             text_buffer = yield from _parse_and_emit_tools(text_buffer)
-        if text_buffer.strip():
-            yield from _flush_text_as_block(text_buffer.strip())
+        if text_buffer:
+            yield from _flush_text_as_block(text_buffer)
 
     if current_block_type is not None:
         yield from _close_block()
