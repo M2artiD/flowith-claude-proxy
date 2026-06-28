@@ -20,15 +20,25 @@ from typing import Any
 REACT_TOOL_STOP_SEQUENCE = "</tool_call>"
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
-_THINK_PARTIAL_RE = re.compile(r"<think>.*$", re.DOTALL)
 
 
+# NOTE on <think> filtering:
+#   The streaming path (server.py / codex/router.py: filter_stream_think_tags)
+#   has its own state machine that strips <think>...</think> spans token by
+#   token. That logic is authoritative for streaming and must NOT be touched
+#   here.
+#
+#   For the non-streaming path we only strip *paired* <think>...</think> blocks.
+#   A previous fallback regex eagerly deleted everything from any lone
+#   <think> tag in prose (e.g. when the user/model is literally
+#   talking about the word "think" tags), the whole tail of the answer was
+#   silently swallowed. Real unclosed thinking blocks in non-streaming
+#   responses are vanishingly rare; preserving prose is the safer default.
 def strip_model_thinking(text: str) -> str:
-    """Remove provider-specific <think> blocks from visible assistant text."""
+    """Remove paired <think>...</think> blocks from buffered assistant text."""
     if not text:
         return ""
-    text = _THINK_RE.sub("", text)
-    return _THINK_PARTIAL_RE.sub("", text)
+    return _THINK_RE.sub("", text)
 
 
 # ---------------------------------------------------------------
