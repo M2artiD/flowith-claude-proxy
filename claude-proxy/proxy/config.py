@@ -45,6 +45,10 @@ FLOWITH_SSL_VERIFY = os.environ.get("FLOWITH_SSL_VERIFY", "true").strip().lower(
     "0", "false", "no", "off",
 }
 
+FLOWITH_TRACE_HERMES = os.environ.get("FLOWITH_TRACE_HERMES", "false").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
 # HTTP/SOCKS proxy
 _https_proxy = os.environ.get("FLOWITH_UPSTREAM_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
 _http_proxy = os.environ.get("FLOWITH_UPSTREAM_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or ""
