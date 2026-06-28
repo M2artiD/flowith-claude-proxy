@@ -435,7 +435,7 @@ def _format_tool_call_xml(name: str, arguments: Any) -> str:
         "<tool_call>\n"
         f"<name>{html.escape(name or '')}</name>\n"
         "<parameters>\n"
-        f"{_json_dumps_compact(args)}\n"
+        f"{_cdata(_json_dumps_compact(args))}\n"
         "</parameters>\n"
         "</tool_call>"
     )
