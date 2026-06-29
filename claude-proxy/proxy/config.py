@@ -49,6 +49,10 @@ FLOWITH_TRACE_HERMES = os.environ.get("FLOWITH_TRACE_HERMES", "false").strip().l
     "1", "true", "yes", "on",
 }
 
+FLOWITH_REQUIRE_SERVER_KEY = os.environ.get("FLOWITH_REQUIRE_SERVER_KEY", "false").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
 # HTTP/SOCKS proxy
 _https_proxy = os.environ.get("FLOWITH_UPSTREAM_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
 _http_proxy = os.environ.get("FLOWITH_UPSTREAM_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or ""
