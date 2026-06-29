@@ -14,6 +14,8 @@
   - Manual verification showed `delta` chunks once each and `full_text_field=0`, `full_output_text=0`.
 - Existing dirty files left untouched for now:
   - `claude-proxy/proxy/__main__.py`
-  - `claude-proxy/proxy/config.py`
   - `claude-proxy/proxy/upstream.py`
-- Those three appear to be prior tracing / UTF-8 / debug-instrumentation changes, not part of the streaming fix.
+- Those files appear to be prior tracing / UTF-8 / debug-instrumentation changes, not part of the streaming fix.
+- 2026-06-28: Fixed startup ImportError by adding `FLOWITH_TRACE_HERMES` to `claude-proxy/proxy/config.py`; added `claude-proxy/tests/test_config.py`. Verified with `python -m pytest tests -q` and a temporary uvicorn `/health` check on port 8799.
+- 2026-06-28: Fixed launcher hang on `[INFO] Another launcher is installing dependencies. Waiting...`; root cause was stale empty `claude-proxy/.install.lock` with no active installer process. Updated all root and `claude-proxy/` `start*.bat` files to clear locks older than 300s when no `venv/pip/ensurepip` process is active. Verified stale-lock reproduction before the fix, stale-lock cleanup through `start-codex.bat`, no remaining `.install.lock`, no proxy process/ports 8787-8789 left from verification, and `python -m pytest tests -q` from `claude-proxy/` (`39 passed, 1 warning, 5 subtests passed`).
+- 2026-06-28: Added root `clean.bat` for manual cleanup. Default cleanup removes an empty `claude-proxy/.install.lock`, root/proxy pytest caches, and project bytecode caches; `.env`, logs, and `claude-proxy/venv` are kept unless `--venv` is passed. README documents `clean.bat` and `clean.bat --venv`. Verified by creating an empty lock and `proxy/__pycache__/codex_clean_probe.tmp`, running `cmd /c clean.bat --no-pause`, confirming `lock_exists=False`, `probe_exists=False`, `venv_exists=True`, plus `cmd /c clean.bat --help` and `git diff --check`.

@@ -10,10 +10,19 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 set "INSTALL_LOCK=%CD%\.install.lock"
+set "INSTALL_LOCK_STALE_SECONDS=300"
 
 :wait_install_lock
 mkdir "%INSTALL_LOCK%" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$lock=$env:INSTALL_LOCK; $item=Get-Item -LiteralPath $lock -ErrorAction SilentlyContinue; if (-not $item) { exit 0 }; $age=((Get-Date)-$item.LastWriteTime).TotalSeconds; $active=Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and ($_.CommandLine -match 'requirements\.txt' -or $_.CommandLine -match 'pip install' -or $_.CommandLine -match 'ensurepip' -or $_.CommandLine -match 'python.* -m venv') } | Select-Object -First 1; if (($age -gt [int]$env:INSTALL_LOCK_STALE_SECONDS) -and -not $active) { exit 42 }; exit 0" >nul 2>&1
+    if ERRORLEVEL 42 (
+        if not ERRORLEVEL 43 (
+            echo [WARN] Stale dependency install lock found. Clearing it...
+            rmdir "%INSTALL_LOCK%" >nul 2>&1
+            goto wait_install_lock
+        )
+    )
     echo [INFO] Another launcher is installing dependencies. Waiting...
     timeout /t 2 /nobreak >nul
     goto wait_install_lock

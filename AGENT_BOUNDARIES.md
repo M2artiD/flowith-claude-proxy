@@ -11,21 +11,8 @@ The minimal startup fix is limited to:
 
 Do not remove or rewrite `FLOWITH_REQUIRE_SERVER_KEY` unless the user explicitly asks to change the server-key enforcement behavior. The default must stay compatible with existing client-supplied API key behavior.
 
-## Existing Local Work To Leave Alone
+## Dirty-Work Handling
 
-The following files had local changes or were untracked before this boundary note was created. Do not modify, format, stage, commit, delete, or revert them unless the user explicitly asks for that specific file or task:
+The previously dirty files were reviewed and handled in small follow-up commits. Future agents should rely on `git status --short` for the current workspace state rather than this file's old dirty-file list.
 
-- `README.md`
-- `claude-proxy/proxy/codex/router.py`
-- `claude-proxy/proxy/server.py`
-- `claude-proxy/start-codex.bat`
-- `claude-proxy/start-hermes.bat`
-- `claude-proxy/start.bat`
-- `memory/working.md`
-- `start-codex.bat`
-- `start-hermes.bat`
-- `start.bat`
-- `claude-proxy/proxy/server.py.bak`
-- `clean.bat`
-
-If a future task requires touching one of these files, inspect the current diff first and preserve unrelated user or prior-agent changes.
+If future local changes appear, inspect the diff first and preserve unrelated user or prior-agent changes. Do not delete backup, cache, lock, or generated files unless the user asks to clean them or the file is verified to be a disposable local artifact.

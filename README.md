@@ -30,6 +30,20 @@ Both scripts enter `claude-proxy\`, create or reuse `venv`, install dependencies
 
 These environment changes apply only to the launched process and do not rewrite `.env`.
 
+## Clean
+
+If a launcher was closed mid-startup or local caches look stale, run:
+
+```powershell
+.\clean.bat
+```
+
+This removes the dependency install lock when it is empty, plus local pytest and Python bytecode caches. It keeps `.env`, logs, and `claude-proxy\venv` by default. To force dependencies to reinstall on the next launch:
+
+```powershell
+.\clean.bat --venv
+```
+
 ## Claude Code / Anthropic configuration
 
 Use this mode for Claude Code or any Anthropic-compatible client.
