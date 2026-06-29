@@ -11,6 +11,7 @@ from typing import Any, Generator
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from ..adapter import (
     build_tool_xml_prompt,
@@ -176,7 +177,8 @@ def create_router(
                 },
             )
 
-        result = client.call_api(
+        result = await run_in_threadpool(
+            client.call_api,
             messages,
             model=upstream_model,
             max_retries=2,
@@ -250,7 +252,8 @@ def create_router(
                 },
             )
 
-        result = client.call_api(
+        result = await run_in_threadpool(
+            client.call_api,
             messages,
             model=upstream_model,
             max_retries=2,

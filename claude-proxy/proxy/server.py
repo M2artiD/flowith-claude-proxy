@@ -11,6 +11,7 @@ from typing import Any, Generator
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from . import __version__
 from .adapter import (
@@ -43,6 +44,7 @@ from .config import (
     API_TIMEOUT,
     DEFAULT_MODEL,
     FLOWITH_BASE_URL,
+    FLOWITH_REQUIRE_SERVER_KEY,
     FLOWITH_SSL_VERIFY,
     FLOWITH_TOOL_MODE,
     UPSTREAM_PROXIES,
@@ -129,6 +131,12 @@ def _require_api_key(x_api_key: str | None, authorization: str | None) -> str:
             status_code=401,
             detail="Missing API key. Send x-api-key or Authorization: Bearer <key>, or set FLOWITH_API_KEY on the server.",
         )
+    if FLOWITH_REQUIRE_SERVER_KEY:
+        if not _SERVER_API_KEY or api_key != _SERVER_API_KEY:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid API key.",
+            )
     return api_key
 
 
@@ -183,12 +191,7 @@ async def create_message(
     msg_count = len(body.get("messages") or [])
     print(f"[REQ] model={requested_model}  tools={tool_count}  system_len={sys_len}  msgs={msg_count}  stream={body.get('stream')}", flush=True)
 
-    api_key = _resolve_api_key(x_api_key, authorization)
-    if not api_key:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing API key. Send x-api-key or Authorization: Bearer <key>, or set FLOWITH_API_KEY on the server.",
-        )
+    api_key = _require_api_key(x_api_key, authorization)
 
     requested_model = requested_model if requested_model != "?" else DEFAULT_MODEL
     flowith_model = map_model(requested_model, default=DEFAULT_MODEL)
@@ -244,7 +247,8 @@ async def create_message(
         stop_sequences = _with_xml_tool_stop_sequence(stop_sequences)
 
     if not stream:
-        result = client.call_api(
+        result = await run_in_threadpool(
+            client.call_api,
             messages,
             model=flowith_model,
             max_retries=2,
@@ -366,17 +370,28 @@ def _stream_claude_events(
 ) -> Generator[bytes, None, None]:
     q: "queue.Queue[Any]" = queue.Queue(maxsize=512)
     result_holder: dict[str, Any] = {}
+    cancel_event = threading.Event()
+
+    def _safe_put(item: Any) -> None:
+        # Drop chunks once the client disconnected so the worker cannot
+        # wedge on a full queue and leak the upstream semaphore.
+        while not cancel_event.is_set():
+            try:
+                q.put(item, timeout=1)
+                return
+            except queue.Full:
+                continue
 
     def on_chunk(piece: str) -> None:
         if piece:
-            q.put(("text", piece))
+            _safe_put(("text", piece))
 
     def on_reasoning(piece: str) -> None:
         if piece:
-            q.put(("reasoning", piece))
+            _safe_put(("reasoning", piece))
 
     def on_tool_call(tc: dict[str, Any]) -> None:
-        q.put(("tool_call", tc))
+        _safe_put(("tool_call", tc))
 
     def worker() -> None:
         try:
@@ -401,204 +416,210 @@ def _stream_claude_events(
         except Exception as e:
             result_holder["result"] = {"success": False, "error": str(e)}
         finally:
-            q.put(_SENTINEL_DONE)
+            try:
+                q.put(_SENTINEL_DONE, timeout=1)
+            except queue.Full:
+                pass
 
     threading.Thread(target=worker, daemon=True).start()
 
-    message_id = new_message_id()
-    yield sse_message_start(message_id, requested_model, input_tokens=0).encode("utf-8")
-    yield sse_ping().encode("utf-8")
+    try:
+        message_id = new_message_id()
+        yield sse_message_start(message_id, requested_model, input_tokens=0).encode("utf-8")
+        yield sse_ping().encode("utf-8")
 
-    current_block_index = 0
-    current_block_type: str | None = None
-    streamed_any = False
-    emitted_tool_use = False
-    last_ping = time.time()
+        current_block_index = 0
+        current_block_type: str | None = None
+        streamed_any = False
+        emitted_tool_use = False
+        last_ping = time.time()
 
-    text_buffer = ""
-    xml_parsing = False
-    think_tail = ""
-    in_think_text = False
-
-    def _close_block() -> None:
-        nonlocal current_block_type, current_block_index
-        if current_block_type is not None:
-            yield sse_content_block_stop(current_block_index).encode("utf-8")
-            current_block_index += 1
-            current_block_type = None
-
-    def _open_block(btype: str, **kwargs: Any) -> None:
-        nonlocal current_block_type
-        yield sse_content_block_start(current_block_index, block_type=btype, **kwargs).encode("utf-8")
-        current_block_type = btype
-
-    def _flush_text_as_block(text: str) -> None:
-        nonlocal current_block_index, streamed_any
-        if not text:
-            return
-        yield from _close_block()
-        yield from _open_block("text")
-        streamed_any = True
-        yield sse_content_block_delta(text, current_block_index).encode("utf-8")
-
-    def _emit_tool_use_block(tool: dict[str, Any]) -> None:
-        nonlocal current_block_index, streamed_any, emitted_tool_use
-        yield from _close_block()
-        yield from _open_block("tool_use", tool_id=tool["id"], tool_name=tool["name"])
-        streamed_any = True
-        emitted_tool_use = True
-        json_str = json.dumps(tool["input"], ensure_ascii=False)
-        _CHUNK = 30
-        if len(json_str) <= _CHUNK * 2:
-            yield sse_tool_input_delta(json_str, current_block_index).encode("utf-8")
-        else:
-            for i in range(0, len(json_str), _CHUNK):
-                yield sse_tool_input_delta(json_str[i:i + _CHUNK], current_block_index).encode("utf-8")
-
-    def _parse_and_emit_tools(buf: str) -> str:
-        nonlocal xml_parsing
-        try:
-            tools = parse_xml_tool_calls(buf)
-            if tools:
-                for tool in tools:
-                    yield from _emit_tool_use_block(tool)
-            consumed_end = find_xml_tool_call_consumed_end(buf)
-            if consumed_end == -1:
-                consumed_end = find_xml_tool_call_end(buf)
-            if consumed_end != -1:
-                remaining = buf[consumed_end:]
-                xml_parsing = has_xml_tool_call_marker(remaining)
-                return remaining
-        except Exception:
-            pass
+        text_buffer = ""
         xml_parsing = False
-        return buf
+        think_tail = ""
+        in_think_text = False
 
-    while True:
-        try:
-            item = q.get(timeout=10)
-        except queue.Empty:
-            yield sse_ping().encode("utf-8")
-            last_ping = time.time()
-            continue
+        def _close_block() -> None:
+            nonlocal current_block_type, current_block_index
+            if current_block_type is not None:
+                yield sse_content_block_stop(current_block_index).encode("utf-8")
+                current_block_index += 1
+                current_block_type = None
 
-        if item is _SENTINEL_DONE:
-            break
+        def _open_block(btype: str, **kwargs: Any) -> None:
+            nonlocal current_block_type
+            yield sse_content_block_start(current_block_index, block_type=btype, **kwargs).encode("utf-8")
+            current_block_type = btype
 
-        if not isinstance(item, tuple) or len(item) != 2:
-            continue
-
-        kind, payload = item
-
-        if kind == "reasoning":
-            if current_block_type != "thinking":
-                yield from _close_block()
-                yield from _open_block("thinking")
+        def _flush_text_as_block(text: str) -> None:
+            nonlocal current_block_index, streamed_any
+            if not text:
+                return
+            yield from _close_block()
+            yield from _open_block("text")
             streamed_any = True
-            yield sse_thinking_delta(payload, current_block_index).encode("utf-8")
+            yield sse_content_block_delta(text, current_block_index).encode("utf-8")
 
-        elif kind == "text":
-            think_tail += payload
-            payload, think_tail, in_think_text = _filter_stream_think_tags(
-                think_tail,
-                in_think_text,
-            )
-            if not payload:
-                continue
-
-            if not has_tools:
-                if current_block_type != "text":
-                    yield from _close_block()
-                    yield from _open_block("text")
-                streamed_any = True
-                yield sse_content_block_delta(payload, current_block_index).encode("utf-8")
-                continue
-
-            text_buffer += payload
-
-            if not xml_parsing:
-                tag_start = find_xml_tool_call_start(text_buffer)
-
-                if tag_start != -1:
-                    xml_parsing = True
-                    pre_xml = text_buffer[:tag_start]
-                    if pre_xml:
-                        yield from _flush_text_as_block(pre_xml)
-
-            if xml_parsing:
-                has_close = find_xml_tool_call_end(text_buffer) != -1
-                if has_close:
-                    text_buffer = yield from _parse_and_emit_tools(text_buffer)
-                    if text_buffer and not xml_parsing:
-                        yield from _flush_text_as_block(text_buffer)
-                        text_buffer = ""
+        def _emit_tool_use_block(tool: dict[str, Any]) -> None:
+            nonlocal current_block_index, streamed_any, emitted_tool_use
+            yield from _close_block()
+            yield from _open_block("tool_use", tool_id=tool["id"], tool_name=tool["name"])
+            streamed_any = True
+            emitted_tool_use = True
+            json_str = json.dumps(tool["input"], ensure_ascii=False)
+            _CHUNK = 30
+            if len(json_str) <= _CHUNK * 2:
+                yield sse_tool_input_delta(json_str, current_block_index).encode("utf-8")
             else:
-                _TAG_WINDOW = 128
-                if len(text_buffer) > _TAG_WINDOW:
-                    safe_text = text_buffer[:-_TAG_WINDOW]
+                for i in range(0, len(json_str), _CHUNK):
+                    yield sse_tool_input_delta(json_str[i:i + _CHUNK], current_block_index).encode("utf-8")
+
+        def _parse_and_emit_tools(buf: str) -> str:
+            nonlocal xml_parsing
+            try:
+                tools = parse_xml_tool_calls(buf)
+                if tools:
+                    for tool in tools:
+                        yield from _emit_tool_use_block(tool)
+                consumed_end = find_xml_tool_call_consumed_end(buf)
+                if consumed_end == -1:
+                    consumed_end = find_xml_tool_call_end(buf)
+                if consumed_end != -1:
+                    remaining = buf[consumed_end:]
+                    xml_parsing = has_xml_tool_call_marker(remaining)
+                    return remaining
+            except Exception:
+                pass
+            xml_parsing = False
+            return buf
+
+        while True:
+            try:
+                item = q.get(timeout=10)
+            except queue.Empty:
+                yield sse_ping().encode("utf-8")
+                last_ping = time.time()
+                continue
+
+            if item is _SENTINEL_DONE:
+                break
+
+            if not isinstance(item, tuple) or len(item) != 2:
+                continue
+
+            kind, payload = item
+
+            if kind == "reasoning":
+                if current_block_type != "thinking":
+                    yield from _close_block()
+                    yield from _open_block("thinking")
+                streamed_any = True
+                yield sse_thinking_delta(payload, current_block_index).encode("utf-8")
+
+            elif kind == "text":
+                think_tail += payload
+                payload, think_tail, in_think_text = _filter_stream_think_tags(
+                    think_tail,
+                    in_think_text,
+                )
+                if not payload:
+                    continue
+
+                if not has_tools:
                     if current_block_type != "text":
                         yield from _close_block()
                         yield from _open_block("text")
                     streamed_any = True
-                    yield sse_content_block_delta(safe_text, current_block_index).encode("utf-8")
-                    text_buffer = text_buffer[-_TAG_WINDOW:]
+                    yield sse_content_block_delta(payload, current_block_index).encode("utf-8")
+                    continue
 
-        elif kind == "tool_call":
-            yield from _close_block()
-            tc_id = normalize_tool_use_id(payload.get("id", f"toolu_{threading.get_ident()}"))
-            func = payload.get("function", {})
-            tc_name = func.get("name", "")
-            yield from _open_block("tool_use", tool_id=tc_id, tool_name=tc_name)
-            current_block_type = "tool_use"
-            streamed_any = True
-            emitted_tool_use = True
-            raw_args = func.get("arguments", "{}")
-            if raw_args:
-                if len(raw_args) <= 60:
-                    yield sse_tool_input_delta(raw_args, current_block_index).encode("utf-8")
+                text_buffer += payload
+
+                if not xml_parsing:
+                    tag_start = find_xml_tool_call_start(text_buffer)
+
+                    if tag_start != -1:
+                        xml_parsing = True
+                        pre_xml = text_buffer[:tag_start]
+                        if pre_xml:
+                            yield from _flush_text_as_block(pre_xml)
+
+                if xml_parsing:
+                    has_close = find_xml_tool_call_end(text_buffer) != -1
+                    if has_close:
+                        text_buffer = yield from _parse_and_emit_tools(text_buffer)
+                        if text_buffer and not xml_parsing:
+                            yield from _flush_text_as_block(text_buffer)
+                            text_buffer = ""
                 else:
-                    for i in range(0, len(raw_args), 30):
-                        yield sse_tool_input_delta(raw_args[i:i + 30], current_block_index).encode("utf-8")
+                    _TAG_WINDOW = 128
+                    if len(text_buffer) > _TAG_WINDOW:
+                        safe_text = text_buffer[:-_TAG_WINDOW]
+                        if current_block_type != "text":
+                            yield from _close_block()
+                            yield from _open_block("text")
+                        streamed_any = True
+                        yield sse_content_block_delta(safe_text, current_block_index).encode("utf-8")
+                        text_buffer = text_buffer[-_TAG_WINDOW:]
 
-        if time.time() - last_ping > 15:
-            yield sse_ping().encode("utf-8")
-            last_ping = time.time()
+            elif kind == "tool_call":
+                yield from _close_block()
+                tc_id = normalize_tool_use_id(payload.get("id", f"toolu_{threading.get_ident()}"))
+                func = payload.get("function", {})
+                tc_name = func.get("name", "")
+                yield from _open_block("tool_use", tool_id=tc_id, tool_name=tc_name)
+                current_block_type = "tool_use"
+                streamed_any = True
+                emitted_tool_use = True
+                raw_args = func.get("arguments", "{}")
+                if raw_args:
+                    if len(raw_args) <= 60:
+                        yield sse_tool_input_delta(raw_args, current_block_index).encode("utf-8")
+                    else:
+                        for i in range(0, len(raw_args), 30):
+                            yield sse_tool_input_delta(raw_args[i:i + 30], current_block_index).encode("utf-8")
 
-    if text_buffer:
-        if xml_parsing:
-            text_buffer = yield from _parse_and_emit_tools(text_buffer)
+            if time.time() - last_ping > 15:
+                yield sse_ping().encode("utf-8")
+                last_ping = time.time()
+
         if text_buffer:
-            yield from _flush_text_as_block(text_buffer)
+            if xml_parsing:
+                text_buffer = yield from _parse_and_emit_tools(text_buffer)
+            if text_buffer:
+                yield from _flush_text_as_block(text_buffer)
 
-    if current_block_type is not None:
-        yield from _close_block()
+        if current_block_type is not None:
+            yield from _close_block()
 
-    res = result_holder.get("result") or {}
-    if not res.get("success"):
-        err_msg = str(res.get("error", "upstream error"))
-        if not streamed_any:
-            yield sse_content_block_start(0, block_type="text").encode("utf-8")
-            yield sse_content_block_delta(f"[upstream error] {err_msg}", 0).encode("utf-8")
-            yield sse_content_block_stop(0).encode("utf-8")
-        yield sse_error(err_msg).encode("utf-8")
+        res = result_holder.get("result") or {}
+        if not res.get("success"):
+            err_msg = str(res.get("error", "upstream error"))
+            if not streamed_any:
+                yield sse_content_block_start(0, block_type="text").encode("utf-8")
+                yield sse_content_block_delta(f"[upstream error] {err_msg}", 0).encode("utf-8")
+                yield sse_content_block_stop(0).encode("utf-8")
+            yield sse_error(err_msg).encode("utf-8")
+            yield sse_message_stop().encode("utf-8")
+            return
+
+        usage = res.get("usage", {}) or {}
+        output_tokens = int(usage.get("completion_tokens", 0) or 0)
+        finish_reason = res.get("finish_reason") or ""
+
+        has_tool_calls = emitted_tool_use or bool(res.get("tool_calls"))
+        if not has_tool_calls:
+            result_content = res.get("content", "") or ""
+            has_tool_calls = has_xml_tool_call_marker(result_content)
+
+        if has_tool_calls:
+            stop_reason = "tool_use"
+        elif finish_reason == "length":
+            stop_reason = "max_tokens"
+        else:
+            stop_reason = "end_turn"
+
+        yield sse_message_delta(output_tokens=output_tokens, stop_reason=stop_reason).encode("utf-8")
         yield sse_message_stop().encode("utf-8")
-        return
-
-    usage = res.get("usage", {}) or {}
-    output_tokens = int(usage.get("completion_tokens", 0) or 0)
-    finish_reason = res.get("finish_reason") or ""
-
-    has_tool_calls = emitted_tool_use or bool(res.get("tool_calls"))
-    if not has_tool_calls:
-        result_content = res.get("content", "") or ""
-        has_tool_calls = has_xml_tool_call_marker(result_content)
-
-    if has_tool_calls:
-        stop_reason = "tool_use"
-    elif finish_reason == "length":
-        stop_reason = "max_tokens"
-    else:
-        stop_reason = "end_turn"
-
-    yield sse_message_delta(output_tokens=output_tokens, stop_reason=stop_reason).encode("utf-8")
-    yield sse_message_stop().encode("utf-8")
+    finally:
+        cancel_event.set()
