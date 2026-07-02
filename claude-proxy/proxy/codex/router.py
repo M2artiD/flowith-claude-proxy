@@ -31,6 +31,85 @@ from ..upstream import FlowithClient
 
 _TRACE_HERMES = FLOWITH_TRACE_HERMES
 
+_THINK_OPEN_TAG = "<think>"
+_THINK_CLOSE_TAG = "</think>"
+
+
+def _split_stream_think_segments(
+    raw: str,
+    in_think: bool,
+) -> tuple[list[tuple[str, str]], str, bool]:
+    """Split an incoming stream fragment into ordered ('text'|'reasoning', str) segments.
+
+    - Content inside <think>...</think> pairs is routed to 'reasoning' so the codex
+      UI can render it as thinking output instead of losing it.
+    - A trailing partial tag (e.g. ``<th``, ``</thin``) is kept in the pending buffer
+      so the next chunk can complete it without leaking the marker as visible text.
+    - When ``in_think`` is True the fragment starts inside a thinking block; the
+      returned boolean tells the caller whether the block is still open after
+      consuming ``raw``.
+    """
+    segments: list[tuple[str, str]] = []
+    pos = 0
+
+    def _append(kind: str, text: str) -> None:
+        if not text:
+            return
+        if segments and segments[-1][0] == kind:
+            segments[-1] = (kind, segments[-1][1] + text)
+            return
+        segments.append((kind, text))
+
+    while pos < len(raw):
+        if in_think:
+            close_idx = raw.find(_THINK_CLOSE_TAG, pos)
+            if close_idx >= 0:
+                _append("reasoning", raw[pos:close_idx])
+                pos = close_idx + len(_THINK_CLOSE_TAG)
+                in_think = False
+                continue
+
+            remainder = raw[pos:]
+            for i in range(min(len(_THINK_CLOSE_TAG) - 1, len(remainder)), 0, -1):
+                if remainder.endswith(_THINK_CLOSE_TAG[:i]):
+                    _append("reasoning", remainder[:-i])
+                    return segments, remainder[-i:], True
+            _append("reasoning", remainder)
+            return segments, "", True
+
+        open_idx = raw.find(_THINK_OPEN_TAG, pos)
+        if open_idx >= 0:
+            _append("text", raw[pos:open_idx])
+            pos = open_idx + len(_THINK_OPEN_TAG)
+            in_think = True
+            continue
+
+        remainder = raw[pos:]
+        for i in range(min(len(_THINK_OPEN_TAG) - 1, len(remainder)), 0, -1):
+            if remainder.endswith(_THINK_OPEN_TAG[:i]):
+                _append("text", remainder[:-i])
+                return segments, remainder[-i:], False
+        _append("text", remainder)
+        return segments, "", False
+
+    return segments, "", in_think
+
+
+def _extract_think_from_text(text: str) -> tuple[str, str]:
+    """Strip <think>...</think> pairs from a non-streaming string.
+
+    Returns (visible_text, extracted_reasoning). If an unclosed opening tag
+    is present, the tail is still routed into reasoning so nothing is lost.
+    """
+    if not text or _THINK_OPEN_TAG not in text:
+        return text, ""
+    segments, tail, in_think = _split_stream_think_segments(text, False)
+    if tail:
+        segments.append(("reasoning" if in_think else "text", tail))
+    visible = "".join(t for k, t in segments if k == "text")
+    reasoning_out = "".join(t for k, t in segments if k == "reasoning")
+    return visible, reasoning_out
+
 
 def _trace_hermes(message: str) -> None:
     if _TRACE_HERMES:
@@ -545,6 +624,9 @@ def _chat_completion_response(result: dict[str, Any], requested_model: str) -> d
     now = int(time.time())
     content = result.get("content", "") or ""
     reasoning = result.get("reasoning_content", "") or ""
+    content, extracted_reasoning = _extract_think_from_text(content)
+    if extracted_reasoning:
+        reasoning = (reasoning + "\n" if reasoning else "") + extracted_reasoning
     tool_calls = _chat_tool_calls_from_result(result)
     message: dict[str, Any] = {"role": "assistant", "content": content}
     finish_reason = _finish_reason_openai(result.get("finish_reason"))
@@ -653,6 +735,8 @@ def _chat_stream_events(
     streamed_text_chunks = 0
     streamed_reasoning_chunks = 0
     xml_buffer = ""
+    think_in = False
+    think_buffer = ""
     emitted_tool_calls: list[dict[str, Any]] = []
 
     def on_chunk(piece: str) -> None:
@@ -810,12 +894,22 @@ def _chat_stream_events(
         if kind != "text":
             continue
         raw_stream_chunks += 1
-        if has_tools:
-            xml_buffer += str(payload)
-            segments, xml_buffer = _drain_xml_tool_stream_buffer(xml_buffer)
-            yield from _emit_tool_segments(segments)
-            continue
-        yield from _emit_text_delta(str(payload))
+        think_buffer += str(payload)
+        think_segments, think_buffer, think_in = _split_stream_think_segments(
+            think_buffer, think_in
+        )
+        for seg_kind, seg_text in think_segments:
+            if not seg_text:
+                continue
+            if seg_kind == "reasoning":
+                yield from _emit_reasoning_delta(seg_text)
+                continue
+            if has_tools:
+                xml_buffer += seg_text
+                segments, xml_buffer = _drain_xml_tool_stream_buffer(xml_buffer)
+                yield from _emit_tool_segments(segments)
+                continue
+            yield from _emit_text_delta(seg_text)
 
     result = result_holder.get("result") or {}
     _trace_hermes(
@@ -933,6 +1027,9 @@ def _responses_response(result: dict[str, Any], requested_model: str) -> dict[st
     now = int(time.time())
     content = result.get("content", "") or ""
     reasoning = result.get("reasoning_content", "") or ""
+    content, extracted_reasoning = _extract_think_from_text(content)
+    if extracted_reasoning:
+        reasoning = (reasoning + "\n" if reasoning else "") + extracted_reasoning
     response_id = "resp_" + new_message_id()[4:]
     message_id = "msg_" + new_message_id()[4:]
     function_calls = _responses_function_calls_from_result(result)
@@ -1086,6 +1183,8 @@ def _responses_stream_events(
 
     output_text = ""
     xml_buffer = ""
+    resp_think_in = False
+    resp_think_buffer = ""
     text_done_emitted = False
     emitted_function_calls: list[dict[str, Any]] = []
     completed_items: dict[int, dict[str, Any]] = {}
@@ -1337,12 +1436,22 @@ def _responses_stream_events(
         if kind != "text":
             continue
         raw_stream_chunks += 1
-        if has_tools:
-            xml_buffer += str(payload)
-            segments, xml_buffer = _drain_xml_tool_stream_buffer(xml_buffer)
-            yield from _emit_response_segments(segments)
-            continue
-        yield from _emit_text_delta(str(payload))
+        resp_think_buffer += str(payload)
+        resp_think_segments, resp_think_buffer, resp_think_in = _split_stream_think_segments(
+            resp_think_buffer, resp_think_in
+        )
+        for seg_kind, seg_text in resp_think_segments:
+            if not seg_text:
+                continue
+            if seg_kind == "reasoning":
+                yield from _emit_reasoning_delta(seg_text)
+                continue
+            if has_tools:
+                xml_buffer += seg_text
+                segments, xml_buffer = _drain_xml_tool_stream_buffer(xml_buffer)
+                yield from _emit_response_segments(segments)
+                continue
+            yield from _emit_text_delta(seg_text)
 
     if has_tools:
         if raw_stream_chunks == 0 and result_holder.get("result", {}).get("content"):
@@ -1390,6 +1499,18 @@ def _responses_stream_events(
     yield from _emit_reasoning_done(
         final_text=final_reasoning if final_reasoning else None
     )
+
+    # If the upstream did NOT stream any text chunks but returned a final content
+    # string (non-streaming or coalesced-response backends), emit it here so the
+    # codex CLI receives the answer instead of an empty message. Skip for the
+    # tool-mode path where the payload is already routed through function_calls.
+    if not has_tools and not emitted_function_calls:
+        final_content = result.get("content", "") or ""
+        if final_content and not output_text:
+            _trace_hermes(
+                f"responses_stream_flush_final_content trace={trace_id} len={len(final_content)}"
+            )
+            yield from _emit_text_delta(final_content)
 
     if not text_item_started and not emitted_function_calls:
         yield from _emit_text_start()

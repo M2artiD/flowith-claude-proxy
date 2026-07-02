@@ -93,6 +93,97 @@ def _request_timeout(read_timeout: int | float) -> tuple[float, int | float]:
     return (connect_timeout, read_timeout)
 
 
+def _pick_reasoning_field(obj: dict[str, Any]) -> str:
+    """Return the first non-empty reasoning-like field from an upstream delta/message.
+
+    Flowith upstream varies between providers; different backends label the chain-of-thought
+    stream differently. We accept any of the common spellings and normalise to a single string.
+    """
+    if not isinstance(obj, dict):
+        return ""
+    for key in (
+        "reasoning_content",
+        "reasoning",
+        "thinking",
+        "thought",
+        "thoughts",
+        "reasoning_text",
+        "cot",
+    ):
+        val = obj.get(key)
+        if isinstance(val, str) and val:
+            return val
+        if isinstance(val, dict):
+            # Anthropic-style {"type": "thinking", "thinking": "..."}
+            for sub in ("thinking", "text", "content"):
+                inner = val.get(sub)
+                if isinstance(inner, str) and inner:
+                    return inner
+        if isinstance(val, list):
+            parts: list[str] = []
+            for item in val:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    for sub in ("thinking", "text", "content", "reasoning"):
+                        inner = item.get(sub)
+                        if isinstance(inner, str):
+                            parts.append(inner)
+                            break
+            joined = "".join(parts)
+            if joined:
+                return joined
+    return ""
+
+
+def _extract_content_and_thinking(content: Any) -> tuple[str, str]:
+    """Normalise a message/delta ``content`` field to (text, thinking).
+
+    Handles three shapes:
+
+    * plain string -> (text, "")
+    * Anthropic-style block list ``[{"type": "thinking", ...}, {"type": "text", ...}]``
+      -> concatenated text + concatenated thinking
+    * dict with ``text`` / ``content`` keys -> best-effort extraction
+    * ``None`` or unknown -> ("", "")
+    """
+    if content is None:
+        return "", ""
+    if isinstance(content, str):
+        return content, ""
+    if isinstance(content, list):
+        texts: list[str] = []
+        thinks: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                texts.append(block)
+                continue
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type") or ""
+            if btype in ("thinking", "reasoning", "thought"):
+                for sub in ("thinking", "reasoning", "text", "content"):
+                    val = block.get(sub)
+                    if isinstance(val, str) and val:
+                        thinks.append(val)
+                        break
+                continue
+            if btype in ("text", "output_text", ""):
+                for sub in ("text", "content"):
+                    val = block.get(sub)
+                    if isinstance(val, str) and val:
+                        texts.append(val)
+                        break
+        return "".join(texts), "".join(thinks)
+    if isinstance(content, dict):
+        for sub in ("text", "content"):
+            val = content.get(sub)
+            if isinstance(val, str):
+                return val, ""
+        return "", ""
+    return str(content), ""
+
+
 class FlowithClient:
     def __init__(
         self,
@@ -260,12 +351,14 @@ class FlowithClient:
                     if result.get("choices"):
                         msg = result["choices"][0]["message"]
                         tool_calls = msg.get("tool_calls")
+                        content_val, thinking_from_blocks = _extract_content_and_thinking(msg.get("content"))
+                        reasoning_text = _pick_reasoning_field(msg) or thinking_from_blocks
                         return {
                             "success": True,
-                            "content": msg.get("content", "") or "",
+                            "content": content_val,
                             "time_ms": elapsed_ms,
                             "usage": result.get("usage", {}) or {},
-                            "reasoning_content": msg.get("reasoning_content", "") or "",
+                            "reasoning_content": reasoning_text,
                             "tool_calls": tool_calls,
                             "finish_reason": result["choices"][0].get("finish_reason"),
                             "upstream_model": upstream_model,
@@ -358,13 +451,18 @@ class FlowithClient:
                 if fr:
                     finish_reason = fr
 
-                piece = delta.get("content")
-                if piece:
-                    content_parts.append(piece)
+                piece_raw = delta.get("content")
+                piece_text, piece_thinking = _extract_content_and_thinking(piece_raw)
+                if piece_text:
+                    content_parts.append(piece_text)
                     if on_chunk:
-                        on_chunk(piece)
+                        on_chunk(piece_text)
+                if piece_thinking:
+                    reasoning_parts.append(piece_thinking)
+                    if on_reasoning:
+                        on_reasoning(piece_thinking)
 
-                reasoning = delta.get("reasoning_content")
+                reasoning = _pick_reasoning_field(delta)
                 if reasoning:
                     reasoning_parts.append(reasoning)
                     if on_reasoning:
