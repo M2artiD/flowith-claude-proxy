@@ -544,12 +544,16 @@ def _chat_tool_calls_from_result(result: dict[str, Any]) -> list[dict[str, Any]]
 def _chat_completion_response(result: dict[str, Any], requested_model: str) -> dict[str, Any]:
     now = int(time.time())
     content = result.get("content", "") or ""
+    reasoning = result.get("reasoning_content", "") or ""
     tool_calls = _chat_tool_calls_from_result(result)
     message: dict[str, Any] = {"role": "assistant", "content": content}
     finish_reason = _finish_reason_openai(result.get("finish_reason"))
     if tool_calls:
         message = {"role": "assistant", "content": None, "tool_calls": tool_calls}
         finish_reason = "tool_calls"
+    if reasoning:
+        # OpenAI-compatible reasoning field (DeepSeek/Qwen/most reasoning clients).
+        message["reasoning_content"] = reasoning
     return {
         "id": "chatcmpl_" + new_message_id()[4:],
         "object": "chat.completion",
@@ -647,12 +651,17 @@ def _chat_stream_events(
     has_tools = bool(tools)
     raw_stream_chunks = 0
     streamed_text_chunks = 0
+    streamed_reasoning_chunks = 0
     xml_buffer = ""
     emitted_tool_calls: list[dict[str, Any]] = []
 
     def on_chunk(piece: str) -> None:
         if piece:
             q.put(("text", piece))
+
+    def on_reasoning(piece: str) -> None:
+        if piece:
+            q.put(("reasoning", piece))
 
     def worker() -> None:
         try:
@@ -662,6 +671,7 @@ def _chat_stream_events(
                 max_retries=1,
                 stream=True,
                 on_chunk=on_chunk,
+                on_reasoning=on_reasoning,
                 tools=None if has_tools else tools,
                 tool_choice=None if has_tools else tool_choice,
                 max_tokens=max_tokens,
@@ -698,6 +708,29 @@ def _chat_stream_events(
                 "created": now,
                 "model": requested_model,
                 "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+            },
+        ).encode("utf-8")
+
+    def _emit_reasoning_delta(text: str) -> Generator[bytes, None, None]:
+        nonlocal streamed_reasoning_chunks
+        if not text:
+            return
+        streamed_reasoning_chunks += 1
+        # OpenAI-compatible reasoning field (DeepSeek/Qwen/most reasoning-capable clients).
+        yield _openai_sse(
+            None,
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": now,
+                "model": requested_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"reasoning_content": text},
+                        "finish_reason": None,
+                    }
+                ],
             },
         ).encode("utf-8")
 
@@ -771,6 +804,9 @@ def _chat_stream_events(
         if not isinstance(item, tuple) or len(item) != 2:
             continue
         kind, payload = item
+        if kind == "reasoning":
+            yield from _emit_reasoning_delta(str(payload))
+            continue
         if kind != "text":
             continue
         raw_stream_chunks += 1
@@ -896,16 +932,27 @@ def _responses_function_calls_from_result(result: dict[str, Any]) -> list[dict[s
 def _responses_response(result: dict[str, Any], requested_model: str) -> dict[str, Any]:
     now = int(time.time())
     content = result.get("content", "") or ""
+    reasoning = result.get("reasoning_content", "") or ""
     response_id = "resp_" + new_message_id()[4:]
     message_id = "msg_" + new_message_id()[4:]
     function_calls = _responses_function_calls_from_result(result)
-    output: list[dict[str, Any]]
+    output: list[dict[str, Any]] = []
     output_text = content
+    if reasoning:
+        output.append(
+            {
+                "id": "rs_" + new_message_id()[4:],
+                "type": "reasoning",
+                "summary": [
+                    {"type": "summary_text", "text": reasoning}
+                ],
+            }
+        )
     if function_calls:
-        output = function_calls
+        output.extend(function_calls)
         output_text = ""
     else:
-        output = [
+        output.append(
             {
                 "id": message_id,
                 "type": "message",
@@ -919,7 +966,7 @@ def _responses_response(result: dict[str, Any], requested_model: str) -> dict[st
                     }
                 ],
             }
-        ]
+        )
     return {
         "id": response_id,
         "object": "response",
@@ -965,6 +1012,10 @@ def _responses_stream_events(
         if piece:
             q.put(("text", piece))
 
+    def on_reasoning(piece: str) -> None:
+        if piece:
+            q.put(("reasoning", piece))
+
     def worker() -> None:
         try:
             result_holder["result"] = client.call_api(
@@ -973,6 +1024,7 @@ def _responses_stream_events(
                 max_retries=1,
                 stream=True,
                 on_chunk=on_chunk,
+                on_reasoning=on_reasoning,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
@@ -1169,8 +1221,108 @@ def _responses_stream_events(
                 for function_call in function_calls:
                     yield from _emit_function_call(function_call)
 
-    if not has_tools:
-        yield from _emit_text_start()
+    reasoning_item_id = "rs_" + new_message_id()[4:]
+    reasoning_item_started = False
+    reasoning_item_done = False
+    reasoning_output_index: int | None = None
+    reasoning_text_accum = ""
+    streamed_reasoning_chunks = 0
+
+    def _emit_reasoning_start() -> Generator[bytes, None, None]:
+        nonlocal next_output_index, reasoning_item_started, reasoning_output_index
+        if reasoning_item_started:
+            return
+        reasoning_item_started = True
+        reasoning_output_index = next_output_index
+        next_output_index += 1
+        _trace_hermes(
+            f"responses_stream_event trace={trace_id} event=response.output_item.added kind=reasoning output_index={reasoning_output_index}"
+        )
+        yield _openai_sse(
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": reasoning_output_index,
+                "item": {
+                    "id": reasoning_item_id,
+                    "type": "reasoning",
+                    "summary": [],
+                },
+            },
+        ).encode("utf-8")
+        yield _openai_sse(
+            "response.reasoning_summary_part.added",
+            {
+                "type": "response.reasoning_summary_part.added",
+                "item_id": reasoning_item_id,
+                "output_index": reasoning_output_index,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""},
+            },
+        ).encode("utf-8")
+
+    def _emit_reasoning_delta(text: str) -> Generator[bytes, None, None]:
+        nonlocal reasoning_text_accum, streamed_reasoning_chunks
+        if not text:
+            return
+        yield from _emit_reasoning_start()
+        reasoning_text_accum += text
+        streamed_reasoning_chunks += 1
+        yield _openai_sse(
+            "response.reasoning_summary_text.delta",
+            {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": reasoning_item_id,
+                "output_index": reasoning_output_index if reasoning_output_index is not None else 0,
+                "summary_index": 0,
+                "delta": text,
+            },
+        ).encode("utf-8")
+
+    def _emit_reasoning_done(*, final_text: str | None = None) -> Generator[bytes, None, None]:
+        nonlocal reasoning_item_done
+        if reasoning_item_done or not reasoning_item_started:
+            return
+        reasoning_item_done = True
+        reported = reasoning_text_accum if final_text is None else final_text
+        output_index = reasoning_output_index if reasoning_output_index is not None else 0
+        _trace_hermes(
+            f"responses_stream_event trace={trace_id} event=response.reasoning_summary_text.done text_len={len(reported)}"
+        )
+        yield _openai_sse(
+            "response.reasoning_summary_text.done",
+            {
+                "type": "response.reasoning_summary_text.done",
+                "item_id": reasoning_item_id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "text": reported,
+            },
+        ).encode("utf-8")
+        yield _openai_sse(
+            "response.reasoning_summary_part.done",
+            {
+                "type": "response.reasoning_summary_part.done",
+                "item_id": reasoning_item_id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": reported},
+            },
+        ).encode("utf-8")
+        reasoning_item = {
+            "id": reasoning_item_id,
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reported}],
+        }
+        completed_items[output_index] = reasoning_item
+        yield _openai_sse(
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": reasoning_item,
+            },
+        ).encode("utf-8")
 
     while True:
         item = q.get()
@@ -1179,6 +1331,9 @@ def _responses_stream_events(
         if not isinstance(item, tuple) or len(item) != 2:
             continue
         kind, payload = item
+        if kind == "reasoning":
+            yield from _emit_reasoning_delta(str(payload))
+            continue
         if kind != "text":
             continue
         raw_stream_chunks += 1
@@ -1226,6 +1381,15 @@ def _responses_stream_events(
         )
         for function_call in native_function_calls:
             yield from _emit_function_call(function_call)
+
+    # Finalize reasoning first; if upstream only returned reasoning at the end (non-stream fallback),
+    # emit whatever accumulated in result.reasoning_content.
+    final_reasoning = result.get("reasoning_content", "") or ""
+    if final_reasoning and not reasoning_item_started:
+        yield from _emit_reasoning_delta(final_reasoning)
+    yield from _emit_reasoning_done(
+        final_text=final_reasoning if final_reasoning else None
+    )
 
     if not text_item_started and not emitted_function_calls:
         yield from _emit_text_start()
