@@ -11,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Generator
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -115,6 +116,24 @@ def _is_local_client_host(host: str | None) -> bool:
     return bool(mapped and mapped.is_loopback)
 
 
+def _origin_is_allowed(request: Request) -> bool:
+    """Reject cross-origin browser requests (CSRF via loopback fetch).
+
+    Only browsers attach an Origin header; CLI/SDK callers never do, so a
+    missing Origin is not a signal of anything. A present Origin that
+    doesn't match our own Host means some other page's script, not the
+    user, is driving this request.
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    host = request.headers.get("host")
+    if not host:
+        return False
+    origin_host = urlsplit(origin).netloc.strip().lower()
+    return origin_host == host.strip().lower()
+
+
 def _request_too_large_response() -> JSONResponse:
     return JSONResponse(
         status_code=413,
@@ -161,6 +180,16 @@ async def _local_only_middleware(request: Request, call_next: Any) -> Any:
                     "error": {
                         "type": "forbidden",
                         "message": "FLOWITH_LOCAL_ONLY is enabled; only localhost clients are allowed.",
+                    }
+                },
+            )
+        if not _origin_is_allowed(request):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "type": "forbidden",
+                        "message": "Cross-origin requests are not allowed.",
                     }
                 },
             )
