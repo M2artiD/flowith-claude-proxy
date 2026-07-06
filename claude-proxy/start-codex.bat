@@ -9,6 +9,21 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
+if not defined FLOWITH_API_PROFILE set "FLOWITH_API_PROFILE=codex"
+if not defined FLOWITH_API_PORT set "FLOWITH_API_PORT=8788"
+if not defined FLOWITH_OPEN_DASHBOARD if exist .env (
+    for /f "usebackq tokens=1,* delims==" %%A in (`findstr /b /i "FLOWITH_OPEN_DASHBOARD=" .env 2^>nul`) do set "FLOWITH_OPEN_DASHBOARD=%%B"
+)
+
+
+set "PORT_ALREADY_RUNNING=0"
+call :check_port %FLOWITH_API_PORT%
+if "%PORT_ALREADY_RUNNING%"=="1" (
+    call :open_dashboard %FLOWITH_API_PORT%
+    exit /b 0
+)
+if ERRORLEVEL 1 exit /b 1
+
 set "INSTALL_LOCK=%CD%\.install.lock"
 set "INSTALL_LOCK_STALE_SECONDS=300"
 
@@ -62,7 +77,7 @@ if not exist .env (
     if exist .env.example (
         echo [INFO] .env not found. Creating from .env.example...
         copy .env.example .env >nul
-        echo [WARN] Please edit .env and set FLOWITH_API_KEY.
+        echo [WARN] Please edit claude-proxy\.env and set FLOWITH_API_KEY.
     ) else (
         echo [ERROR] .env not found and .env.example is missing.
     )
@@ -72,17 +87,44 @@ if not exist .env (
 
 rd /s /q proxy\__pycache__ 2>nul
 
-set FLOWITH_API_PROFILE=codex
-set FLOWITH_API_PORT=8788
+call :open_dashboard %FLOWITH_API_PORT%
 
 echo.
 echo =====================================
 echo   Flowith Codex/OpenAI Proxy
-echo   http://127.0.0.1:8788/v1
+echo   http://127.0.0.1:%FLOWITH_API_PORT%/v1
 echo   Endpoints: /v1/responses, /v1/chat/completions
+echo   Dashboard: http://127.0.0.1:%FLOWITH_API_PORT%/dashboard
 echo   Streaming: text/tool stream guard enabled
 echo =====================================
 echo.
 
 python -m proxy
 pause
+exit /b %ERRORLEVEL%
+
+:open_dashboard
+set "_DASHBOARD_PORT=%~1"
+if /i "%FLOWITH_OPEN_DASHBOARD%"=="false" exit /b 0
+if /i "%FLOWITH_OPEN_DASHBOARD%"=="0" exit /b 0
+powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$port=[int]$env:_DASHBOARD_PORT; $inner='for($i=0; $i -lt 30; $i++) { try { $r=Invoke-WebRequest -Uri ''http://127.0.0.1:' + $port + '/health'' -UseBasicParsing -TimeoutSec 1; if ($r.StatusCode -eq 200 -and $r.Content -match ''\"ok\"\s*:\s*true'') { Start-Process ''http://127.0.0.1:' + $port + '/dashboard''; break } } catch { Start-Sleep -Milliseconds 500 } }'; Start-Process powershell -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command',$inner)" >nul 2>&1
+exit /b 0
+
+:check_port
+set "_PORT=%~1"
+netstat -ano | findstr /r /c:":%_PORT% .*LISTENING" >nul 2>&1
+if %ERRORLEVEL% NEQ 0 exit /b 0
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$port=[int]$env:_PORT; try { $r=Invoke-WebRequest -Uri ('http://127.0.0.1:{0}/health' -f $port) -UseBasicParsing -TimeoutSec 2; if ($r.StatusCode -eq 200 -and $r.Content -match '\"ok\"\s*:\s*true') { exit 10 } } catch {}; exit 20" >nul 2>&1
+if %ERRORLEVEL% EQU 10 (
+    echo [OK] Proxy already running on http://127.0.0.1:%_PORT%
+    echo      Reuse this instance, or stop it before launching a fresh one.
+    set "PORT_ALREADY_RUNNING=1"
+    exit /b 0
+)
+echo [ERROR] Port %_PORT% is already in use by a non-proxy or unhealthy process.
+echo         Kill the previous instance, or change the port, then retry.
+echo         Tip: from project root, run clean.bat --stop-proxy to stop known proxy listeners.
+echo         Owning PIDs:
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr /r /c:":%_PORT% .*LISTENING"') do echo           PID %%P
+pause
+exit /b 1

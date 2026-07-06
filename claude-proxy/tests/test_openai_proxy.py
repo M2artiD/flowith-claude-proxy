@@ -53,6 +53,87 @@ class OpenAIProxyTests(unittest.TestCase):
         else:
             os.environ["FLOWITH_API_PROFILE"] = self.original_profile
 
+    def test_require_server_key_rejects_anonymous_call(self) -> None:
+        # With the gate on, an unauthenticated caller must not silently inherit
+        # the server key via the header-less fallback. Regression for #issue-auth-fallback.
+        original_flag = server.FLOWITH_REQUIRE_SERVER_KEY
+        server.FLOWITH_REQUIRE_SERVER_KEY = True
+        try:
+            self.assertIsNone(server._resolve_api_key(None, None))
+        finally:
+            server.FLOWITH_REQUIRE_SERVER_KEY = original_flag
+
+    def test_require_server_key_off_still_allows_fallback(self) -> None:
+        original_flag = server.FLOWITH_REQUIRE_SERVER_KEY
+        original_local_only = server.FLOWITH_LOCAL_ONLY
+        server.FLOWITH_REQUIRE_SERVER_KEY = False
+        server.FLOWITH_LOCAL_ONLY = True
+        try:
+            self.assertEqual(server._resolve_api_key(None, None), "test-key")
+        finally:
+            server.FLOWITH_REQUIRE_SERVER_KEY = original_flag
+            server.FLOWITH_LOCAL_ONLY = original_local_only
+
+    def test_server_key_fallback_is_disabled_when_not_local_only(self) -> None:
+        original_flag = server.FLOWITH_REQUIRE_SERVER_KEY
+        original_local_only = server.FLOWITH_LOCAL_ONLY
+        server.FLOWITH_REQUIRE_SERVER_KEY = False
+        server.FLOWITH_LOCAL_ONLY = False
+        try:
+            self.assertIsNone(server._resolve_api_key(None, None))
+        finally:
+            server.FLOWITH_REQUIRE_SERVER_KEY = original_flag
+            server.FLOWITH_LOCAL_ONLY = original_local_only
+
+    def test_require_server_key_rejects_wrong_key_on_all_inference_endpoints(self) -> None:
+        # HTTP-level regression: with the gate on, a wrong key must get 401 on
+        # every inference endpoint, and the correct key must still pass. Guards
+        # against any single route dropping the injected require_api_key check.
+        original_flag = server.FLOWITH_REQUIRE_SERVER_KEY
+        server.FLOWITH_REQUIRE_SERVER_KEY = True
+        try:
+            inference_requests = [
+                (
+                    "/v1/chat/completions",
+                    {
+                        "model": "claude-4.6-sonnet",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                ),
+                (
+                    "/v1/responses",
+                    {
+                        "model": "claude-4.6-sonnet",
+                        "input": "hi",
+                    },
+                ),
+                (
+                    "/v1/messages",
+                    {
+                        "model": "claude-4.6-sonnet",
+                        "max_tokens": 16,
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                ),
+            ]
+            for path, payload in inference_requests:
+                with self.subTest(path=path, key="wrong"):
+                    response = self.client.post(
+                        path,
+                        headers={"Authorization": "Bearer wrong-key"},
+                        json=payload,
+                    )
+                    self.assertEqual(response.status_code, 401)
+                with self.subTest(path=path, key="correct"):
+                    response = self.client.post(
+                        path,
+                        headers={"Authorization": "Bearer test-key"},
+                        json=payload,
+                    )
+                    self.assertEqual(response.status_code, 200)
+        finally:
+            server.FLOWITH_REQUIRE_SERVER_KEY = original_flag
+
     def test_claude_profile_disables_openai_endpoints(self) -> None:
         os.environ["FLOWITH_API_PROFILE"] = "claude"
 
@@ -104,6 +185,23 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn('"content": "lo"', events)
         self.assertIn('"finish_reason": "stop"', events)
         self.assertIn("data: [DONE]", events)
+
+    def test_chat_completions_streaming_preserves_final_partial_think_prefix(self) -> None:
+        self.fake_client.next_stream_chunks = ["answer <th"]
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "claude-4.6-sonnet",
+                "messages": [{"role": "user", "content": "echo final tail"}],
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('"content": "answer "', response.text)
+        self.assertIn('"content": "<th"', response.text)
 
     def test_chat_completions_streaming_with_tools_does_not_duplicate_streamed_plain_text(self) -> None:
         self.fake_client.next_stream_chunks = ["hello"]
@@ -162,6 +260,35 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn('"finish_reason": "stop"', events)
         self.assertIn("data: [DONE]", events)
         self.assertNotIn('"finish_reason": "tool_calls"', events)
+
+    def test_chat_completions_streaming_with_tools_preserves_final_partial_tool_prefix(self) -> None:
+        self.fake_client.next_stream_chunks = ["answer <tool_call"]
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "claude-4.6-sonnet",
+                "messages": [{"role": "user", "content": "echo final tail"}],
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "description": "Run a shell command",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('"content": "answer "', response.text)
+        self.assertIn('"content": "<tool_call"', response.text)
+        self.assertIn('"finish_reason": "stop"', response.text)
+        self.assertNotIn('"finish_reason": "tool_calls"', response.text)
 
     def test_chat_completions_streaming_with_tools_xml_tool_call_does_not_leak_raw_xml(self) -> None:
         self.fake_client.next_stream_chunks = [
@@ -346,9 +473,10 @@ class OpenAIProxyTests(unittest.TestCase):
 
         upstream_call = self.fake_client.calls[0]
         self.assertIsNone(upstream_call.get("tools"))
-        self.assertIn("</tool_call>", upstream_call.get("stop_sequences"))
+        self.assertNotIn("</tool_call>", upstream_call.get("stop_sequences") or [])
         self.assertEqual(upstream_call["messages"][0]["role"], "system")
-        self.assertIn("# TOOL CALLING", upstream_call["messages"][0]["content"])
+        self.assertIn("# Tool Use", upstream_call["messages"][0]["content"])
+        self.assertIn("Use a tool only when it is needed", upstream_call["messages"][0]["content"])
         self.assertIn("### shell", upstream_call["messages"][0]["content"])
 
     def test_responses_input_function_call_output_becomes_observation(self) -> None:
@@ -399,6 +527,44 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn('"delta": "lo"', events)
         self.assertIn("event: response.completed", events)
 
+    def test_responses_streaming_preserves_final_partial_think_prefix(self) -> None:
+        self.fake_client.next_stream_chunks = ["answer <th"]
+
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "claude-4.6-sonnet",
+                "input": "echo final tail",
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('"delta": "answer "', response.text)
+        self.assertIn('"delta": "<th"', response.text)
+        self.assertIn('"output_text": "answer <th"', response.text)
+
+    def test_responses_streaming_with_tools_preserves_final_partial_tool_prefix(self) -> None:
+        self.fake_client.next_stream_chunks = ["answer <tool_call"]
+
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "claude-4.6-sonnet",
+                "input": "echo final tail",
+                "stream": True,
+                "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('"delta": "answer "', response.text)
+        self.assertIn('"delta": "<tool_call"', response.text)
+        self.assertIn('"output_text": "answer <tool_call"', response.text)
+        self.assertNotIn('"type": "function_call"', response.text)
+
     def test_responses_streaming_xml_tool_call(self) -> None:
         self.fake_client.next_stream_chunks = [
             "<tool_call>\n<name>shell</name>\n",
@@ -429,7 +595,7 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn("event: response.completed", events)
         self.assertNotIn("<tool_call>", events)
 
-    def test_responses_streaming_with_tools_preserves_plain_text_deltas(self) -> None:
+    def test_responses_streaming_with_tools_plain_text_keeps_final_text(self) -> None:
         response = self.client.post(
             "/v1/responses",
             headers={"Authorization": "Bearer test-key"},
@@ -450,8 +616,8 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn("event: response.output_text.done", events)
         self.assertIn("event: response.completed", events)
         self.assertNotIn('"type": "function_call"', events)
-        self.assertNotIn('"text": "hello"', events)
-        self.assertNotIn('"output_text": "hello"', events)
+        self.assertIn('"text": "hello"', events)
+        self.assertIn('"output_text": "hello"', events)
 
     def test_responses_streaming_with_tools_xml_tool_call_does_not_leak_raw_xml(self) -> None:
         self.fake_client.next_stream_chunks = [
@@ -480,6 +646,37 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn("event: response.completed", events)
         self.assertNotIn("<tool_call>", events)
 
+    def test_responses_streaming_with_tools_preserves_text_around_xml_tool_call(self) -> None:
+        self.fake_client.next_stream_chunks = [
+            "Need cwd. ",
+            "<tool_call>\n<name>shell</name>\n",
+            "<parameters>\n",
+            '{"command":"pwd"}',
+            "\n</parameters>\n</tool_call>",
+            " Done.",
+        ]
+
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "claude-4.6-sonnet",
+                "input": "check cwd and explain",
+                "stream": True,
+                "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        events = response.text
+        self.assertIn('"delta": "Need cwd. "', events)
+        self.assertIn('"delta": " Done."', events)
+        self.assertIn('"type": "function_call"', events)
+        self.assertIn('"name": "shell"', events)
+        self.assertIn('"text": "Need cwd.  Done."', events)
+        self.assertIn('"output_text": "Need cwd.  Done."', events)
+        self.assertNotIn("<tool_call>", events)
+
     def test_hermes_root_chat_completions_alias(self) -> None:
         response = self.client.post(
             "/chat/completions",
@@ -497,10 +694,111 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertEqual(self.fake_client.calls[0]["messages"], [{"role": "user", "content": "say hello"}])
 
     def test_hermes_probe_endpoints_do_not_404(self) -> None:
-        for path in ["/api/v1/models", "/api/tags", "/version", "/props", "/v1/props"]:
+        for path in [
+            "/models",
+            "/v1/models",
+            "/api/v1/models",
+            "/api/tags",
+            "/version",
+            "/api/version",
+            "/props",
+            "/v1/props",
+            "/api/props",
+        ]:
             with self.subTest(path=path):
                 response = self.client.get(path)
                 self.assertEqual(response.status_code, 200)
+
+    def test_require_server_key_rejects_wrong_key_on_discovery_endpoints(self) -> None:
+        # Discovery endpoints can reveal configured model aliases/capabilities.
+        # Keep them unauthenticated for local probes by default, but protect
+        # them when the operator explicitly enables the server-key gate.
+        original_flag = server.FLOWITH_REQUIRE_SERVER_KEY
+        server.FLOWITH_REQUIRE_SERVER_KEY = True
+        try:
+            for path in [
+                "/models",
+                "/v1/models",
+                "/api/v1/models",
+                "/api/tags",
+                "/version",
+                "/api/version",
+                "/props",
+                "/v1/props",
+                "/api/props",
+            ]:
+                with self.subTest(path=path, key="missing"):
+                    response = self.client.get(path)
+                    self.assertEqual(response.status_code, 401)
+                with self.subTest(path=path, key="wrong"):
+                    response = self.client.get(
+                        path,
+                        headers={"Authorization": "Bearer wrong-key"},
+                    )
+                    self.assertEqual(response.status_code, 401)
+                with self.subTest(path=path, key="correct"):
+                    response = self.client.get(
+                        path,
+                        headers={"Authorization": "Bearer test-key"},
+                    )
+                    self.assertEqual(response.status_code, 200)
+                with self.subTest(path=path, key="correct-x-api-key"):
+                    response = self.client.get(
+                        path,
+                        headers={"x-api-key": "test-key"},
+                    )
+                    self.assertEqual(response.status_code, 200)
+        finally:
+            server.FLOWITH_REQUIRE_SERVER_KEY = original_flag
+
+    def test_root_head_probe_succeeds(self) -> None:
+        response = self.client.head("/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_root_does_not_disclose_upstream_url(self) -> None:
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("upstream", response.json())
+
+    def test_request_body_over_configured_limit_returns_413(self) -> None:
+        original_limit = server.FLOWITH_MAX_REQUEST_BYTES
+        server.FLOWITH_MAX_REQUEST_BYTES = 32
+        try:
+            response = self.client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer test-key"},
+                json={
+                    "model": "claude-4.6-sonnet",
+                    "messages": [{"role": "user", "content": "x" * 64}],
+                },
+            )
+            self.assertEqual(response.status_code, 413)
+        finally:
+            server.FLOWITH_MAX_REQUEST_BYTES = original_limit
+
+    def test_request_body_without_content_length_over_limit_returns_413(self) -> None:
+        # Regression: chunked or otherwise length-less requests must not bypass
+        # the request-size guard and then be read fully by request.json().
+        original_limit = server.FLOWITH_MAX_REQUEST_BYTES
+        server.FLOWITH_MAX_REQUEST_BYTES = 32
+        try:
+            body = (
+                b'{"model":"claude-4.6-sonnet","messages":'
+                b'[{"role":"user","content":"'
+                + (b"x" * 64)
+                + b'"}]}'
+            )
+            response = self.client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer test-key",
+                    "transfer-encoding": "chunked",
+                },
+                content=iter([body]),
+            )
+            self.assertEqual(response.status_code, 413)
+        finally:
+            server.FLOWITH_MAX_REQUEST_BYTES = original_limit
 
 
 if __name__ == "__main__":

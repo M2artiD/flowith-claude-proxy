@@ -261,7 +261,7 @@ def _tool_choice_instruction(tool_choice: Any) -> str:
         return "You must call one available tool."
     elif tool_choice == "none":
         return "Do not call tools for this response."
-    return "Call a tool whenever it is needed to answer or act correctly."
+    return "Use a tool only when it is needed; if no tool is needed, answer directly."
 
 
 def _build_tool_xml_prompt(
@@ -295,11 +295,12 @@ def _build_tool_xml_prompt(
     choice_instruction = _tool_choice_instruction(tool_choice)
 
     return (
-        "# TOOL CALLING - YOU MUST USE THIS EXACT XML FORMAT\n\n"
-        "You are connected to Claude Code tools through this proxy. Native Anthropic "
-        "tool definitions are not sent to the upstream model, so tool calls must be "
-        "expressed as XML text.\n\n"
-        "To call a tool, you MUST output this EXACT XML block - nothing else works:\n\n"
+        "# Tool Use\n\n"
+        "You have access to tools through this proxy. Use a tool only when it is "
+        "needed to answer or act correctly. If the user request can be answered "
+        "directly, answer normally in plain text and do not emit XML.\n\n"
+        "When you need to call a tool, output exactly this XML block and stop "
+        "immediately after it:\n\n"
         "<tool_call>\n"
         "<name>TOOL_NAME</name>\n"
         "<parameters>\n"
@@ -307,7 +308,7 @@ def _build_tool_xml_prompt(
         "</parameters>\n"
         "</tool_call>\n\n"
         "CRITICAL RULES:\n"
-        "1. You MUST use the <tool_call> XML block above to call tools. Do NOT describe or narrate tool calls in plain text.\n"
+        "1. Use the <tool_call> XML block above when calling tools. Do NOT describe or narrate tool calls in plain text.\n"
         "2. Output ONLY ONE tool call per response.\n"
         "3. The <parameters> body MUST be one valid JSON object matching the input schema.\n"
         "4. STOP writing immediately after </tool_call> and wait for <observation>.\n"
@@ -626,9 +627,31 @@ def _rfind_outside_cdata(text: str, needle: str, start: int = 0, end: int | None
 
 def _extract_cdata_or_text(raw: str) -> str:
     stripped = raw.strip()
-    if stripped.startswith(_CDATA_START) and stripped.endswith(_CDATA_END):
-        return stripped[len(_CDATA_START):-len(_CDATA_END)]
-    return html.unescape(stripped)
+    if not stripped.startswith(_CDATA_START):
+        return html.unescape(stripped)
+    # Concatenate consecutive CDATA sections. Reverses the standard CDATA
+    # split-escape emitted on the write side (see the tool-result CDATA
+    # wrapper above), which previously left split junk inside JSON params
+    # and degraded tool inputs to {} ('Invalid tool parameters' in CC).
+    parts: list[str] = []
+    pos = 0
+    n = len(stripped)
+    while pos < n:
+        if stripped.startswith(_CDATA_START, pos):
+            end = stripped.find(_CDATA_END, pos + len(_CDATA_START))
+            if end == -1:
+                parts.append(stripped[pos + len(_CDATA_START):])
+                break
+            parts.append(stripped[pos + len(_CDATA_START):end])
+            pos = end + len(_CDATA_END)
+        else:
+            nxt = stripped.find(_CDATA_START, pos)
+            if nxt == -1:
+                parts.append(stripped[pos:])
+                break
+            parts.append(stripped[pos:nxt])
+            pos = nxt
+    return "".join(parts)
 
 
 def _coerce_param_value(raw: str) -> Any:
@@ -636,6 +659,74 @@ def _coerce_param_value(raw: str) -> Any:
         return json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         return raw
+
+
+def _repair_json_text(raw: str) -> str:
+    """Best-effort repair of near-JSON tool params.
+
+    Fixes only string-value internals (tracked via in-string state):
+    - literal newlines/tabs inside string values -> \n / \t
+    - shell-style \' escape (illegal in JSON) -> '
+    Structural whitespace is left untouched.
+    """
+    out: list[str] = []
+    in_str = False
+    escape = False
+    for ch in raw:
+        if in_str:
+            if escape:
+                # \' is not a legal JSON escape; the model leaked shell escaping.
+                if ch == "'":
+                    out[-1] = "'"  # drop the backslash we already appended
+                else:
+                    out.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escape = True
+                continue
+            if ch == '"':
+                in_str = False
+                out.append(ch)
+                continue
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                out.append("\\r")
+                continue
+            if ch == "\t":
+                out.append("\\t")
+                continue
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_str = True
+        out.append(ch)
+    return "".join(out)
+
+
+def _loads_tool_params(raw: str) -> dict[str, Any]:
+    """Parse tool-call params with lenient retry; never silently return {}.
+
+    Layers: strict json.loads -> repaired json.loads -> {"value": raw}.
+    A silent {} makes Claude Code report 'Invalid tool parameters' and show
+    an empty reply, so unparseable input is preserved instead of dropped.
+    """
+    text = raw.strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        try:
+            parsed = json.loads(_repair_json_text(text))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {"value": raw}
+    if not isinstance(parsed, dict):
+        return {"value": parsed}
+    return parsed
 
 
 def _parse_parameter_elements(body: str) -> dict[str, Any]:
@@ -703,12 +794,7 @@ def _parse_tool_call_block(raw_block: str, allow_partial: bool = False) -> dict[
         if params_close != -1:
             raw_params_body = raw_params_body[:params_close]
     raw_params = _extract_cdata_or_text(raw_params_body)
-    try:
-        parsed = json.loads(raw_params)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        parsed = {}
-    if not isinstance(parsed, dict):
-        parsed = {"value": parsed}
+    parsed = _loads_tool_params(raw_params)
 
     if not name:
         return None
@@ -758,9 +844,22 @@ def _parse_tool_call_spans(text: str) -> list[tuple[int, int, list[dict[str, Any
             break
         block_end = close_start + len(_TAG_TOOL_CALL_CLOSE)
         tool = _parse_tool_call_block(text[start:block_end])
+        # A literal close tag inside the JSON parameters (e.g. code that
+        # mentions the tag itself) makes the first close candidate cut the
+        # block mid-params, so the strict regex fails. Extend the block to
+        # subsequent close tags until it parses.
+        first_block_end = block_end
+        while tool is None:
+            next_close = _find_outside_cdata(text, _TAG_TOOL_CALL_CLOSE, block_end)
+            if next_close == -1:
+                break
+            block_end = next_close + len(_TAG_TOOL_CALL_CLOSE)
+            tool = _parse_tool_call_block(text[start:block_end])
         if tool:
             spans.append((start, block_end, [tool]))
-        pos = block_end
+            pos = block_end
+        else:
+            pos = first_block_end
     return spans
 
 

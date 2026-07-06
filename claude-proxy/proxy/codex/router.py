@@ -120,6 +120,7 @@ _SENTINEL_DONE = object()
 ReadJsonObject = Callable[[Request], Awaitable[dict[str, Any]]]
 RequireProfile = Callable[..., None]
 RequireApiKey = Callable[[str | None, str | None], str]
+RequireDiscoveryApiKey = Callable[[str | None, str | None], None]
 GetClientForKey = Callable[[str, str], tuple[FlowithClient, str | None]]
 WithXmlToolStopSequence = Callable[[list[str] | str | None], list[str]]
 
@@ -129,6 +130,7 @@ def create_router(
     require_profile: RequireProfile,
     read_json_object: ReadJsonObject,
     require_api_key: RequireApiKey,
+    require_discovery_api_key: RequireDiscoveryApiKey,
     get_client_for_key: GetClientForKey,
     with_xml_tool_stop_sequence: WithXmlToolStopSequence,
 ) -> APIRouter:
@@ -136,9 +138,14 @@ def create_router(
 
     router = APIRouter()
 
+    @router.get("/models")
     @router.get("/v1/models")
-    def list_models() -> dict[str, Any]:
+    def list_models(
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
         require_profile("codex", "openai")
+        require_discovery_api_key(x_api_key, authorization)
         from ..config import CUSTOM_MODEL_ALIASES
 
         model_ids = sorted(set(CUSTOM_MODEL_ALIASES.values()) | {DEFAULT_MODEL})
@@ -151,12 +158,19 @@ def create_router(
         }
 
     @router.get("/api/v1/models")
-    def list_api_v1_models() -> dict[str, Any]:
-        return list_models()
+    def list_api_v1_models(
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        return list_models(x_api_key, authorization)
 
     @router.get("/api/tags")
-    def list_ollama_tags() -> dict[str, Any]:
+    def list_ollama_tags(
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
         require_profile("codex", "openai")
+        require_discovery_api_key(x_api_key, authorization)
         from ..config import CUSTOM_MODEL_ALIASES
 
         model_ids = sorted(set(CUSTOM_MODEL_ALIASES.values()) | {DEFAULT_MODEL})
@@ -176,15 +190,23 @@ def create_router(
 
     @router.get("/version")
     @router.get("/api/version")
-    def version() -> dict[str, Any]:
+    def version(
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
         require_profile("codex", "openai")
+        require_discovery_api_key(x_api_key, authorization)
         return {"version": __version__}
 
     @router.get("/props")
     @router.get("/v1/props")
     @router.get("/api/props")
-    def props() -> dict[str, Any]:
+    def props(
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
         require_profile("codex", "openai")
+        require_discovery_api_key(x_api_key, authorization)
         return {
             "service": "flowith-claude-proxy",
             "version": __version__,
@@ -418,11 +440,8 @@ def _json_arguments(raw: Any) -> dict[str, Any]:
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return {}
-        return parsed if isinstance(parsed, dict) else {"value": parsed}
+        from ..adapter import _loads_tool_params
+        return _loads_tool_params(raw)
     return {}
 
 
@@ -695,6 +714,13 @@ def _drain_xml_tool_stream_buffer(
         xml_end = find_xml_tool_call_end(buffer)
         if xml_end == -1 and not final:
             break
+        if xml_end == -1 and final and ">" not in buffer:
+            # EOF while holding only a possible opening marker prefix.  Since no
+            # full tag was ever confirmed, preserve it as visible assistant text
+            # instead of treating it as malformed tool XML.
+            segments.append(("text", buffer))
+            buffer = ""
+            break
 
         xml_source = buffer if xml_end == -1 else buffer[:xml_end]
         tools = parse_xml_tool_calls(xml_source)
@@ -705,7 +731,11 @@ def _drain_xml_tool_stream_buffer(
             continue
 
         if final:
-            # A malformed tool marker should not leak back as assistant text.
+            if any(marker.startswith(buffer) for marker in _XML_STREAM_OPEN_MARKERS):
+                # This was only held to disambiguate a possible marker split at
+                # chunk boundary.  No later chunk arrived, so it is visible text.
+                segments.append(("text", buffer))
+            # Other malformed/partial tool XML should not leak back as assistant text.
             buffer = ""
             break
         break
@@ -729,6 +759,7 @@ def _chat_stream_events(
     now = int(time.time())
     q: "queue.Queue[Any]" = queue.Queue(maxsize=512)
     result_holder: dict[str, Any] = {}
+    cancel_event = threading.Event()
 
     has_tools = bool(tools)
     raw_stream_chunks = 0
@@ -739,13 +770,21 @@ def _chat_stream_events(
     think_buffer = ""
     emitted_tool_calls: list[dict[str, Any]] = []
 
+    def _safe_put(item: Any) -> None:
+        while not cancel_event.is_set():
+            try:
+                q.put(item, timeout=1)
+                return
+            except queue.Full:
+                continue
+
     def on_chunk(piece: str) -> None:
         if piece:
-            q.put(("text", piece))
+            _safe_put(("text", piece))
 
     def on_reasoning(piece: str) -> None:
         if piece:
-            q.put(("reasoning", piece))
+            _safe_put(("reasoning", piece))
 
     def worker() -> None:
         try:
@@ -762,11 +801,12 @@ def _chat_stream_events(
                 temperature=temperature,
                 top_p=top_p,
                 stop_sequences=stop_sequences,
+                cancel_event=cancel_event,
             )
         except Exception as e:
             result_holder["result"] = {"success": False, "error": str(e)}
         finally:
-            q.put(_SENTINEL_DONE)
+            _safe_put(_SENTINEL_DONE)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -881,35 +921,51 @@ def _chat_stream_events(
                 for raw_tool in payload:
                     yield from _emit_tool_call_delta(_chat_tool_call_item(raw_tool))
 
-    while True:
-        item = q.get()
-        if item is _SENTINEL_DONE:
-            break
-        if not isinstance(item, tuple) or len(item) != 2:
-            continue
-        kind, payload = item
-        if kind == "reasoning":
-            yield from _emit_reasoning_delta(str(payload))
-            continue
-        if kind != "text":
-            continue
-        raw_stream_chunks += 1
-        think_buffer += str(payload)
-        think_segments, think_buffer, think_in = _split_stream_think_segments(
-            think_buffer, think_in
-        )
-        for seg_kind, seg_text in think_segments:
-            if not seg_text:
+    try:
+        while True:
+            try:
+                item = q.get(timeout=10)
+            except queue.Empty:
+                # SSE comment heartbeat: keeps intermediaries alive and gives
+                # the generator a chance to observe client disconnect.
+                yield b": ping\n\n"
                 continue
-            if seg_kind == "reasoning":
-                yield from _emit_reasoning_delta(seg_text)
+            if item is _SENTINEL_DONE:
+                break
+            if not isinstance(item, tuple) or len(item) != 2:
                 continue
-            if has_tools:
-                xml_buffer += seg_text
-                segments, xml_buffer = _drain_xml_tool_stream_buffer(xml_buffer)
-                yield from _emit_tool_segments(segments)
+            kind, payload = item
+            if kind == "reasoning":
+                yield from _emit_reasoning_delta(str(payload))
                 continue
-            yield from _emit_text_delta(seg_text)
+            if kind != "text":
+                continue
+            raw_stream_chunks += 1
+            think_buffer += str(payload)
+            think_segments, think_buffer, think_in = _split_stream_think_segments(
+                think_buffer, think_in
+            )
+            for seg_kind, seg_text in think_segments:
+                if not seg_text:
+                    continue
+                if seg_kind == "reasoning":
+                    yield from _emit_reasoning_delta(seg_text)
+                    continue
+                if has_tools:
+                    xml_buffer += seg_text
+                    segments, xml_buffer = _drain_xml_tool_stream_buffer(xml_buffer)
+                    yield from _emit_tool_segments(segments)
+                    continue
+                yield from _emit_text_delta(seg_text)
+    finally:
+        cancel_event.set()
+
+    if think_buffer and not think_in:
+        if has_tools:
+            xml_buffer += think_buffer
+        else:
+            yield from _emit_text_delta(think_buffer)
+        think_buffer = ""
 
     result = result_holder.get("result") or {}
     _trace_hermes(
@@ -1104,14 +1160,23 @@ def _responses_stream_events(
     now = int(time.time())
     q: "queue.Queue[Any]" = queue.Queue(maxsize=512)
     result_holder: dict[str, Any] = {}
+    cancel_event = threading.Event()
+
+    def _safe_put(item: Any) -> None:
+        while not cancel_event.is_set():
+            try:
+                q.put(item, timeout=1)
+                return
+            except queue.Full:
+                continue
 
     def on_chunk(piece: str) -> None:
         if piece:
-            q.put(("text", piece))
+            _safe_put(("text", piece))
 
     def on_reasoning(piece: str) -> None:
         if piece:
-            q.put(("reasoning", piece))
+            _safe_put(("reasoning", piece))
 
     def worker() -> None:
         try:
@@ -1128,11 +1193,12 @@ def _responses_stream_events(
                 tools=None,
                 tool_choice=None,
                 stop_sequences=stop_sequences,
+                cancel_event=cancel_event,
             )
         except Exception as e:
             result_holder["result"] = {"success": False, "error": str(e)}
         finally:
-            q.put(_SENTINEL_DONE)
+            _safe_put(_SENTINEL_DONE)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -1423,35 +1489,49 @@ def _responses_stream_events(
             },
         ).encode("utf-8")
 
-    while True:
-        item = q.get()
-        if item is _SENTINEL_DONE:
-            break
-        if not isinstance(item, tuple) or len(item) != 2:
-            continue
-        kind, payload = item
-        if kind == "reasoning":
-            yield from _emit_reasoning_delta(str(payload))
-            continue
-        if kind != "text":
-            continue
-        raw_stream_chunks += 1
-        resp_think_buffer += str(payload)
-        resp_think_segments, resp_think_buffer, resp_think_in = _split_stream_think_segments(
-            resp_think_buffer, resp_think_in
-        )
-        for seg_kind, seg_text in resp_think_segments:
-            if not seg_text:
+    try:
+        while True:
+            try:
+                item = q.get(timeout=10)
+            except queue.Empty:
+                yield b": ping\n\n"
                 continue
-            if seg_kind == "reasoning":
-                yield from _emit_reasoning_delta(seg_text)
+            if item is _SENTINEL_DONE:
+                break
+            if not isinstance(item, tuple) or len(item) != 2:
                 continue
-            if has_tools:
-                xml_buffer += seg_text
-                segments, xml_buffer = _drain_xml_tool_stream_buffer(xml_buffer)
-                yield from _emit_response_segments(segments)
+            kind, payload = item
+            if kind == "reasoning":
+                yield from _emit_reasoning_delta(str(payload))
                 continue
-            yield from _emit_text_delta(seg_text)
+            if kind != "text":
+                continue
+            raw_stream_chunks += 1
+            resp_think_buffer += str(payload)
+            resp_think_segments, resp_think_buffer, resp_think_in = _split_stream_think_segments(
+                resp_think_buffer, resp_think_in
+            )
+            for seg_kind, seg_text in resp_think_segments:
+                if not seg_text:
+                    continue
+                if seg_kind == "reasoning":
+                    yield from _emit_reasoning_delta(seg_text)
+                    continue
+                if has_tools:
+                    xml_buffer += seg_text
+                    segments, xml_buffer = _drain_xml_tool_stream_buffer(xml_buffer)
+                    yield from _emit_response_segments(segments)
+                    continue
+                yield from _emit_text_delta(seg_text)
+    finally:
+        cancel_event.set()
+
+    if resp_think_buffer and not resp_think_in:
+        if has_tools:
+            xml_buffer += resp_think_buffer
+        else:
+            yield from _emit_text_delta(resp_think_buffer)
+        resp_think_buffer = ""
 
     if has_tools:
         if raw_stream_chunks == 0 and result_holder.get("result", {}).get("content"):
@@ -1515,7 +1595,7 @@ def _responses_stream_events(
     if not text_item_started and not emitted_function_calls:
         yield from _emit_text_start()
 
-    yield from _emit_text_done(final_text="" if has_tools else None)
+    yield from _emit_text_done()
 
     completed_output = [completed_items[index] for index in sorted(completed_items)]
 
@@ -1532,7 +1612,7 @@ def _responses_stream_events(
                 "status": "completed",
                 "model": requested_model,
                 "output": completed_output,
-                "output_text": "" if has_tools else output_text,
+                "output_text": output_text,
                 "usage": usage,
             },
         },

@@ -13,6 +13,9 @@ build/
 
 # 环境变量
 .env
+.flowith_api_key
+.hermes/
+Users*.claudehooks*.ps1
 
 # IDE
 .vscode/
@@ -23,6 +26,11 @@ build/
 # 日志
 *.log
 logs/
+debug_dumps/
+_probe*.ps1
+_probe*.sse
+# Pytest
+.pytest_cache/
 
 # OS
 .DS_Store

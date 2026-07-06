@@ -1,25 +1,22 @@
-version: '3.8'
+version: "3.8"
 
 services:
-  claude-proxy:
+  flowith-proxy:
     build: .
-    container_name: claude-proxy
-    ports:
-      - "8000:8000"
+    container_name: flowith-claude-proxy
+    env_file:
+      - .env
     environment:
-      - PROXY_HOST=0.0.0.0
-      - PROXY_PORT=8000
-      - UPSTREAM_API_KEY=${UPSTREAM_API_KEY}
-      - UPSTREAM_BASE_URL=${UPSTREAM_BASE_URL:-https://api.deepseek.com/v1}
-      - UPSTREAM_MODEL=${UPSTREAM_MODEL:-deepseek-chat}
-      - HTTP_PROXY=${HTTP_PROXY:-}
-      - HTTPS_PROXY=${HTTPS_PROXY:-}
-      - ENABLE_MULTI_AGENT=${ENABLE_MULTI_AGENT:-true}
-      - MAX_AGENTS=${MAX_AGENTS:-3}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      FLOWITH_API_HOST: 0.0.0.0
+      FLOWITH_API_PORT: 8787
+      FLOWITH_API_PROFILE: all
+      FLOWITH_LOCAL_ONLY: "false"
+      FLOWITH_REQUIRE_SERVER_KEY: "true"
+    ports:
+      - "127.0.0.1:8787:8787"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://127.0.0.1:8787/health').raise_for_status()"]
       interval: 30s
       timeout: 3s
       retries: 3

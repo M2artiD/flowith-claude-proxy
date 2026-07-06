@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -19,6 +20,8 @@ from urllib3.util.retry import Retry
 from .config import (
     DEBUG_DUMP,
     DEBUG_DUMP_DIR,
+    DEBUG_DUMP_MAX_BYTES,
+    DEBUG_DUMP_MAX_FILES,
     FLOWITH_CONNECT_TIMEOUT,
     FLOWITH_DISABLE_KEEPALIVE,
     FLOWITH_MAX_CONCURRENCY,
@@ -27,8 +30,103 @@ from .config import (
     FLOWITH_RETRY_JITTER,
     FLOWITH_RETRY_MAX_DELAY,
     FLOWITH_RETRY_TOTAL,
+    FLOWITH_SEMAPHORE_TIMEOUT,
     FLOWITH_SSL_RETRY_EXTRA,
 )
+
+
+_REDACTED = "[REDACTED]"
+_SECRET_FIELD_MARKERS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+)
+_SECRET_STRING_PATTERNS = (
+    (
+        re.compile(r"(?i)\b(authorization\s*:\s*bearer\s+)([^\s\"'\\,}]+)"),
+        r"\1" + _REDACTED,
+    ),
+    (
+        re.compile(r"(?i)\b(bearer\s+)([^\s\"'\\,}]+)"),
+        r"\1" + _REDACTED,
+    ),
+    (
+        re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9._-]{6,}"),
+        "sk-" + _REDACTED,
+    ),
+    (
+        re.compile(
+            r"(?i)\b(token|secret|api[_-]?key|password|passwd|credential)\s*[:=]\s*"
+            r"([^\s\"'\\,}&]+)"
+        ),
+        r"\1=" + _REDACTED,
+    ),
+)
+
+
+def _is_secret_field(key: Any) -> bool:
+    normalized = str(key).lower().replace("-", "_")
+    return any(marker.replace("-", "_") in normalized for marker in _SECRET_FIELD_MARKERS)
+
+
+def _redact_secrets(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _REDACTED if _is_secret_field(key) else _redact_secrets(nested)
+            for key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_secrets(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_secrets(item) for item in value)
+    if isinstance(value, str):
+        redacted = value
+        for pattern, replacement in _SECRET_STRING_PATTERNS:
+            redacted = pattern.sub(replacement, redacted)
+        return redacted
+    return value
+
+
+
+
+def _truncate_debug_value(value: Any) -> Any:
+    if DEBUG_DUMP_MAX_BYTES <= 0:
+        return value
+    if isinstance(value, str):
+        encoded = value.encode("utf-8")
+        if len(encoded) <= DEBUG_DUMP_MAX_BYTES:
+            return value
+        kept = encoded[:DEBUG_DUMP_MAX_BYTES].decode("utf-8", errors="ignore")
+        omitted = len(encoded) - DEBUG_DUMP_MAX_BYTES
+        return f"{kept}... [truncated {omitted} bytes]"
+    if isinstance(value, dict):
+        return {key: _truncate_debug_value(nested) for key, nested in value.items()}
+    if isinstance(value, list):
+        return [_truncate_debug_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_truncate_debug_value(item) for item in value)
+    return value
+
+
+def _prune_debug_dumps(dump_dir: Path) -> None:
+    if DEBUG_DUMP_MAX_FILES <= 0:
+        return
+    dump_files = sorted(
+        dump_dir.glob("flowith_*.json"),
+        key=lambda p: (p.stat().st_mtime_ns, p.name),
+    )
+    for stale in dump_files[:-DEBUG_DUMP_MAX_FILES]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
 
 
 def _dump_intercept(
@@ -51,17 +149,18 @@ def _dump_intercept(
         "request": {
             "method": "POST",
             "url": os.environ.get("FLOWITH_BASE_URL", "https://edge.flowith.io/external/use/llm"),
-            "payload": payload,
+            "payload": _truncate_debug_value(_redact_secrets(payload)),
         },
         "response": {
             "status": response_status,
-            "headers": response_headers,
-            "body": response_body,
+            "headers": _truncate_debug_value(_redact_secrets(dict(response_headers))),
+            "body": _truncate_debug_value(_redact_secrets(response_body)),
         },
         "upstream_model": upstream_model,
     }
     with open(dump_path, "w", encoding="utf-8") as f:
         json.dump(dump, f, ensure_ascii=False, indent=2)
+    _prune_debug_dumps(dump_dir)
     print(f"[intercept] Dumped upstream {stream_label} call -> {dump_path}", flush=True)
 
 
@@ -91,6 +190,14 @@ def _retry_delay(attempt: int) -> float:
 def _request_timeout(read_timeout: int | float) -> tuple[float, int | float]:
     connect_timeout = max(1.0, min(float(FLOWITH_CONNECT_TIMEOUT), float(read_timeout)))
     return (connect_timeout, read_timeout)
+
+
+def _stream_result_delivered_any(result: dict[str, Any]) -> bool:
+    return bool(
+        result.get("content")
+        or result.get("reasoning_content")
+        or result.get("tool_calls")
+    )
 
 
 def _pick_reasoning_field(obj: dict[str, Any]) -> str:
@@ -265,6 +372,7 @@ class FlowithClient:
         temperature: float | None = None,
         top_p: float | None = None,
         stop_sequences: list[str] | str | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         use_model = model or self.model
         last_error: Exception | None = None
@@ -272,6 +380,33 @@ class FlowithClient:
         base_attempts = max(1, max_retries, FLOWITH_RETRY_TOTAL)
         attempt = 0
         ssl_extra_used = 0
+        delivered_any = {"v": False}
+
+        if stream:
+            _orig_on_chunk = on_chunk
+            _orig_on_reasoning = on_reasoning
+            _orig_on_tool_call = on_tool_call
+
+            def _wrap_chunk(text: str) -> None:
+                if text:
+                    delivered_any["v"] = True
+                if _orig_on_chunk is not None:
+                    _orig_on_chunk(text)
+
+            def _wrap_reasoning(text: str) -> None:
+                if text:
+                    delivered_any["v"] = True
+                if _orig_on_reasoning is not None:
+                    _orig_on_reasoning(text)
+
+            def _wrap_tool_call(tc: dict[str, Any]) -> None:
+                delivered_any["v"] = True
+                if _orig_on_tool_call is not None:
+                    _orig_on_tool_call(tc)
+
+            on_chunk = _wrap_chunk
+            on_reasoning = _wrap_reasoning
+            on_tool_call = _wrap_tool_call
 
         while attempt < base_attempts + ssl_extra_used:
             attempt += 1
@@ -279,8 +414,10 @@ class FlowithClient:
             retryable_ssl_error = False
             try:
                 if _UPSTREAM_SEMAPHORE is not None:
-                    _UPSTREAM_SEMAPHORE.acquire()
-                    acquired = True
+                    acquired = _UPSTREAM_SEMAPHORE.acquire(timeout=FLOWITH_SEMAPHORE_TIMEOUT)
+                    if not acquired:
+                        last_error = Exception("Upstream concurrency limit reached; timed out waiting for an available slot")
+                        break
 
                 start = time.time()
                 use_thinking = thinking if thinking is not None else self.thinking
@@ -323,47 +460,55 @@ class FlowithClient:
                         is_stream=stream,
                         upstream_model=None,
                     )
-                    last_error = Exception(
-                        f"HTTP {response.status_code}: {response.text[:300]}"
-                    )
+                    last_error = Exception(f"HTTP {response.status_code}: upstream returned an error response")
                     if response.status_code in {429, 500, 502, 503, 504}:
                         self._reset_session()
+                    else:
+                        break
                 else:
                     if stream:
-                        return self._parse_stream(
+                        result = self._parse_stream(
                             response, elapsed_ms, payload,
                             on_chunk, on_reasoning, on_tool_call,
+                            cancel_event=cancel_event,
+                        )
+                        if result.get("success") and _stream_result_delivered_any(result):
+                            return result
+                        if result.get("error"):
+                            last_error = Exception(str(result["error"]))
+                        else:
+                            last_error = Exception("Upstream stream ended without content")
+                        self._reset_session()
+                    else:
+                        resp_body = response.text
+                        result = response.json()
+                        upstream_model = result.get("model")
+
+                        _dump_intercept(
+                            payload=payload,
+                            response_status=response.status_code,
+                            response_headers=dict(response.headers),
+                            response_body=resp_body,
+                            is_stream=False,
+                            upstream_model=upstream_model,
                         )
 
-                    resp_body = response.text
-                    result = response.json()
-                    upstream_model = result.get("model")
-
-                    _dump_intercept(
-                        payload=payload,
-                        response_status=response.status_code,
-                        response_headers=dict(response.headers),
-                        response_body=resp_body,
-                        is_stream=False,
-                        upstream_model=upstream_model,
-                    )
-
-                    if result.get("choices"):
-                        msg = result["choices"][0]["message"]
-                        tool_calls = msg.get("tool_calls")
-                        content_val, thinking_from_blocks = _extract_content_and_thinking(msg.get("content"))
-                        reasoning_text = _pick_reasoning_field(msg) or thinking_from_blocks
-                        return {
-                            "success": True,
-                            "content": content_val,
-                            "time_ms": elapsed_ms,
-                            "usage": result.get("usage", {}) or {},
-                            "reasoning_content": reasoning_text,
-                            "tool_calls": tool_calls,
-                            "finish_reason": result["choices"][0].get("finish_reason"),
-                            "upstream_model": upstream_model,
-                        }
-                    last_error = Exception("Upstream response has no choices")
+                        if result.get("choices"):
+                            msg = result["choices"][0]["message"]
+                            tool_calls = msg.get("tool_calls")
+                            content_val, thinking_from_blocks = _extract_content_and_thinking(msg.get("content"))
+                            reasoning_text = _pick_reasoning_field(msg) or thinking_from_blocks
+                            return {
+                                "success": True,
+                                "content": content_val,
+                                "time_ms": elapsed_ms,
+                                "usage": result.get("usage", {}) or {},
+                                "reasoning_content": reasoning_text,
+                                "tool_calls": tool_calls,
+                                "finish_reason": result["choices"][0].get("finish_reason"),
+                                "upstream_model": upstream_model,
+                            }
+                        last_error = Exception("Upstream response has no choices")
 
             except requests.exceptions.Timeout:
                 self._reset_session()
@@ -396,6 +541,11 @@ class FlowithClient:
             ):
                 ssl_extra_used += 1
 
+            if stream and delivered_any["v"]:
+                # Bytes already sent to the client; re-issuing the upstream call
+                # would produce a duplicated response stream.
+                break
+
             if attempt < base_attempts + ssl_extra_used:
                 time.sleep(_retry_delay(attempt))
 
@@ -409,6 +559,7 @@ class FlowithClient:
         on_chunk: Callable[[str], None] | None,
         on_reasoning: Callable[[str], None] | None,
         on_tool_call: Callable[[dict[str, Any]], None] | None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -416,82 +567,140 @@ class FlowithClient:
         tool_call_accum: dict[int, dict[str, Any]] = {}
         finish_reason: str | None = None
         upstream_model: str | None = None
-        raw_lines: list[str] = []
+        debug_body_parts: list[str] = []
+        debug_body_bytes = 0
+        debug_body_omitted_bytes = 0
+        stream_error: str | None = None
 
-        for raw_line in response.iter_lines(decode_unicode=True):
-            if not raw_line:
-                continue
-            line = raw_line.strip()
-            raw_lines.append(line)
+        def _append_debug_body_line(line: str) -> None:
+            nonlocal debug_body_bytes, debug_body_omitted_bytes
+            if not DEBUG_DUMP:
+                return
 
-            if line.startswith("data:"):
-                line = line[5:].strip()
-            if line == "[DONE]":
-                break
-            try:
-                chunk = json.loads(line)
-            except Exception:
-                continue
+            piece = line if not debug_body_parts else "\n" + line
+            encoded = piece.encode("utf-8")
+            if DEBUG_DUMP_MAX_BYTES <= 0:
+                debug_body_parts.append(piece)
+                debug_body_bytes += len(encoded)
+                return
 
-            if "error" in chunk and not chunk.get("choices"):
-                err_info = chunk["error"]
-                err_msg = err_info.get("message", str(err_info)) if isinstance(err_info, dict) else str(err_info)
-                if finish_reason is None:
-                    finish_reason = f"error: {err_msg}"
-                continue
+            remaining = DEBUG_DUMP_MAX_BYTES - debug_body_bytes
+            if remaining <= 0:
+                debug_body_omitted_bytes += len(encoded)
+                return
 
-            if "model" in chunk and not upstream_model:
-                upstream_model = chunk["model"]
-            if "usage" in chunk:
-                usage = chunk.get("usage", {}) or usage
+            kept_bytes = encoded[:remaining]
+            kept = kept_bytes.decode("utf-8", errors="ignore")
+            if kept:
+                debug_body_parts.append(kept)
+                debug_body_bytes += len(kept.encode("utf-8"))
+            debug_body_omitted_bytes += len(encoded) - len(kept_bytes)
 
-            for choice in chunk.get("choices", []) or []:
-                delta = choice.get("delta", {}) or {}
-                fr = choice.get("finish_reason")
-                if fr:
-                    finish_reason = fr
+        def _debug_response_body() -> str:
+            body = "".join(debug_body_parts)
+            if debug_body_omitted_bytes > 0:
+                body += f"... [truncated {debug_body_omitted_bytes} bytes]"
+            return body
 
-                piece_raw = delta.get("content")
-                piece_text, piece_thinking = _extract_content_and_thinking(piece_raw)
-                if piece_text:
-                    content_parts.append(piece_text)
-                    if on_chunk:
-                        on_chunk(piece_text)
-                if piece_thinking:
-                    reasoning_parts.append(piece_thinking)
-                    if on_reasoning:
-                        on_reasoning(piece_thinking)
+        def _close_response() -> None:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
 
-                reasoning = _pick_reasoning_field(delta)
-                if reasoning:
-                    reasoning_parts.append(reasoning)
-                    if on_reasoning:
-                        on_reasoning(reasoning)
+        cancel_watcher: threading.Thread | None = None
+        if cancel_event is not None:
+            def _watch_cancel() -> None:
+                cancel_event.wait()
+                if cancel_event.is_set():
+                    _close_response()
 
-                tc_deltas = delta.get("tool_calls")
-                if tc_deltas:
-                    for tc in tc_deltas:
-                        idx = tc.get("index", 0)
-                        if idx not in tool_call_accum:
-                            tool_call_accum[idx] = {
-                                "id": tc.get("id", ""),
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            }
-                        entry = tool_call_accum[idx]
-                        if tc.get("id"):
-                            entry["id"] = tc["id"]
-                        func_delta = tc.get("function", {})
-                        if func_delta.get("name"):
-                            entry["function"]["name"] = func_delta["name"]
-                        if func_delta.get("arguments"):
-                            entry["function"]["arguments"] += func_delta["arguments"]
+            cancel_watcher = threading.Thread(target=_watch_cancel, daemon=True)
+            cancel_watcher.start()
+
+        try:
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if cancel_event is not None and cancel_event.is_set():
+                    stream_error = "Upstream stream cancelled"
+                    break
+                if not raw_line:
+                    continue
+                line = raw_line.strip()
+                _append_debug_body_line(line)
+
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if line == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(line)
+                except Exception:
+                    continue
+
+                if "error" in chunk and not chunk.get("choices"):
+                    err_info = chunk["error"]
+                    err_msg = err_info.get("message", str(err_info)) if isinstance(err_info, dict) else str(err_info)
+                    stream_error = err_msg
+                    if finish_reason is None:
+                        finish_reason = f"error: {err_msg}"
+                    break
+
+                if "model" in chunk and not upstream_model:
+                    upstream_model = chunk["model"]
+                if "usage" in chunk:
+                    usage = chunk.get("usage", {}) or usage
+
+                for choice in chunk.get("choices", []) or []:
+                    delta = choice.get("delta", {}) or {}
+                    fr = choice.get("finish_reason")
+                    if fr:
+                        finish_reason = fr
+
+                    piece_raw = delta.get("content")
+                    piece_text, piece_thinking = _extract_content_and_thinking(piece_raw)
+                    if piece_text:
+                        content_parts.append(piece_text)
+                        if on_chunk:
+                            on_chunk(piece_text)
+                    if piece_thinking:
+                        reasoning_parts.append(piece_thinking)
+                        if on_reasoning:
+                            on_reasoning(piece_thinking)
+
+                    reasoning = _pick_reasoning_field(delta)
+                    if reasoning:
+                        reasoning_parts.append(reasoning)
+                        if on_reasoning:
+                            on_reasoning(reasoning)
+
+                    tc_deltas = delta.get("tool_calls")
+                    if tc_deltas:
+                        for tc in tc_deltas:
+                            idx = tc.get("index", 0)
+                            if idx not in tool_call_accum:
+                                tool_call_accum[idx] = {
+                                    "id": tc.get("id", ""),
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                }
+                            entry = tool_call_accum[idx]
+                            if tc.get("id"):
+                                entry["id"] = tc["id"]
+                            func_delta = tc.get("function", {})
+                            if func_delta.get("name"):
+                                entry["function"]["name"] = func_delta["name"]
+                            if func_delta.get("arguments"):
+                                entry["function"]["arguments"] += func_delta["arguments"]
+        finally:
+            _close_response()
+            if cancel_event is not None and cancel_event.is_set():
+                if stream_error is None:
+                    stream_error = "Upstream stream cancelled"
 
         _dump_intercept(
             payload=payload,
             response_status=response.status_code,
             response_headers=dict(response.headers),
-            response_body="\n".join(raw_lines),
+            response_body=_debug_response_body(),
             is_stream=True,
             upstream_model=upstream_model,
         )
@@ -502,6 +711,19 @@ class FlowithClient:
             if on_tool_call:
                 for tc in tool_calls:
                     on_tool_call(tc)
+
+        if stream_error:
+            return {
+                "success": False,
+                "error": stream_error,
+                "content": "".join(content_parts),
+                "time_ms": elapsed_ms,
+                "usage": usage,
+                "reasoning_content": "".join(reasoning_parts),
+                "tool_calls": tool_calls,
+                "finish_reason": finish_reason,
+                "upstream_model": upstream_model,
+            }
 
         return {
             "success": True,

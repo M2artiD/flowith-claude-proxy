@@ -1,24 +1,25 @@
 FROM python:3.11-slim
 
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONUTF8=1 \
+    PYTHONIOENCODING=utf-8 \
+    FLOWITH_API_HOST=0.0.0.0 \
+    FLOWITH_API_PORT=8787
+
 WORKDIR /app
 
-# 安装依赖
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 复制代码
 COPY proxy/ ./proxy/
 
-# 环境变量
-ENV PROXY_HOST=0.0.0.0
-ENV PROXY_PORT=8000
+RUN adduser --disabled-password --gecos "" --home /home/proxy proxy \
+    && chown -R proxy:proxy /app
+USER proxy
 
-# 暴露端口
-EXPOSE 8000
+EXPOSE 8787
 
-# 健康检查
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import httpx; httpx.get('http://localhost:8000/health')"
+    CMD python -c "import httpx; httpx.get('http://127.0.0.1:8787/health').raise_for_status()"
 
-# 启动服务
 CMD ["python", "-m", "proxy"]

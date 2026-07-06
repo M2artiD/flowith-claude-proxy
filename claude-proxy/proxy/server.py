@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import hmac
 import json
+import ipaddress
 import os
 import queue
 import threading
 import time
+from pathlib import Path
 from typing import Any, Generator
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import __version__
@@ -42,9 +45,22 @@ from .adapter import (
 from .codex import create_router as create_codex_router
 from .config import (
     API_TIMEOUT,
+    CUSTOM_MODEL_ALIASES,
+    DEBUG_DUMP,
+    DEBUG_DUMP_DIR,
+    DEBUG_DUMP_MAX_BYTES,
+    DEBUG_DUMP_MAX_FILES,
+    DEFAULT_HOST,
     DEFAULT_MODEL,
+    DEFAULT_PORT,
     FLOWITH_BASE_URL,
+    FLOWITH_CONNECT_TIMEOUT,
+    FLOWITH_LOCAL_ONLY,
+    FLOWITH_MAX_CONCURRENCY,
+    FLOWITH_MAX_REQUEST_BYTES,
+    FLOWITH_REQUEST_LOG,
     FLOWITH_REQUIRE_SERVER_KEY,
+    FLOWITH_SEMAPHORE_TIMEOUT,
     FLOWITH_SSL_VERIFY,
     FLOWITH_TOOL_MODE,
     UPSTREAM_PROXIES,
@@ -59,7 +75,96 @@ app = FastAPI(
 
 _SERVER_API_KEY = load_api_key()
 
+if FLOWITH_REQUIRE_SERVER_KEY and not _SERVER_API_KEY:
+    raise RuntimeError(
+        "FLOWITH_REQUIRE_SERVER_KEY=true but no server API key is configured. "
+        "Set FLOWITH_API_KEY (or write it to .flowith_api_key) before starting the proxy, "
+        "or disable FLOWITH_REQUIRE_SERVER_KEY."
+    )
+
+if not FLOWITH_LOCAL_ONLY and not FLOWITH_REQUIRE_SERVER_KEY:
+    raise RuntimeError(
+        "Unsafe proxy configuration: FLOWITH_LOCAL_ONLY=false requires "
+        "FLOWITH_REQUIRE_SERVER_KEY=true. Refusing to start an unauthenticated "
+        "network-accessible upstream relay."
+    )
+
 _default_client: FlowithClient | None = None
+
+
+def _keys_equal(a: str | None, b: str | None) -> bool:
+    """Constant-time comparison; treats a missing side as a mismatch."""
+    if not a or not b:
+        return False
+    return hmac.compare_digest(a, b)
+
+
+def _is_local_client_host(host: str | None) -> bool:
+    if not host:
+        return False
+    normalized = host.strip().strip("[]").lower()
+    if normalized in {"localhost", "testclient"}:
+        return True
+    try:
+        ip = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    if ip.is_loopback:
+        return True
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return bool(mapped and mapped.is_loopback)
+
+
+def _request_too_large_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=413,
+        content={
+            "error": {
+                "type": "request_too_large",
+                "message": "Request body exceeds FLOWITH_MAX_REQUEST_BYTES.",
+            }
+        },
+    )
+
+
+async def _request_body_exceeds_limit(request: Request, limit: int) -> bool:
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            length = int(content_length)
+        except ValueError:
+            length = -1
+        if length > limit:
+            return True
+
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > limit:
+            return True
+
+    request._body = bytes(body)  # Starlette cache for downstream request.json().
+    return False
+
+
+@app.middleware("http")
+async def _local_only_middleware(request: Request, call_next: Any) -> Any:
+    if FLOWITH_MAX_REQUEST_BYTES > 0:
+        if await _request_body_exceeds_limit(request, FLOWITH_MAX_REQUEST_BYTES):
+            return _request_too_large_response()
+    if FLOWITH_LOCAL_ONLY:
+        client_host = request.client.host if request.client else None
+        if not _is_local_client_host(client_host):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "type": "forbidden",
+                        "message": "FLOWITH_LOCAL_ONLY is enabled; only localhost clients are allowed.",
+                    }
+                },
+            )
+    return await call_next(request)
 
 
 def _api_profile() -> str:
@@ -95,11 +200,20 @@ def _resolve_api_key(
         return x_api_key.strip()
     if authorization and authorization.lower().startswith("bearer "):
         return authorization.split(" ", 1)[1].strip()
+    # No client-provided key. In server-key-required mode we must NOT silently
+    # fall back to the server key here; otherwise the require-server-key gate
+    # below (which compares api_key against _SERVER_API_KEY) would always pass
+    # for anonymous callers. Only expose the server key implicitly when the
+    # gate is off, which preserves the legacy "trusted local caller" behaviour.
+    if FLOWITH_REQUIRE_SERVER_KEY:
+        return None
+    if not FLOWITH_LOCAL_ONLY:
+        return None
     return _SERVER_API_KEY
 
 
 def _get_client_for_key(api_key: str, flowith_model: str) -> tuple[FlowithClient, str | None]:
-    if api_key == _SERVER_API_KEY:
+    if _keys_equal(api_key, _SERVER_API_KEY):
         return _get_default_client(), flowith_model
     return (
         FlowithClient(
@@ -132,7 +246,7 @@ def _require_api_key(x_api_key: str | None, authorization: str | None) -> str:
             detail="Missing API key. Send x-api-key or Authorization: Bearer <key>, or set FLOWITH_API_KEY on the server.",
         )
     if FLOWITH_REQUIRE_SERVER_KEY:
-        if not _SERVER_API_KEY or api_key != _SERVER_API_KEY:
+        if not _keys_equal(api_key, _SERVER_API_KEY):
             raise HTTPException(
                 status_code=401,
                 detail="Invalid API key.",
@@ -140,12 +254,235 @@ def _require_api_key(x_api_key: str | None, authorization: str | None) -> str:
     return api_key
 
 
+def _require_discovery_api_key(x_api_key: str | None, authorization: str | None) -> None:
+    if FLOWITH_REQUIRE_SERVER_KEY:
+        _require_api_key(x_api_key, authorization)
+
+
+_DASHBOARD_ROUTE_GROUPS = {
+    "anthropic": [
+        "POST /v1/messages",
+    ],
+    "openai": [
+        "POST /v1/chat/completions",
+        "POST /v1/responses",
+        "GET /v1/models",
+        "GET /models",
+    ],
+    "diagnostics": [
+        "HEAD /",
+        "GET /",
+        "GET /health",
+        "GET /dashboard",
+        "GET /dashboard/api/status",
+        "GET /dashboard/api/config",
+        "GET /dashboard/api/routes",
+        "GET /dashboard/api/debug-dumps",
+    ],
+}
+
+
+def _dashboard_routes_flat() -> list[str]:
+    routes: list[str] = []
+    for group_routes in _DASHBOARD_ROUTE_GROUPS.values():
+        routes.extend(group_routes)
+    return routes
+
+
+def _mask_secret(value: str | None) -> str | None:
+    if not value:
+        return None
+    if len(value) <= 8:
+        return "****"
+    return f"{value[:4]}****{value[-4:]}"
+
+
+def _available_model_ids() -> list[str]:
+    return sorted(set(CUSTOM_MODEL_ALIASES.values()) | {DEFAULT_MODEL})
+
+
+def _dashboard_auth(x_api_key: str | None, authorization: str | None) -> None:
+    if FLOWITH_REQUIRE_SERVER_KEY:
+        _require_api_key(x_api_key, authorization)
+
+
+def _debug_dump_files(limit: int = 50) -> list[dict[str, Any]]:
+    dump_dir = Path(DEBUG_DUMP_DIR)
+    if not dump_dir.exists() or not dump_dir.is_dir():
+        return []
+    files: list[tuple[Path, Any]] = []
+    for candidate in dump_dir.glob("flowith_*.json"):
+        try:
+            if not candidate.is_file():
+                continue
+            stat = candidate.stat()
+        except OSError:
+            continue
+        files.append((candidate, stat))
+    files.sort(key=lambda item: (item[1].st_mtime_ns, item[0].name), reverse=True)
+
+    result: list[dict[str, Any]] = []
+    for path, stat in files[:limit]:
+        result.append(
+            {
+                "name": path.name,
+                "size_bytes": stat.st_size,
+                "modified": stat.st_mtime,
+            }
+        )
+    return result
+
+
+def _debug_dump_count() -> int:
+    dump_dir = Path(DEBUG_DUMP_DIR)
+    if not dump_dir.exists() or not dump_dir.is_dir():
+        return 0
+    count = 0
+    for candidate in dump_dir.glob("flowith_*.json"):
+        try:
+            if candidate.is_file():
+                count += 1
+        except OSError:
+            continue
+    return count
+
+
+def _dashboard_status_payload() -> dict[str, Any]:
+    model_ids = _available_model_ids()
+    return {
+        "service": "flowith-claude-proxy",
+        "version": __version__,
+        "health": {"ok": True},
+        "bind": {"host": DEFAULT_HOST, "port": DEFAULT_PORT},
+        "upstream": {
+            "base_url": FLOWITH_BASE_URL,
+            "timeout_seconds": API_TIMEOUT,
+            "connect_timeout_seconds": FLOWITH_CONNECT_TIMEOUT,
+            "ssl_verify": FLOWITH_SSL_VERIFY,
+            "proxy_configured": bool(UPSTREAM_PROXIES),
+        },
+        "security": {
+            "local_only": FLOWITH_LOCAL_ONLY,
+            "require_server_key": FLOWITH_REQUIRE_SERVER_KEY,
+            "server_key_configured": bool(_SERVER_API_KEY),
+        },
+        "limits": {
+            "max_request_bytes": FLOWITH_MAX_REQUEST_BYTES,
+            "max_concurrency": FLOWITH_MAX_CONCURRENCY,
+            "semaphore_timeout_seconds": FLOWITH_SEMAPHORE_TIMEOUT,
+        },
+        "debug_dumps": {
+            "enabled": DEBUG_DUMP,
+            "dir": DEBUG_DUMP_DIR,
+            "max_bytes": DEBUG_DUMP_MAX_BYTES,
+            "max_files": DEBUG_DUMP_MAX_FILES,
+            "count": _debug_dump_count(),
+        },
+        "models": {
+            "default": DEFAULT_MODEL,
+            "available": model_ids,
+            "count": len(model_ids),
+        },
+        "routes": _dashboard_routes_flat(),
+    }
+
+
+def _dashboard_config_payload() -> dict[str, Any]:
+    return {
+        "FLOWITH_API_KEY": _mask_secret(_SERVER_API_KEY),
+        "FLOWITH_BASE_URL": FLOWITH_BASE_URL,
+        "FLOWITH_DEFAULT_MODEL": DEFAULT_MODEL,
+        "FLOWITH_API_HOST": DEFAULT_HOST,
+        "FLOWITH_API_PORT": DEFAULT_PORT,
+        "FLOWITH_LOCAL_ONLY": FLOWITH_LOCAL_ONLY,
+        "FLOWITH_REQUIRE_SERVER_KEY": FLOWITH_REQUIRE_SERVER_KEY,
+        "FLOWITH_MAX_REQUEST_BYTES": FLOWITH_MAX_REQUEST_BYTES,
+        "FLOWITH_MAX_CONCURRENCY": FLOWITH_MAX_CONCURRENCY,
+        "FLOWITH_SEMAPHORE_TIMEOUT": FLOWITH_SEMAPHORE_TIMEOUT,
+        "FLOWITH_TIMEOUT": API_TIMEOUT,
+        "FLOWITH_CONNECT_TIMEOUT": FLOWITH_CONNECT_TIMEOUT,
+        "FLOWITH_SSL_VERIFY": FLOWITH_SSL_VERIFY,
+        "FLOWITH_TOOL_MODE": FLOWITH_TOOL_MODE,
+        "FLOWITH_REQUEST_LOG": FLOWITH_REQUEST_LOG,
+        "FLOWITH_UPSTREAM_PROXY_CONFIGURED": bool(UPSTREAM_PROXIES),
+        "DEBUG_DUMP": DEBUG_DUMP,
+        "DEBUG_DUMP_DIR": DEBUG_DUMP_DIR,
+        "DEBUG_DUMP_MAX_BYTES": DEBUG_DUMP_MAX_BYTES,
+        "DEBUG_DUMP_MAX_FILES": DEBUG_DUMP_MAX_FILES,
+        "CUSTOM_MODEL_ALIASES": dict(CUSTOM_MODEL_ALIASES),
+    }
+
+
+_DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flowith Claude Proxy Console</title>
+  <style>
+    :root { color-scheme: light dark; font-family: Inter, Segoe UI, Arial, sans-serif; }
+    body { margin: 0; padding: 32px; background: #0f172a; color: #e2e8f0; }
+    main { max-width: 1100px; margin: 0 auto; }
+    h1 { margin: 0 0 8px; font-size: 32px; }
+    p { color: #94a3b8; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin: 24px 0; }
+    .card { background: #111827; border: 1px solid #334155; border-radius: 14px; padding: 18px; box-shadow: 0 8px 30px #0003; }
+    .label { color: #94a3b8; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; }
+    .value { font-size: 24px; margin-top: 6px; }
+    pre { overflow: auto; white-space: pre-wrap; background: #020617; border-radius: 12px; padding: 16px; border: 1px solid #1e293b; }
+    a { color: #7dd3fc; }
+    button { background: #2563eb; color: white; border: 0; border-radius: 10px; padding: 10px 14px; cursor: pointer; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Flowith Claude Proxy Console</h1>
+  <p>Read-only local dashboard for runtime status, safe configuration, route inventory, and debug dump metadata.</p>
+  <div class="grid">
+    <section class="card"><div class="label">Status</div><div class="value" id="status">Loading?</div></section>
+    <section class="card"><div class="label">Bind</div><div class="value" id="bind">?</div></section>
+    <section class="card"><div class="label">Local Only</div><div class="value" id="local">?</div></section>
+    <section class="card"><div class="label">Models</div><div class="value" id="models">?</div></section>
+  </div>
+  <p>
+    API endpoints:
+    <a href="/dashboard/api/status">/dashboard/api/status</a>,
+    <a href="/dashboard/api/config">/dashboard/api/config</a>,
+    <a href="/dashboard/api/routes">/dashboard/api/routes</a>,
+    <a href="/dashboard/api/debug-dumps">/dashboard/api/debug-dumps</a>
+  </p>
+  <button id="refresh">Refresh</button>
+  <h2>Status JSON</h2>
+  <pre id="json">Loading?</pre>
+</main>
+<script>
+async function loadStatus() {
+  const res = await fetch('/dashboard/api/status');
+  const data = await res.json();
+  document.getElementById('status').textContent = data.health && data.health.ok ? 'Running' : 'Issue';
+  document.getElementById('bind').textContent = `${data.bind.host}:${data.bind.port}`;
+  document.getElementById('local').textContent = String(data.security.local_only);
+  document.getElementById('models').textContent = String(data.models.count);
+  document.getElementById('json').textContent = JSON.stringify(data, null, 2);
+}
+document.getElementById('refresh').addEventListener('click', loadStatus);
+loadStatus().catch(err => { document.getElementById('json').textContent = String(err); });
+</script>
+</body>
+</html>
+"""
+
+
+@app.head("/")
+def root_head() -> Response:
+    return Response(status_code=200)
+
+
 @app.get("/")
 def root() -> dict[str, Any]:
     return {
         "service": "flowith-claude-proxy",
         "version": __version__,
-        "upstream": FLOWITH_BASE_URL,
         "endpoints": [
             "POST /v1/messages",
             "POST /v1/chat/completions",
@@ -160,10 +497,63 @@ def health() -> dict[str, Any]:
     return {"ok": True}
 
 
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard(
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    authorization: str | None = Header(default=None),
+) -> HTMLResponse:
+    _dashboard_auth(x_api_key, authorization)
+    return HTMLResponse(_DASHBOARD_HTML)
+
+
+@app.get("/dashboard/api/status")
+def dashboard_status(
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _dashboard_auth(x_api_key, authorization)
+    return _dashboard_status_payload()
+
+
+@app.get("/dashboard/api/config")
+def dashboard_config(
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _dashboard_auth(x_api_key, authorization)
+    return _dashboard_config_payload()
+
+
+@app.get("/dashboard/api/routes")
+def dashboard_routes(
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, list[str]]:
+    _dashboard_auth(x_api_key, authorization)
+    return {group: list(routes) for group, routes in _DASHBOARD_ROUTE_GROUPS.items()}
+
+
+@app.get("/dashboard/api/debug-dumps")
+def dashboard_debug_dumps(
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _dashboard_auth(x_api_key, authorization)
+    return {
+        "enabled": DEBUG_DUMP,
+        "dir": DEBUG_DUMP_DIR,
+        "max_bytes": DEBUG_DUMP_MAX_BYTES,
+        "max_files": DEBUG_DUMP_MAX_FILES,
+        "count": _debug_dump_count(),
+        "files": _debug_dump_files(limit=50),
+    }
+
+
 app.include_router(create_codex_router(
     require_profile=_require_profile,
     read_json_object=_read_json_object,
     require_api_key=_require_api_key,
+    require_discovery_api_key=_require_discovery_api_key,
     get_client_for_key=_get_client_for_key,
     with_xml_tool_stop_sequence=lambda stop_sequences: _with_xml_tool_stop_sequence(stop_sequences),
 ))
@@ -184,12 +574,16 @@ async def create_message(
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Request body must be a JSON object")
 
-    # ===== REQUEST LOG =====
     requested_model = body.get("model", "?")
-    tool_count = len(body.get("tools") or [])
-    sys_len = len(str(body.get("system") or ""))
-    msg_count = len(body.get("messages") or [])
-    print(f"[REQ] model={requested_model}  tools={tool_count}  system_len={sys_len}  msgs={msg_count}  stream={body.get('stream')}", flush=True)
+    if FLOWITH_REQUEST_LOG:
+        tool_count = len(body.get("tools") or [])
+        sys_len = len(str(body.get("system") or ""))
+        msg_count = len(body.get("messages") or [])
+        print(
+            f"[REQ] model={requested_model}  tools={tool_count}  "
+            f"system_len={sys_len}  msgs={msg_count}  stream={body.get('stream')}",
+            flush=True,
+        )
 
     api_key = _require_api_key(x_api_key, authorization)
 
@@ -204,7 +598,7 @@ async def create_message(
         thinking_budget_tokens = raw_thinking.get("budget_tokens")
 
     raw_tools = body.get("tools") or []
-    # Never pass native OpenAI tools to Flowith — the upstream model may
+    # Never pass native OpenAI tools to Flowith; the upstream model may
     # either reject them (claude-fable-5) or get confused by the dual
     # native+XML instruction.  Tool guidance is injected exclusively via
     # the system-prompt XML block in claude_request_to_flowith_messages().
@@ -226,7 +620,7 @@ async def create_message(
     if not messages or all(m["role"] == "system" for m in messages):
         raise HTTPException(status_code=400, detail="At least one user/assistant message is required")
 
-    if api_key == _SERVER_API_KEY:
+    if _keys_equal(api_key, _SERVER_API_KEY):
         client = _get_default_client()
     else:
         client = FlowithClient(
@@ -273,10 +667,22 @@ async def create_message(
                     },
                 },
             )
+        if _looks_like_hook_json_request(body, messages):
+            result = _normalise_hook_json_result(result)
         return JSONResponse(content=flowith_result_to_claude_response(result, requested_model))
 
-    return StreamingResponse(
-        _stream_claude_events(
+    if _looks_like_hook_json_request(body, messages):
+        event_stream = _stream_hook_json_events(
+            client, messages, requested_model, flowith_model,
+            enable_thinking=enable_thinking,
+            thinking_budget_tokens=thinking_budget_tokens,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop_sequences=stop_sequences,
+        )
+    else:
+        event_stream = _stream_claude_events(
             client, messages, requested_model, flowith_model,
             enable_thinking=enable_thinking,
             has_tools=has_tools,
@@ -287,7 +693,10 @@ async def create_message(
             temperature=temperature,
             top_p=top_p,
             stop_sequences=stop_sequences,
-        ),
+        )
+
+    return StreamingResponse(
+        event_stream,
         media_type="text/event-stream; charset=utf-8",
         headers={
             "Cache-Control": "no-cache, no-transform",
@@ -300,6 +709,200 @@ async def create_message(
 _SENTINEL_DONE = object()
 _THINK_OPEN_TAG = "<think>"
 _THINK_CLOSE_TAG = "</think>"
+
+
+def _looks_like_hook_json_request(body: dict[str, Any], messages: list[dict[str, Any]]) -> bool:
+    """Detect strict Claude Code hook-validation requests without catching normal goal chat."""
+    if body.get("tools"):
+        return False
+
+    chunks: list[str] = []
+    for field in ("system", "metadata"):
+        value = body.get(field)
+        if value:
+            chunks.append(str(value))
+
+    last_message = messages[-1] if messages else {}
+    last_content = str(last_message.get("content", "") or "")
+    joined = "\n".join(chunks + [last_content]).lower()
+
+    has_json_keys = '"ok"' in joined and '"reason"' in joined
+    has_json_contract = any(marker in joined for marker in (
+        "json object",
+        "valid json",
+        "must return json",
+        "respond with json",
+        "response must be json",
+        "output json",
+        "strict json",
+    ))
+    has_explicit_hook_context = any(marker in joined for marker in (
+        "stop hook",
+        "subagentstop",
+        "hook event",
+        "hook result",
+        "session-scoped stop hook",
+        "claude code hook",
+        "stop-condition hook",
+        "stop condition hook",
+    ))
+
+    return has_json_keys and has_json_contract and has_explicit_hook_context
+
+
+def _extract_first_json_object(text: str) -> dict[str, Any] | None:
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for pos in range(start, len(text)):
+            ch = text[pos]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:pos + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        break
+                    return parsed if isinstance(parsed, dict) else None
+        start = text.find("{", start + 1)
+    return None
+
+
+def _normalise_hook_json_result(result: dict[str, Any]) -> dict[str, Any]:
+    content = str(result.get("content", "") or "").strip()
+    if not content:
+        normalised = dict(result)
+        normalised["content"] = json.dumps(
+            {"ok": False, "reason": "Upstream returned empty content for the hook JSON check."},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return normalised
+
+    parsed = _extract_first_json_object(content)
+    if isinstance(parsed, dict) and isinstance(parsed.get("ok"), bool):
+        ok = bool(parsed["ok"])
+        reason = str(parsed.get("reason", "") or content).strip()
+    else:
+        lowered = content.lower()
+        negative_markers = (
+            "not met",
+            "not satisfied",
+            "incomplete",
+            "continue",
+            "keep working",
+            "missing",
+            "blocked",
+            "cannot",
+            "can't",
+            "failed",
+            '"ok": false',
+            '"ok":false',
+        )
+        positive_markers = (
+            "completed",
+            "done",
+            "satisfied",
+            "success",
+            "passed",
+            "ready",
+            '"ok": true',
+            '"ok":true',
+        )
+
+        if any(marker in lowered for marker in negative_markers):
+            ok = False
+        elif any(marker in lowered for marker in positive_markers):
+            ok = True
+        else:
+            ok = False
+
+        reason = content
+
+    normalised = dict(result)
+    normalised["content"] = json.dumps(
+        {"ok": ok, "reason": reason},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return normalised
+
+
+def _stream_hook_json_events(
+    client: FlowithClient,
+    messages: list[dict[str, Any]],
+    requested_model: str,
+    upstream_model: str | None = None,
+    enable_thinking: bool = False,
+    thinking_budget_tokens: int | None = None,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    stop_sequences: list[str] | str | None = None,
+) -> Generator[bytes, None, None]:
+    message_id = new_message_id()
+    yield sse_message_start(message_id, requested_model, input_tokens=0).encode("utf-8")
+    yield sse_ping().encode("utf-8")
+
+    try:
+        result = client.call_api(
+            messages,
+            model=upstream_model,
+            max_retries=2,
+            stream=False,
+            tools=None,
+            tool_choice=None,
+            thinking=enable_thinking,
+            thinking_budget_tokens=thinking_budget_tokens,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop_sequences=stop_sequences,
+        )
+    except Exception as e:
+        result = {"success": False, "error": str(e)}
+
+    if not result.get("success"):
+        err_msg = str(result.get("error", "upstream error"))
+        yield sse_content_block_start(0, block_type="text").encode("utf-8")
+        yield sse_content_block_delta(
+            json.dumps(
+                {"ok": False, "reason": f"Hook JSON check failed: {err_msg}"},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            0,
+        ).encode("utf-8")
+        yield sse_content_block_stop(0).encode("utf-8")
+        yield sse_message_delta(output_tokens=0, stop_reason="end_turn").encode("utf-8")
+        yield sse_message_stop().encode("utf-8")
+        return
+
+    normalised = _normalise_hook_json_result(result)
+    text = str(normalised.get("content", "") or "")
+    usage = normalised.get("usage", {}) or {}
+    output_tokens = int(usage.get("completion_tokens", 0) or 0)
+
+    yield sse_content_block_start(0, block_type="text").encode("utf-8")
+    yield sse_content_block_delta(text, 0).encode("utf-8")
+    yield sse_content_block_stop(0).encode("utf-8")
+    yield sse_message_delta(output_tokens=output_tokens, stop_reason="end_turn").encode("utf-8")
+    yield sse_message_stop().encode("utf-8")
 
 
 def _filter_stream_think_tags(raw: str, in_think: bool) -> tuple[str, str, bool]:
@@ -348,8 +951,11 @@ def _with_xml_tool_stop_sequence(
     else:
         sequences = list(stop_sequences)
 
-    if REACT_TOOL_STOP_SEQUENCE not in sequences:
-        sequences.append(REACT_TOOL_STOP_SEQUENCE)
+    # Do not inject </tool_call> as an upstream stop sequence. Some upstream
+    # providers match stop strings against the full prompt/transcript, so a
+    # previous assistant tool call in conversation history can terminate the
+    # next response before any new tokens are produced. Streaming/non-streaming
+    # parsers already tolerate both complete and stop-truncated tool XML.
     return sequences
 
 
@@ -411,15 +1017,13 @@ def _stream_claude_events(
                 temperature=temperature,
                 top_p=top_p,
                 stop_sequences=stop_sequences,
+                cancel_event=cancel_event,
             )
             result_holder["result"] = res
         except Exception as e:
             result_holder["result"] = {"success": False, "error": str(e)}
         finally:
-            try:
-                q.put(_SENTINEL_DONE, timeout=1)
-            except queue.Full:
-                pass
+            _safe_put(_SENTINEL_DONE)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -583,6 +1187,17 @@ def _stream_claude_events(
                 yield sse_ping().encode("utf-8")
                 last_ping = time.time()
 
+        if think_tail and not in_think_text:
+            if not has_tools:
+                if current_block_type != "text":
+                    yield from _close_block()
+                    yield from _open_block("text")
+                streamed_any = True
+                yield sse_content_block_delta(think_tail, current_block_index).encode("utf-8")
+            else:
+                text_buffer += think_tail
+            think_tail = ""
+
         if text_buffer:
             if xml_parsing:
                 text_buffer = yield from _parse_and_emit_tools(text_buffer)
@@ -595,6 +1210,14 @@ def _stream_claude_events(
         res = result_holder.get("result") or {}
         if not res.get("success"):
             err_msg = str(res.get("error", "upstream error"))
+            if "Upstream stream ended without content" in err_msg and not streamed_any:
+                # Empty upstream SSE after retries is a transient provider quirk.
+                # Do not surface it as an Anthropic API error because Claude Code
+                # treats stream error events as hard failures; finish the turn
+                # cleanly instead.
+                yield sse_message_delta(output_tokens=0, stop_reason="end_turn").encode("utf-8")
+                yield sse_message_stop().encode("utf-8")
+                return
             if not streamed_any:
                 yield sse_content_block_start(0, block_type="text").encode("utf-8")
                 yield sse_content_block_delta(f"[upstream error] {err_msg}", 0).encode("utf-8")

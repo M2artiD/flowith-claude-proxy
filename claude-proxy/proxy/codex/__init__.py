@@ -1,4 +1,4 @@
-﻿"""Codex/OpenAI compatibility package."""
+"""Codex/OpenAI compatibility package."""
 
 from .router import create_router
 

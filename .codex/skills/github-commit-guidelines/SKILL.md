@@ -1,85 +1,68 @@
 ---
 name: github-commit-guidelines
-description: [TODO: Complete and informative explanation of what the skill does and when to use it. Include WHEN to use this skill - specific scenarios, file types, or tasks that trigger it.]
+description: Apply project-safe GitHub commit and PR preparation discipline. Use before staging, committing, amending, creating PRs, responding to code review with commits, or when a user asks to commit/push/open a PR; also use when a repo has many dirty files or generated artifacts and Codex must avoid staging unrelated user changes.
 ---
 
 # Github Commit Guidelines
 
-## Overview
+Use this skill to keep commits small, reviewable, verified, and free of unrelated user work.
 
-[TODO: 1-2 sentences explaining what this skill enables]
+## Preflight
 
-## Structuring This Skill
+1. Inspect `git status --short` from the repo root.
+2. Inspect relevant unstaged and staged diffs before staging or committing.
+3. Identify which files belong to the requested change and which are unrelated existing user changes.
+4. Do not stage unrelated dirty files, temporary debug scripts, logs, backups, secrets, or generated artifacts unless the user explicitly requests them.
+5. If the requested commit would mix unrelated concerns, split it or ask before combining.
 
-[TODO: Choose the structure that best fits this skill's purpose. Common patterns:
+## Verification Gate
 
-**1. Workflow-Based** (best for sequential processes)
-- Works well when there are clear step-by-step procedures
-- Example: DOCX skill with "Workflow Decision Tree" -> "Reading" -> "Creating" -> "Editing"
-- Structure: ## Overview -> ## Workflow Decision Tree -> ## Step 1 -> ## Step 2...
+Before committing or saying work is ready:
 
-**2. Task-Based** (best for tool collections)
-- Works well when the skill offers different operations/capabilities
-- Example: PDF skill with "Quick Start" -> "Merge PDFs" -> "Split PDFs" -> "Extract Text"
-- Structure: ## Overview -> ## Quick Start -> ## Task Category 1 -> ## Task Category 2...
+- Run the narrowest relevant tests, lint, build, smoke test, or file inspection that proves the change.
+- If checks fail, stop and report the failure unless the user explicitly asks to commit known-failing work.
+- If checks cannot be run, state exactly what was not verified and why.
+- Never claim tests pass from old output or memory.
 
-**3. Reference/Guidelines** (best for standards or specifications)
-- Works well for brand guidelines, coding standards, or requirements
-- Example: Brand styling with "Brand Guidelines" -> "Colors" -> "Typography" -> "Features"
-- Structure: ## Overview -> ## Guidelines -> ## Specifications -> ## Usage...
+## Secret and Artifact Safety
 
-**4. Capabilities-Based** (best for integrated systems)
-- Works well when the skill provides multiple interrelated features
-- Example: Product Management with "Core Capabilities" -> numbered capability list
-- Structure: ## Overview -> ## Core Capabilities -> ### 1. Feature -> ### 2. Feature...
+Before staging:
 
-Patterns can be mixed and matched as needed. Most skills combine patterns (e.g., start with task-based, add workflow for complex operations).
+- Search staged diff for tokens, API keys, passwords, private keys, cookies, `.env` values, and provider credentials.
+- Exclude `.env`, local caches, logs, screenshots with secrets, ad-hoc replay dumps, and temporary one-off scripts unless intentionally part of the change.
+- If a secret appears in a diff, do not commit it; warn the user and recommend rotation if it was exposed.
 
-Delete this entire "Structuring This Skill" section when done - it's just guidance.]
+## Commit Message
 
-## [TODO: Replace with the first main section based on chosen structure]
+Write concise imperative subjects.
 
-[TODO: Add content here. See examples in existing skills:
-- Code samples for technical skills
-- Decision trees for complex workflows
-- Concrete examples with realistic user requests
-- References to scripts/templates/references as needed]
+Prefer the repository's existing style. If no stronger convention exists, use Conventional Commits for code changes:
 
-## Resources (optional)
+- `fix: ...` for bug fixes
+- `feat: ...` for user-visible features
+- `test: ...` for tests only
+- `docs: ...` for documentation only
+- `chore: ...` for maintenance
 
-Create only the resource directories this skill actually needs. Delete this section if no resources are required.
+Use a body when the reason, risk, migration, rollback, or verification is not obvious.
 
-### scripts/
-Executable code (Python/Bash/etc.) that can be run directly to perform specific operations.
+## Stop Conditions
 
-**Examples from other skills:**
-- PDF skill: `fill_fillable_fields.py`, `extract_form_field_info.py` - utilities for PDF manipulation
-- DOCX skill: `document.py`, `utilities.py` - Python modules for document processing
+Do not commit when:
 
-**Appropriate for:** Python scripts, shell scripts, or any executable code that performs automation, data processing, or specific operations.
+- the staged diff contains unrelated user changes;
+- verification fails unexpectedly;
+- a secret-like value is present;
+- the repo state is ambiguous and committing would risk losing or misattributing work;
+- the user requested review only, not a commit.
 
-**Note:** Scripts may be executed without loading into context, but can still be read by Codex for patching or environment adjustments.
+## Reporting
 
-### references/
-Documentation and reference material intended to be loaded into context to inform Codex's process and thinking.
+After a successful commit, report:
 
-**Examples from other skills:**
-- Product management: `communication.md`, `context_building.md` - detailed workflow guides
-- BigQuery: API reference documentation and query examples
-- Finance: Schema documentation, company policies
+- commit hash and subject;
+- files or change groups included;
+- verification command(s) and result;
+- known uncommitted unrelated files, if any.
 
-**Appropriate for:** In-depth documentation, API references, database schemas, comprehensive guides, or any detailed information that Codex should reference while working.
-
-### assets/
-Files not intended to be loaded into context, but rather used within the output Codex produces.
-
-**Examples from other skills:**
-- Brand styling: PowerPoint template files (.pptx), logo files
-- Frontend builder: HTML/React boilerplate project directories
-- Typography: Font files (.ttf, .woff2)
-
-**Appropriate for:** Templates, boilerplate code, document templates, images, icons, fonts, or any files meant to be copied or used in the final output.
-
----
-
-**Not every skill requires all three types of resources.**
+Emit Codex git directives only after the corresponding git action succeeds.

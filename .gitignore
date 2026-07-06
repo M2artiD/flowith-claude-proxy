@@ -11,8 +11,14 @@ ENV/
 dist/
 build/
 
-# 环境变量
+# Environment and secrets
 .env
+.flowith_api_key
+claude-proxy/.flowith_api_key
+.hermes/
+claude-proxy/.hermes/
+Users*.claudehooks*.ps1
+claude-proxy/Users*.claudehooks*.ps1
 
 # IDE
 .vscode/
@@ -20,9 +26,15 @@ build/
 *.swp
 *.swo
 
-# 日志
+# Logs and debug dumps
 *.log
 logs/
+debug_dumps/
+claude-proxy/debug_dumps/
+_probe*.ps1
+_probe*.sse
+claude-proxy/_probe*.ps1
+claude-proxy/_probe*.sse
 
 # OS
 .DS_Store
@@ -31,7 +43,10 @@ Thumbs.db
 # Pytest
 .pytest_cache/
 
-# 旧项目遗留
+# Local reference checkout
+uniref/
+
+# Legacy project leftovers
 output_*.py
 output_*.txt
 output_*.json

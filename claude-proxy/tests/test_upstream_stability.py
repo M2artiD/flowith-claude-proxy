@@ -1,4 +1,8 @@
-﻿import unittest
+import json
+import threading
+import tempfile
+import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import requests
@@ -18,6 +22,49 @@ class FakeResponse:
             "choices": [{"message": {"content": "pong"}, "finish_reason": "stop"}],
             "usage": {},
         }
+
+
+class FakeHTTPErrorResponse:
+    headers = {}
+
+    def __init__(self, status_code, text="upstream error"):
+        self.status_code = status_code
+        self.text = text
+
+    def json(self):
+        raise AssertionError("HTTP error responses should not be parsed as success JSON")
+
+
+class FakeStreamResponse:
+    status_code = 200
+    headers = {}
+    text = ""
+
+    def __init__(self, lines):
+        self.lines = lines
+        self.closed = False
+
+    def iter_lines(self, decode_unicode=False):
+        for line in self.lines:
+            yield line
+
+    def close(self):
+        self.closed = True
+
+
+class BlockingStreamResponse(FakeStreamResponse):
+    def __init__(self, lines):
+        super().__init__(lines)
+        self.close_event = threading.Event()
+
+    def iter_lines(self, decode_unicode=False):
+        for line in self.lines:
+            yield line
+        self.close_event.wait(timeout=5)
+
+    def close(self):
+        self.closed = True
+        self.close_event.set()
 
 
 class FakeSession:
@@ -100,46 +147,11 @@ class UpstreamStabilityTests(unittest.TestCase):
         self.assertEqual(len(sessions), 3)
         self.assertEqual(sleep_mock.call_count, 2)
 
-    def test_request_uses_fast_connect_timeout_and_long_read_timeout(self):
-        outcomes = [FakeResponse()]
-        sessions = []
-
-        def make_session():
-            session = FakeSession(outcomes)
-            sessions.append(session)
-            return session
-
-        with (
-            patch.object(requests, "Session", side_effect=make_session),
-            patch("proxy.upstream.FLOWITH_CONNECT_TIMEOUT", 30),
-        ):
-            client = FlowithClient(
-                api_key="test-key",
-                model="claude-test",
-                base_url="https://edge.flowith.io/external/use/llm",
-                timeout=300,
-                ssl_verify=True,
-            )
-            result = client.call_api([{"role": "user", "content": "ping"}], max_retries=1)
-
-        self.assertTrue(result["success"])
-        self.assertEqual(sessions[0].calls[0][1]["timeout"], (30, 300))
-
-    def test_retry_delay_is_capped_for_efficient_reconnects(self):
-        with (
-            patch("proxy.upstream.FLOWITH_RETRY_BACKOFF", 10),
-            patch("proxy.upstream.FLOWITH_RETRY_JITTER", 0),
-            patch("proxy.upstream.FLOWITH_RETRY_MAX_DELAY", 8),
-        ):
-            from proxy.upstream import _retry_delay
-
-            self.assertEqual(_retry_delay(4), 8)
-
-    def test_call_api_uses_configured_retry_floor_even_when_caller_asks_once(self):
+    def test_nonretryable_http_4xx_fails_without_retry_delay(self):
         outcomes = [
-            ConnectTimeout("connect timed out"),
-            ConnectTimeout("connect timed out again"),
-            FakeResponse(),
+            FakeHTTPErrorResponse(401, "invalid api key"),
+            FakeHTTPErrorResponse(401, "invalid api key"),
+            FakeHTTPErrorResponse(401, "invalid api key"),
         ]
         sessions = []
 
@@ -154,18 +166,18 @@ class UpstreamStabilityTests(unittest.TestCase):
             patch("proxy.upstream.time.sleep") as sleep_mock,
         ):
             client = FlowithClient(
-                api_key="test-key",
+                api_key="bad-key",
                 model="claude-test",
                 base_url="https://edge.flowith.io/external/use/llm",
                 ssl_verify=True,
             )
             result = client.call_api([{"role": "user", "content": "ping"}], max_retries=1)
 
-        self.assertTrue(result["success"])
-        self.assertEqual(result["content"], "pong")
-        self.assertEqual(len(sessions), 3)
-        self.assertEqual(sleep_mock.call_count, 2)
-
+        self.assertFalse(result["success"])
+        self.assertIn("HTTP 401", result["error"])
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(len(sessions[0].calls), 1)
+        sleep_mock.assert_not_called()
     def test_request_uses_fast_connect_timeout_and_long_read_timeout(self):
         outcomes = [FakeResponse()]
         sessions = []
@@ -200,6 +212,177 @@ class UpstreamStabilityTests(unittest.TestCase):
             from proxy.upstream import _retry_delay
 
             self.assertEqual(_retry_delay(4), 8)
+
+    def test_debug_dump_redacts_secret_shaped_payload_and_response_headers(self):
+        from proxy.upstream import _dump_intercept
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("proxy.upstream.DEBUG_DUMP", True),
+            patch("proxy.upstream.DEBUG_DUMP_DIR", tmpdir),
+        ):
+            _dump_intercept(
+                payload={
+                    "api_key": "payload-secret",
+                    "messages": [{"role": "user", "content": "keep prompt visible"}],
+                    "nested": {"Authorization": "Bearer nested-secret"},
+                },
+                response_status=200,
+                response_headers={
+                    "Authorization": "Bearer response-secret",
+                    "Set-Cookie": "session=response-secret",
+                    "Content-Type": "application/json",
+                },
+                response_body='{"ok": true}',
+                is_stream=False,
+                upstream_model="claude-test",
+            )
+
+            dump_files = list(Path(tmpdir).glob("flowith_nonstream_*.json"))
+            self.assertEqual(len(dump_files), 1)
+            dump = json.loads(dump_files[0].read_text(encoding="utf-8"))
+
+        dumped_text = json.dumps(dump, ensure_ascii=False)
+        self.assertNotIn("payload-secret", dumped_text)
+        self.assertNotIn("nested-secret", dumped_text)
+        self.assertNotIn("response-secret", dumped_text)
+        self.assertEqual(dump["request"]["payload"]["api_key"], "[REDACTED]")
+        self.assertEqual(dump["request"]["payload"]["nested"]["Authorization"], "[REDACTED]")
+        self.assertEqual(dump["response"]["headers"]["Authorization"], "[REDACTED]")
+        self.assertEqual(dump["response"]["headers"]["Set-Cookie"], "[REDACTED]")
+        self.assertEqual(dump["response"]["headers"]["Content-Type"], "application/json")
+        self.assertEqual(dump["request"]["payload"]["messages"][0]["content"], "keep prompt visible")
+
+    def test_debug_dump_redacts_secret_shaped_strings_inside_prompt_and_response_body(self):
+        from proxy.upstream import _dump_intercept
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("proxy.upstream.DEBUG_DUMP", True),
+            patch("proxy.upstream.DEBUG_DUMP_DIR", tmpdir),
+        ):
+            _dump_intercept(
+                payload={
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "debug this Authorization: Bearer prompt-secret-token "
+                                "and sk-live-1234567890abcdef"
+                            ),
+                        }
+                    ],
+                    "metadata": "token=metadata-secret",
+                },
+                response_status=200,
+                response_headers={"Content-Type": "application/json"},
+                response_body='{"content":"secret=response-secret and Bearer body-secret-token"}',
+                is_stream=False,
+                upstream_model="claude-test",
+            )
+
+            dump_files = list(Path(tmpdir).glob("flowith_nonstream_*.json"))
+            self.assertEqual(len(dump_files), 1)
+            dumped_text = dump_files[0].read_text(encoding="utf-8")
+
+        self.assertNotIn("prompt-secret-token", dumped_text)
+        self.assertNotIn("sk-live-1234567890abcdef", dumped_text)
+        self.assertNotIn("metadata-secret", dumped_text)
+        self.assertNotIn("response-secret", dumped_text)
+        self.assertNotIn("body-secret-token", dumped_text)
+        self.assertIn("Authorization: Bearer [REDACTED]", dumped_text)
+        self.assertIn("sk-[REDACTED]", dumped_text)
+        self.assertIn("token=[REDACTED]", dumped_text)
+        self.assertIn("secret=[REDACTED]", dumped_text)
+
+    def test_debug_dump_truncates_large_bodies_and_prunes_old_files(self):
+        from proxy.upstream import _dump_intercept
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("proxy.upstream.DEBUG_DUMP", True),
+            patch("proxy.upstream.DEBUG_DUMP_DIR", tmpdir),
+            patch("proxy.upstream.DEBUG_DUMP_MAX_BYTES", 32),
+            patch("proxy.upstream.DEBUG_DUMP_MAX_FILES", 2),
+        ):
+            old_a = Path(tmpdir) / "flowith_nonstream_20000101_000000_000001.json"
+            old_b = Path(tmpdir) / "flowith_nonstream_20000101_000000_000002.json"
+            old_a.write_text("{}", encoding="utf-8")
+            old_b.write_text("{}", encoding="utf-8")
+
+            _dump_intercept(
+                payload={"messages": [{"role": "user", "content": "x" * 100}]},
+                response_status=200,
+                response_headers={"Content-Type": "application/json"},
+                response_body="y" * 100,
+                is_stream=False,
+                upstream_model="claude-test",
+            )
+
+            dump_files = sorted(Path(tmpdir).glob("flowith_*.json"))
+            self.assertEqual(len(dump_files), 2)
+            self.assertNotIn(old_a, dump_files)
+            newest = dump_files[-1]
+            dump = json.loads(newest.read_text(encoding="utf-8"))
+
+        self.assertLessEqual(len(dump["response"]["body"]), 80)
+        self.assertIn("[truncated", dump["response"]["body"])
+        self.assertLessEqual(len(dump["request"]["payload"]["messages"][0]["content"]), 80)
+        self.assertIn("[truncated", dump["request"]["payload"]["messages"][0]["content"])
+
+    def test_http_error_response_does_not_expose_upstream_body_details(self):
+        outcomes = [
+            FakeHTTPErrorResponse(
+                401,
+                "invalid key for internal host db.internal.example with token secret-token",
+            ),
+        ]
+
+        with (
+            patch.object(requests, "Session", return_value=FakeSession(outcomes)),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 1),
+            patch("proxy.upstream.FLOWITH_SSL_RETRY_EXTRA", 0),
+            patch("proxy.upstream.time.sleep"),
+        ):
+            client = FlowithClient(
+                api_key="bad-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api([{"role": "user", "content": "ping"}], max_retries=1)
+
+        self.assertFalse(result["success"])
+        self.assertIn("HTTP 401", result["error"])
+        self.assertNotIn("db.internal", result["error"])
+        self.assertNotIn("secret-token", result["error"])
+
+    def test_upstream_semaphore_acquire_timeout_returns_failure(self):
+        class NeverAcquireSemaphore:
+            def acquire(self, timeout=None):
+                self.timeout = timeout
+                return False
+
+            def release(self):
+                raise AssertionError("release should not be called if acquire failed")
+
+        semaphore = NeverAcquireSemaphore()
+
+        with (
+            patch("proxy.upstream._UPSTREAM_SEMAPHORE", semaphore),
+            patch("proxy.upstream.FLOWITH_SEMAPHORE_TIMEOUT", 0.01),
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api([{"role": "user", "content": "ping"}], max_retries=1)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(semaphore.timeout, 0.01)
+        self.assertIn("concurrency limit", result["error"])
 
 
     def test_concurrent_calls_use_isolated_sessions(self):
@@ -350,6 +533,229 @@ class UpstreamStabilityTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIn("Upstream SSL error", result["error"])
         self.assertNotIn("FLOWITH_SSL_VERIFY=false", result["error"])
+
+
+    def test_streaming_empty_stop_response_is_retried_before_returning_success(self):
+        empty_stream = FakeStreamResponse([
+            'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ])
+        good_stream = FakeStreamResponse([
+            'data: {"choices":[{"index":0,"delta":{"content":"pong"},"finish_reason":null}]}',
+            'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ])
+        outcomes = [empty_stream, good_stream]
+        sessions = []
+        chunks = []
+
+        def make_session():
+            session = FakeSession(outcomes)
+            sessions.append(session)
+            return session
+
+        with (
+            patch.object(requests, "Session", side_effect=make_session),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 2),
+            patch("proxy.upstream.time.sleep") as sleep_mock,
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api(
+                [{"role": "user", "content": "ping"}],
+                stream=True,
+                on_chunk=chunks.append,
+                max_retries=1,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["content"], "pong")
+        self.assertEqual(chunks, ["pong"])
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual(sleep_mock.call_count, 1)
+
+
+    def test_streaming_error_chunk_returns_failure_not_success(self):
+        error_stream = FakeStreamResponse([
+            'data: {"error":{"message":"provider overloaded"}}',
+            "data: [DONE]",
+        ])
+        sessions = []
+
+        def make_session():
+            session = FakeSession([error_stream])
+            sessions.append(session)
+            return session
+
+        with (
+            patch.object(requests, "Session", side_effect=make_session),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 1),
+            patch("proxy.upstream.FLOWITH_SSL_RETRY_EXTRA", 0),
+            patch("proxy.upstream.time.sleep"),
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api(
+                [{"role": "user", "content": "ping"}],
+                stream=True,
+                max_retries=1,
+            )
+
+        self.assertFalse(result["success"])
+        self.assertIn("provider overloaded", result["error"])
+
+    def test_streaming_debug_body_is_not_accumulated_when_debug_dump_is_disabled(self):
+        stream = FakeStreamResponse([
+            'data: {"choices":[{"delta":{"content":"pong"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ])
+        captured = {}
+
+        def capture_dump(**kwargs):
+            captured.update(kwargs)
+
+        with (
+            patch.object(requests, "Session", return_value=FakeSession([stream])),
+            patch("proxy.upstream.DEBUG_DUMP", False),
+            patch("proxy.upstream._dump_intercept", side_effect=capture_dump),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 1),
+            patch("proxy.upstream.FLOWITH_SSL_RETRY_EXTRA", 0),
+            patch("proxy.upstream.time.sleep"),
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api([{"role": "user", "content": "ping"}], stream=True)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["content"], "pong")
+        self.assertEqual(captured["response_body"], "")
+
+    def test_streaming_debug_body_is_bounded_before_dumping(self):
+        long_piece = "x" * 200
+        stream = FakeStreamResponse([
+            f'data: {{"choices":[{{"delta":{{"content":"{long_piece}"}},'
+            f'"finish_reason":null}}]}}',
+            "data: [DONE]",
+        ])
+        captured = {}
+
+        def capture_dump(**kwargs):
+            captured.update(kwargs)
+
+        with (
+            patch.object(requests, "Session", return_value=FakeSession([stream])),
+            patch("proxy.upstream.DEBUG_DUMP", True),
+            patch("proxy.upstream.DEBUG_DUMP_MAX_BYTES", 32),
+            patch("proxy.upstream._dump_intercept", side_effect=capture_dump),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 1),
+            patch("proxy.upstream.FLOWITH_SSL_RETRY_EXTRA", 0),
+            patch("proxy.upstream.time.sleep"),
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api([{"role": "user", "content": "ping"}], stream=True)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["content"], long_piece)
+        self.assertLessEqual(len(captured["response_body"].encode("utf-8")), 96)
+        self.assertIn("[truncated", captured["response_body"])
+
+    def test_streaming_success_closes_upstream_response(self):
+        stream = FakeStreamResponse([
+            'data: {"choices":[{"index":0,"delta":{"content":"pong"},"finish_reason":null}]}',
+            'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ])
+        chunks = []
+
+        with (
+            patch.object(requests, "Session", return_value=FakeSession([stream])),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 1),
+            patch("proxy.upstream.FLOWITH_SSL_RETRY_EXTRA", 0),
+            patch("proxy.upstream.time.sleep"),
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api(
+                [{"role": "user", "content": "ping"}],
+                stream=True,
+                on_chunk=chunks.append,
+                max_retries=1,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["content"], "pong")
+        self.assertEqual(chunks, ["pong"])
+        self.assertTrue(stream.closed)
+    def test_streaming_cancel_event_closes_upstream_response(self):
+        stream = BlockingStreamResponse([
+            'data: {"choices":[{"index":0,"delta":{"content":"pong"},"finish_reason":null}]}',
+        ])
+        sessions = []
+        cancel_event = threading.Event()
+        chunk_event = threading.Event()
+        chunks = []
+        result_holder = {}
+
+        def make_session():
+            session = FakeSession([stream])
+            sessions.append(session)
+            return session
+
+        with (
+            patch.object(requests, "Session", side_effect=make_session),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 1),
+            patch("proxy.upstream.FLOWITH_SSL_RETRY_EXTRA", 0),
+            patch("proxy.upstream.time.sleep"),
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+
+            def call_stream():
+                result_holder["result"] = client.call_api(
+                    [{"role": "user", "content": "ping"}],
+                    stream=True,
+                    on_chunk=lambda chunk: (chunks.append(chunk), chunk_event.set()),
+                    max_retries=1,
+                    cancel_event=cancel_event,
+                )
+
+            thread = threading.Thread(target=call_stream)
+            thread.start()
+            self.assertTrue(chunk_event.wait(timeout=2))
+            self.assertEqual(chunks, ["pong"])
+            cancel_event.set()
+            thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(stream.closed)
+        self.assertFalse(result_holder["result"]["success"])
+        self.assertIn("cancelled", result_holder["result"]["error"])
 
 
 if __name__ == "__main__":
