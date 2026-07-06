@@ -63,7 +63,7 @@ class ToolBridgeTests(unittest.TestCase):
             "/v1/messages",
             headers={"x-api-key": "test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "max_tokens": 16,
                 "messages": [{"role": "user", "content": "hello"}],
             },
@@ -86,7 +86,7 @@ class ToolBridgeTests(unittest.TestCase):
                 "/v1/messages",
                 headers={"x-api-key": "test-key"},
                 json={
-                    "model": "claude-4.6-sonnet",
+                    "model": "claude-5-sonnet",
                     "max_tokens": 16,
                     "messages": [{"role": "user", "content": "hello"}],
                 },

@@ -34,14 +34,14 @@ Do not use the old `http://127.0.0.1:8000` address.
    | Name | `Flowith Claude Proxy` |
    | API Key | your Flowith API key |
    | Base URL | `http://127.0.0.1:8787` |
-   | Model | `claude-4.6-sonnet` |
+   | Model | `claude-5-sonnet` |
 
 4. Enable the provider and restart Claude Code if needed.
 
 Deep link example:
 
 ```text
-ccswitch://provider/import?name=Flowith%20Claude%20Proxy&apiKey=your-flowith-api-key&baseUrl=http://127.0.0.1:8787&model=claude-4.6-sonnet
+ccswitch://provider/import?name=Flowith%20Claude%20Proxy&apiKey=your-flowith-api-key&baseUrl=http://127.0.0.1:8787&model=claude-5-sonnet
 ```
 
 Note: `GET /v1/models` is disabled on `8787` by design. Use `8788/v1` for OpenAI-compatible model listing.
@@ -67,12 +67,12 @@ Note: `GET /v1/models` is disabled on `8787` by design. Use `8788/v1` for OpenAI
    | Name | `Flowith Codex Proxy` |
    | API Key | your Flowith API key |
    | Base URL | `http://127.0.0.1:8788/v1` |
-   | Model | `claude-4.6-sonnet` |
+   | Model | `claude-5-sonnet` |
 
 Deep link example:
 
 ```text
-ccswitch://provider/import?name=Flowith%20Codex%20Proxy&apiKey=your-flowith-api-key&baseUrl=http://127.0.0.1:8788/v1&model=claude-4.6-sonnet
+ccswitch://provider/import?name=Flowith%20Codex%20Proxy&apiKey=your-flowith-api-key&baseUrl=http://127.0.0.1:8788/v1&model=claude-5-sonnet
 ```
 
 ## Troubleshooting
@@ -92,7 +92,7 @@ This is expected. `8787` runs the Claude profile and only exposes Claude/Anthrop
 
 Use a currently configured alias such as:
 
-- `claude-4.6-sonnet`
+- `claude-5-sonnet`
 - `claude-opus-4.7`
 - `claude-opus-4.8`
 - `claude-haiku-4-5`

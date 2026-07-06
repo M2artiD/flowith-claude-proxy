@@ -27,7 +27,7 @@ Configure the client with:
 ```text
 Base URL: http://127.0.0.1:8787
 API Key: your Flowith API key
-Model: claude-4.6-sonnet
+Model: claude-5-sonnet
 ```
 
 Main route:
@@ -51,7 +51,7 @@ Configure the client with:
 ```text
 Base URL: http://127.0.0.1:8788/v1
 API Key: your Flowith API key
-Model: claude-4.6-sonnet
+Model: claude-5-sonnet
 ```
 
 Main routes:
@@ -76,7 +76,7 @@ Configure Hermes with:
 ```text
 Base URL: http://127.0.0.1:8789/v1
 API Key: your Flowith API key
-Model: claude-4.6-sonnet
+Model: claude-5-sonnet
 ```
 
 Main routes:

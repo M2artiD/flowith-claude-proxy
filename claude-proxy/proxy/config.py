@@ -40,7 +40,7 @@ FLOWITH_BASE_URL = os.environ.get(
     "https://edge.flowith.io/external/use/llm",
 )
 
-DEFAULT_MODEL = os.environ.get("FLOWITH_DEFAULT_MODEL", "claude-4.6-sonnet")
+DEFAULT_MODEL = os.environ.get("FLOWITH_DEFAULT_MODEL", "claude-5-sonnet")
 
 API_TIMEOUT = _env_int("FLOWITH_TIMEOUT", 300)
 

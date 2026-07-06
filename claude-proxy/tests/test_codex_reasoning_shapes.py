@@ -117,7 +117,7 @@ class CodexUpstreamShapeTests(unittest.TestCase):
             "/v1/responses",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "input": "say hello",
                 "stream": True,
             },

@@ -44,7 +44,7 @@ def strip_model_thinking(text: str) -> str:
 # ---------------------------------------------------------------
 # Model aliases
 # ---------------------------------------------------------------
-def map_model(claude_model: str, default: str = "claude-4.6-sonnet") -> str:
+def map_model(claude_model: str, default: str = "claude-5-sonnet") -> str:
     """Passthrough model name as-is. Only apply user-defined custom aliases."""
     if not claude_model:
         return default

@@ -101,21 +101,21 @@ class OpenAIProxyTests(unittest.TestCase):
                 (
                     "/v1/chat/completions",
                     {
-                        "model": "claude-4.6-sonnet",
+                        "model": "claude-5-sonnet",
                         "messages": [{"role": "user", "content": "hi"}],
                     },
                 ),
                 (
                     "/v1/responses",
                     {
-                        "model": "claude-4.6-sonnet",
+                        "model": "claude-5-sonnet",
                         "input": "hi",
                     },
                 ),
                 (
                     "/v1/messages",
                     {
-                        "model": "claude-4.6-sonnet",
+                        "model": "claude-5-sonnet",
                         "max_tokens": 16,
                         "messages": [{"role": "user", "content": "hi"}],
                     },
@@ -146,7 +146,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/chat/completions",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "messages": [{"role": "user", "content": "say hello"}],
             },
         )
@@ -158,7 +158,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/chat/completions",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "messages": [{"role": "user", "content": "say hello"}],
                 "max_tokens": 16,
             },
@@ -167,7 +167,7 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(body["object"], "chat.completion")
-        self.assertEqual(body["model"], "claude-4.6-sonnet")
+        self.assertEqual(body["model"], "claude-5-sonnet")
         self.assertEqual(body["choices"][0]["message"]["content"], "hello")
         self.assertEqual(body["choices"][0]["finish_reason"], "stop")
         self.assertEqual(self.fake_client.calls[0]["messages"], [{"role": "user", "content": "say hello"}])
@@ -181,7 +181,7 @@ class OpenAIProxyTests(unittest.TestCase):
                 "/v1/chat/completions",
                 headers={"Authorization": "Bearer test-key"},
                 json={
-                    "model": "claude-4.6-sonnet",
+                    "model": "claude-5-sonnet",
                     "messages": [{"role": "user", "content": "secret prompt text"}],
                     "tools": [
                         {
@@ -201,7 +201,7 @@ class OpenAIProxyTests(unittest.TestCase):
         log = stdout.getvalue()
         self.assertIn("[REQ] route=chat_completions", log)
         self.assertIn("path=/v1/chat/completions", log)
-        self.assertIn("model=claude-4.6-sonnet", log)
+        self.assertIn("model=claude-5-sonnet", log)
         self.assertIn("tools=1", log)
         self.assertIn("msgs=1", log)
         self.assertIn("stream=False", log)
@@ -216,7 +216,7 @@ class OpenAIProxyTests(unittest.TestCase):
                 "/v1/responses",
                 headers={"Authorization": "Bearer test-key"},
                 json={
-                    "model": "claude-4.6-sonnet",
+                    "model": "claude-5-sonnet",
                     "input": "private response input",
                     "stream": True,
                 },
@@ -226,7 +226,7 @@ class OpenAIProxyTests(unittest.TestCase):
         log = stdout.getvalue()
         self.assertIn("[REQ] route=responses", log)
         self.assertIn("path=/v1/responses", log)
-        self.assertIn("model=claude-4.6-sonnet", log)
+        self.assertIn("model=claude-5-sonnet", log)
         self.assertIn("tools=0", log)
         self.assertIn("msgs=1", log)
         self.assertIn("stream=True", log)
@@ -237,7 +237,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/chat/completions",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "messages": [{"role": "user", "content": "say hello"}],
                 "stream": True,
             },
@@ -258,7 +258,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/chat/completions",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "messages": [{"role": "user", "content": "echo final tail"}],
                 "stream": True,
             },
@@ -275,7 +275,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/chat/completions",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "messages": [{"role": "user", "content": "say hello"}],
                 "stream": True,
                 "tools": [
@@ -302,7 +302,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/chat/completions",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "messages": [{"role": "user", "content": "say hello"}],
                 "stream": True,
                 "tools": [
@@ -333,7 +333,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/chat/completions",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "messages": [{"role": "user", "content": "echo final tail"}],
                 "stream": True,
                 "tools": [
@@ -367,7 +367,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/chat/completions",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "messages": [{"role": "user", "content": "check cwd"}],
                 "stream": True,
                 "tools": [
@@ -399,7 +399,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/chat/completions",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "messages": [{"role": "user", "content": "say hello"}],
                 "stream": True,
             },
@@ -417,7 +417,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/responses",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "input": "say hello",
                 "stream": True,
             },
@@ -477,7 +477,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/responses",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "input": "say hello",
                 "max_output_tokens": 16,
             },
@@ -486,7 +486,7 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(body["object"], "response")
-        self.assertEqual(body["model"], "claude-4.6-sonnet")
+        self.assertEqual(body["model"], "claude-5-sonnet")
         self.assertEqual(body["output_text"], "hello")
         self.assertEqual(body["output"][0]["content"][0]["text"], "hello")
         self.assertEqual(self.fake_client.calls[0]["messages"], [{"role": "user", "content": "say hello"}])
@@ -578,7 +578,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/responses",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "input": [{"role": "user", "content": [{"type": "input_text", "text": "say hello"}]}],
                 "stream": True,
             },
@@ -599,7 +599,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/responses",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "input": "echo final tail",
                 "stream": True,
             },
@@ -617,7 +617,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/responses",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "input": "echo final tail",
                 "stream": True,
                 "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
@@ -665,7 +665,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/responses",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "input": "say hello",
                 "stream": True,
                 "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
@@ -696,7 +696,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/responses",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "input": "check cwd",
                 "stream": True,
                 "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
@@ -725,7 +725,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/v1/responses",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "input": "check cwd and explain",
                 "stream": True,
                 "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
@@ -747,7 +747,7 @@ class OpenAIProxyTests(unittest.TestCase):
             "/chat/completions",
             headers={"Authorization": "Bearer test-key"},
             json={
-                "model": "claude-4.6-sonnet",
+                "model": "claude-5-sonnet",
                 "messages": [{"role": "user", "content": "say hello"}],
             },
         )
@@ -833,7 +833,7 @@ class OpenAIProxyTests(unittest.TestCase):
                 "/v1/chat/completions",
                 headers={"Authorization": "Bearer test-key"},
                 json={
-                    "model": "claude-4.6-sonnet",
+                    "model": "claude-5-sonnet",
                     "messages": [{"role": "user", "content": "x" * 64}],
                 },
             )
@@ -848,7 +848,7 @@ class OpenAIProxyTests(unittest.TestCase):
         server.FLOWITH_MAX_REQUEST_BYTES = 32
         try:
             body = (
-                b'{"model":"claude-4.6-sonnet","messages":'
+                b'{"model":"claude-5-sonnet","messages":'
                 b'[{"role":"user","content":"'
                 + (b"x" * 64)
                 + b'"}]}'
