@@ -57,6 +57,17 @@ class LauncherBatchTests(unittest.TestCase):
                 self.assertIn('if /i "%FLOWITH_OPEN_DASHBOARD%"=="false" exit /b 0', text)
                 self.assertIn('if /i "%FLOWITH_OPEN_DASHBOARD%"=="0" exit /b 0', text)
 
+    def test_hermes_smoke_defaults_to_configured_key_and_working_model(self) -> None:
+        text = (ROOT / "scripts" / "smoke_hermes.ps1").read_text(encoding="utf-8")
+        self.assertNotIn('"test-key"', text)
+        self.assertNotIn('"hermes"', text)
+        self.assertIn('"claude-5-sonnet"', text)
+        self.assertIn("Get-ConfiguredFlowithApiKey", text)
+        self.assertIn(".flowith_api_key", text)
+        self.assertIn(".env", text)
+        self.assertIn('$ProgressPreference = "SilentlyContinue"', text)
+        self.assertIn("-UseBasicParsing", text)
+
 
 if __name__ == "__main__":
     unittest.main()

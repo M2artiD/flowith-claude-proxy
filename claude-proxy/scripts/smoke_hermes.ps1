@@ -6,12 +6,44 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 if ([string]::IsNullOrWhiteSpace($BaseUrl)) { $BaseUrl = "http://127.0.0.1:8789" }
-if ([string]::IsNullOrWhiteSpace($ApiKey)) { $ApiKey = "test-key" }
-if ([string]::IsNullOrWhiteSpace($Model)) { $Model = "hermes" }
+if ([string]::IsNullOrWhiteSpace($Model)) { $Model = "claude-5-sonnet" }
 if ($SyntaxOnly) {
     Write-Host "Hermes smoke script syntax/options OK"
     exit 0
+}
+
+function Get-ConfiguredFlowithApiKey {
+    $scriptDir = Split-Path -Parent $PSCommandPath
+    $repoRoot = Split-Path -Parent $scriptDir
+    $searchRoots = @($repoRoot, (Get-Location).Path) | Select-Object -Unique
+
+    foreach ($root in $searchRoots) {
+        $path = Join-Path $root ".flowith_api_key"
+        if (Test-Path -LiteralPath $path) {
+            $value = (Get-Content -LiteralPath $path -Raw).Trim().Trim('"').Trim("'")
+            if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
+        }
+    }
+
+    foreach ($root in $searchRoots) {
+        $path = Join-Path $root ".env"
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        foreach ($line in Get-Content -LiteralPath $path) {
+            $trimmed = $line.Trim()
+            if (-not $trimmed.StartsWith("FLOWITH_API_KEY=")) { continue }
+            $value = $trimmed.Substring("FLOWITH_API_KEY=".Length).Trim().Trim('"').Trim("'")
+            if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
+        }
+    }
+
+    return $null
+}
+
+if ([string]::IsNullOrWhiteSpace($ApiKey)) { $ApiKey = Get-ConfiguredFlowithApiKey }
+if ([string]::IsNullOrWhiteSpace($ApiKey)) {
+    throw "No Hermes API key supplied. Set HERMES_API_KEY, FLOWITH_API_KEY in .env, or .flowith_api_key."
 }
 $BaseUrl = $BaseUrl.TrimEnd('/')
 $Headers = @{ Authorization = "Bearer $ApiKey" }
@@ -22,15 +54,15 @@ function Assert-True([bool]$Condition, [string]$Message) {
 
 function Invoke-JsonPost([string]$Path, [hashtable]$Body) {
     $json = $Body | ConvertTo-Json -Depth 20
-    Invoke-RestMethod -Method Post -Uri "$BaseUrl$Path" -Headers $Headers -ContentType "application/json" -Body $json
+    Invoke-RestMethod -Method Post -Uri "$BaseUrl$Path" -Headers $Headers -ContentType "application/json" -Body $json -UseBasicParsing
 }
 
 Write-Host "[1/7] GET /health"
-$health = Invoke-RestMethod -Method Get -Uri "$BaseUrl/health" -Headers $Headers
+$health = Invoke-RestMethod -Method Get -Uri "$BaseUrl/health" -Headers $Headers -UseBasicParsing
 Assert-True ($null -ne $health) "health returned no body"
 
 Write-Host "[2/7] GET /v1/models"
-$models = Invoke-RestMethod -Method Get -Uri "$BaseUrl/v1/models" -Headers $Headers
+$models = Invoke-RestMethod -Method Get -Uri "$BaseUrl/v1/models" -Headers $Headers -UseBasicParsing
 Assert-True ($null -ne $models.data) "models response missing data"
 
 Write-Host "[3/7] non-streaming chat"
@@ -51,7 +83,7 @@ $streamBody = @{
     stream = $true
     max_tokens = 64
 } | ConvertTo-Json -Depth 20
-$response = Invoke-WebRequest -Method Post -Uri "$BaseUrl/v1/chat/completions" -Headers $Headers -ContentType "application/json" -Body $streamBody
+$response = Invoke-WebRequest -Method Post -Uri "$BaseUrl/v1/chat/completions" -Headers $Headers -ContentType "application/json" -Body $streamBody -UseBasicParsing
 $raw = [string]$response.Content
 Assert-True ($raw -match "data:") "streaming response had no SSE data lines"
 Assert-True ($raw -match '"delta"') "streaming response had no delta objects"
