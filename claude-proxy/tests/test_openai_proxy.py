@@ -1,5 +1,7 @@
+import io
 import os
 import unittest
+from contextlib import redirect_stdout
 
 from fastapi.testclient import TestClient
 
@@ -39,15 +41,18 @@ class OpenAIProxyTests(unittest.TestCase):
         self.original_server_api_key = server._SERVER_API_KEY
         self.original_default_client = server._default_client
         self.original_profile = os.environ.get("FLOWITH_API_PROFILE")
+        self.original_request_log = server.FLOWITH_REQUEST_LOG
 
         self.fake_client = FakeFlowithClient()
         server._SERVER_API_KEY = "test-key"
         server._default_client = self.fake_client
+        server.FLOWITH_REQUEST_LOG = False
         self.client = TestClient(server.app)
 
     def tearDown(self) -> None:
         server._SERVER_API_KEY = self.original_server_api_key
         server._default_client = self.original_default_client
+        server.FLOWITH_REQUEST_LOG = self.original_request_log
         if self.original_profile is None:
             os.environ.pop("FLOWITH_API_PROFILE", None)
         else:
@@ -166,6 +171,66 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertEqual(body["choices"][0]["message"]["content"], "hello")
         self.assertEqual(body["choices"][0]["finish_reason"], "stop")
         self.assertEqual(self.fake_client.calls[0]["messages"], [{"role": "user", "content": "say hello"}])
+
+    def test_chat_completions_request_log_summarizes_without_prompt_content(self) -> None:
+        server.FLOWITH_REQUEST_LOG = True
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            response = self.client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer test-key"},
+                json={
+                    "model": "claude-4.6-sonnet",
+                    "messages": [{"role": "user", "content": "secret prompt text"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "shell",
+                                "description": "Run a shell command",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                    "stream": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        log = stdout.getvalue()
+        self.assertIn("[REQ] route=chat_completions", log)
+        self.assertIn("path=/v1/chat/completions", log)
+        self.assertIn("model=claude-4.6-sonnet", log)
+        self.assertIn("tools=1", log)
+        self.assertIn("msgs=1", log)
+        self.assertIn("stream=False", log)
+        self.assertNotIn("secret prompt text", log)
+
+    def test_responses_request_log_summarizes_without_input_content(self) -> None:
+        server.FLOWITH_REQUEST_LOG = True
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            response = self.client.post(
+                "/v1/responses",
+                headers={"Authorization": "Bearer test-key"},
+                json={
+                    "model": "claude-4.6-sonnet",
+                    "input": "private response input",
+                    "stream": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        log = stdout.getvalue()
+        self.assertIn("[REQ] route=responses", log)
+        self.assertIn("path=/v1/responses", log)
+        self.assertIn("model=claude-4.6-sonnet", log)
+        self.assertIn("tools=0", log)
+        self.assertIn("msgs=1", log)
+        self.assertIn("stream=True", log)
+        self.assertNotIn("private response input", log)
 
     def test_chat_completions_streaming(self) -> None:
         response = self.client.post(

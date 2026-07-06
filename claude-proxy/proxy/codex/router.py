@@ -123,6 +123,36 @@ RequireApiKey = Callable[[str | None, str | None], str]
 RequireDiscoveryApiKey = Callable[[str | None, str | None], None]
 GetClientForKey = Callable[[str, str], tuple[FlowithClient, str | None]]
 WithXmlToolStopSequence = Callable[[list[str] | str | None], list[str]]
+RequestLogEnabled = Callable[[], bool]
+
+
+def _request_log_message_count(body: dict[str, Any], route: str) -> int:
+    if route == "chat_completions":
+        return len(body.get("messages") or [])
+    if route == "responses":
+        raw_input = body.get("input", "")
+        if isinstance(raw_input, list):
+            return len(raw_input)
+        return 1 if raw_input is not None else 0
+    return 0
+
+
+def _log_request_summary(
+    *,
+    route: str,
+    path: str,
+    body: dict[str, Any],
+    requested_model: str,
+) -> None:
+    print(
+        f"[REQ] route={route} "
+        f"path={path} "
+        f"model={requested_model} "
+        f"tools={len(body.get('tools') or [])} "
+        f"msgs={_request_log_message_count(body, route)} "
+        f"stream={bool(body.get('stream'))}",
+        flush=True,
+    )
 
 
 def create_router(
@@ -133,6 +163,7 @@ def create_router(
     require_discovery_api_key: RequireDiscoveryApiKey,
     get_client_for_key: GetClientForKey,
     with_xml_tool_stop_sequence: WithXmlToolStopSequence,
+    request_log_enabled: RequestLogEnabled = lambda: False,
 ) -> APIRouter:
     """Build the Codex/OpenAI router while reusing server-owned auth/client state."""
 
@@ -231,6 +262,13 @@ def create_router(
         api_key = require_api_key(x_api_key, authorization)
 
         requested_model = body.get("model") or DEFAULT_MODEL
+        if request_log_enabled():
+            _log_request_summary(
+                route="chat_completions",
+                path=request.url.path,
+                body=body,
+                requested_model=requested_model,
+            )
         _trace_hermes(
             "route=chat_completions "
             f"path={request.url.path} "
@@ -306,6 +344,13 @@ def create_router(
         api_key = require_api_key(x_api_key, authorization)
 
         requested_model = body.get("model") or DEFAULT_MODEL
+        if request_log_enabled():
+            _log_request_summary(
+                route="responses",
+                path=request.url.path,
+                body=body,
+                requested_model=requested_model,
+            )
         _trace_hermes(
             "route=responses "
             f"path={request.url.path} "

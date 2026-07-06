@@ -48,8 +48,43 @@ class DashboardTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("text/html", response.headers["content-type"])
-        self.assertIn("Flowith Claude Proxy Console", response.text)
+        self.assertIn("Flowith Proxy Console", response.text)
+        self.assertIn("Client setup", response.text)
+        self.assertIn("Auto refresh: on", response.text)
+        self.assertIn("Dashboard API", response.text)
+        self.assertIn("Safe config JSON", response.text)
+        self.assertIn("Debug dumps", response.text)
+        self.assertIn("OPENAI_BASE_URL", response.text)
+        self.assertIn("ANTHROPIC_BASE_URL", response.text)
+        self.assertIn("Forwarding ready", response.text)
+        self.assertIn("Click BAT, then forward directly", response.text)
+        self.assertIn("Direct forwarding status", response.text)
+        self.assertIn("&rarr;", response.text)
+        self.assertIn("Quick start", response.text)
+        self.assertIn("BAT-launched local proxy", response.text)
+        self.assertIn('id="forwarding-state"', response.text)
+        self.assertIn('id="profile-state"', response.text)
+        self.assertIn('data-active="false"', response.text)
+        self.assertIn("Copy", response.text)
+        self.assertIn("data-copy-target=", response.text)
+        self.assertIn('id="anthropic-url"', response.text)
+        self.assertIn('id="openai-url"', response.text)
+        self.assertIn('aria-live="polite"', response.text)
         self.assertIn("/dashboard/api/status", response.text)
+        self.assertNotIn("https://", response.text)
+
+
+    def test_dashboard_inline_script_is_valid_javascript(self) -> None:
+        response = self.client.get("/dashboard")
+
+        self.assertEqual(response.status_code, 200)
+        script_start = response.text.index("<script>") + len("<script>")
+        script_end = response.text.index("</script>", script_start)
+        inline_script = response.text[script_start:script_end]
+        self.assertNotIn("lines.join('\n')", inline_script)
+        self.assertNotIn(": '\nNo dump files found.'", inline_script)
+        self.assertIn(r"lines.join('\n')", inline_script)
+        self.assertIn(r": '\nNo dump files found.'", inline_script)
 
     def test_dashboard_status_reports_routes_and_safe_runtime_state(self) -> None:
         response = self.client.get("/dashboard/api/status")
@@ -66,6 +101,17 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("POST /v1/responses", payload["routes"])
         self.assertEqual(payload["models"]["default"], server.DEFAULT_MODEL)
         self.assertIn("claude-fable-5", payload["models"]["available"])
+
+    def test_dashboard_status_supports_frontend_connection_hints(self) -> None:
+        response = self.client.get("/dashboard/api/status")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("bind", payload)
+        self.assertIn("port", payload["bind"])
+        self.assertIn("POST /v1/messages", payload["routes"])
+        self.assertIn("POST /v1/chat/completions", payload["routes"])
+        self.assertIn("POST /v1/responses", payload["routes"])
 
     def test_dashboard_config_masks_secrets_and_exposes_safety_knobs(self) -> None:
         response = self.client.get("/dashboard/api/config")

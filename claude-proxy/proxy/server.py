@@ -420,53 +420,210 @@ _DASHBOARD_HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Flowith Claude Proxy Console</title>
   <style>
-    :root { color-scheme: light dark; font-family: Inter, Segoe UI, Arial, sans-serif; }
-    body { margin: 0; padding: 32px; background: #0f172a; color: #e2e8f0; }
-    main { max-width: 1100px; margin: 0 auto; }
-    h1 { margin: 0 0 8px; font-size: 32px; }
-    p { color: #94a3b8; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin: 24px 0; }
-    .card { background: #111827; border: 1px solid #334155; border-radius: 14px; padding: 18px; box-shadow: 0 8px 30px #0003; }
-    .label { color: #94a3b8; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; }
-    .value { font-size: 24px; margin-top: 6px; }
-    pre { overflow: auto; white-space: pre-wrap; background: #020617; border-radius: 12px; padding: 16px; border: 1px solid #1e293b; }
-    a { color: #7dd3fc; }
-    button { background: #2563eb; color: white; border: 0; border-radius: 10px; padding: 10px 14px; cursor: pointer; }
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --bg:#070b16; --panel:#0f172a; --line:#233044; --text:#e5eefb; --muted:#93a4bb; --ok:#34d399; --warn:#f59e0b; --bad:#fb7185; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 20% 0%, #0e749044 0, transparent 34%), radial-gradient(circle at 90% 10%, #2563eb33 0, transparent 30%), var(--bg); color: var(--text); }
+    main { max-width: 1180px; margin: 0 auto; padding: 32px 20px 48px; }
+    header { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; margin-bottom: 22px; }
+    h1 { margin: 0 0 8px; font-size: clamp(30px, 5vw, 48px); letter-spacing: -.04em; }
+    h2 { margin: 0 0 14px; font-size: 18px; }
+    h3 { margin: 0 0 8px; font-size: 15px; }
+    p { color: var(--muted); line-height: 1.6; }
+    a { color: #7dd3fc; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    button { background: #2563eb; color: white; border: 1px solid #60a5fa66; border-radius: 999px; padding: 10px 16px; cursor: pointer; box-shadow: 0 10px 30px #1d4ed833; }
+    button.secondary, .tab { background: #0f172a; color: #cbd5e1; border-color: var(--line); box-shadow: none; }
+    .hero-actions, .tabs, .route-list, .copy-row, .state-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .pill { display: inline-flex; gap: 8px; align-items: center; border: 1px solid var(--line); background: #0f172acc; color: #cbd5e1; border-radius: 999px; padding: 7px 11px; font-size: 13px; }
+    .dot { width: 9px; height: 9px; border-radius: 99px; background: var(--warn); box-shadow: 0 0 18px currentColor; }
+    .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin: 20px 0; }
+    .grid.two { grid-template-columns: minmax(0, 1.1fr) minmax(0, .9fr); align-items: start; }
+    .card { background: linear-gradient(180deg, #111c31 0%, var(--panel) 100%); border: 1px solid var(--line); border-radius: 18px; padding: 18px; box-shadow: 0 18px 48px #0005; }
+    .banner { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 14px; align-items: center; border: 1px solid #22c55e66; border-radius: 20px; padding: 16px; background: linear-gradient(135deg, #064e3b99, #0b1220 58%); box-shadow: 0 24px 60px #0006; margin: 18px 0 4px; }
+    .banner-icon { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 16px; background: #10b98122; color: #86efac; font-size: 24px; border: 1px solid #34d39966; }
+    .banner p { margin: 0; }
+    .steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+    .step { border: 1px solid var(--line); border-radius: 14px; padding: 12px; background: #0b1220; min-width: 0; }
+    .step-num { display: inline-grid; place-items: center; width: 24px; height: 24px; margin-bottom: 8px; border-radius: 999px; background: #1d4ed8; color: white; font-weight: 700; font-size: 13px; }
+    .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    .value { font-size: 25px; font-weight: 750; margin-top: 7px; word-break: break-word; }
+    .hint { color: var(--muted); font-size: 13px; margin-top: 8px; }
+    .tab { padding: 8px 11px; border-radius: 999px; }
+    .tab.active { background: #075985; border-color: #38bdf8aa; color: white; }
+    pre, code { font-family: "Cascadia Mono", Consolas, ui-monospace, monospace; }
+    pre { overflow: auto; white-space: pre-wrap; word-break: break-word; max-height: 460px; background: #020617; border-radius: 14px; padding: 16px; border: 1px solid #1e293b; color: #dbeafe; }
+    .routes { display: grid; gap: 10px; }
+    .route-group { border: 1px solid var(--line); border-radius: 14px; padding: 12px; background: #0b1220; }
+    .route-list { margin-top: 10px; }
+    .route { border-radius: 999px; background: #172554; color: #bfdbfe; padding: 6px 9px; font-size: 12px; }
+    .endpoint-list { display: grid; gap: 8px; margin: 10px 0 0; }
+    .endpoint-list a { display: block; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: #0b1220; }
+    .setup-grid { display: grid; gap: 10px; margin-top: 12px; }
+    .setup-card { border: 1px solid var(--line); border-radius: 14px; padding: 13px; background: #0b1220; }
+    .setup-card strong { display: block; margin-bottom: 8px; }
+    .setup-card[data-active="false"] { opacity: .62; }
+    .setup-card[data-active="true"] { border-color: #38bdf8aa; box-shadow: inset 0 0 0 1px #38bdf822; }
+    .copy-row { align-items: center; margin-top: 8px; }
+    .copy-value { flex: 1 1 260px; min-width: 0; border: 1px solid #1e293b; border-radius: 10px; padding: 9px 10px; background: #020617; color: #dbeafe; overflow-wrap: anywhere; }
+    .copy { padding: 8px 12px; box-shadow: none; }
+    .ready { border-color: #10b98166; background: linear-gradient(180deg, #064e3b66, #0b1220); }
+    .state-row { margin-top: 10px; }
+    .state { border: 1px solid var(--line); border-radius: 999px; padding: 6px 9px; color: #cbd5e1; background: #020617; font-size: 12px; }
+    .state.ok { border-color: #10b98166; color: #bbf7d0; background: #052e25; }
+    .state.warn { border-color: #f59e0b66; color: #fde68a; background: #451a03; }
+    .empty { color: var(--muted); border: 1px dashed var(--line); border-radius: 12px; padding: 12px; }
+    .error { color: #fecdd3; border-color: #be123c; background: #450a0a; }
+    @media (max-width: 860px) { header { display: block; } .hero-actions { justify-content: flex-start; margin-top: 16px; } .grid, .grid.two, .steps, .banner { grid-template-columns: 1fr; } main { padding-top: 22px; } .banner-icon { width: 38px; height: 38px; } }
   </style>
 </head>
 <body>
 <main>
-  <h1>Flowith Claude Proxy Console</h1>
-  <p>Read-only local dashboard for runtime status, safe configuration, route inventory, and debug dump metadata.</p>
+  <header>
+    <div>
+      <span class="pill"><span class="dot" id="status-dot"></span><span id="status-pill">Connecting</span></span>
+      <h1>Flowith Proxy Console</h1>
+      <p>Read-only local dashboard for runtime status, direct BAT-launched forwarding, client connection hints, safe configuration, route inventory, and debug dump metadata.</p>
+    </div>
+    <div class="hero-actions"><button id="refresh">Refresh now</button><button class="secondary" id="auto">Auto refresh: on</button></div>
+  </header>
+  <section class="banner" aria-label="Direct forwarding status">
+    <div class="banner-icon">&rarr;</div>
+    <div>
+      <h2>Click BAT, then forward directly</h2>
+      <p id="forwarding-summary">When the proxy is running, clients send requests to this local URL and the BAT-launched server forwards them to Flowith.</p>
+      <div class="state-row"><span class="state warn" id="forwarding-state">Checking forwarding surface...</span><span class="state" id="profile-state">Profile unknown</span></div>
+    </div>
+  </section>
+  <section class="steps" aria-label="Quick start">
+    <div class="step"><span class="step-num">1</span><h3>Run a launcher</h3><p>Double-click <code>start.bat</code>, <code>start-codex.bat</code>, or <code>start-hermes.bat</code>.</p></div>
+    <div class="step"><span class="step-num">2</span><h3>Wait for green</h3><p>This dashboard opens after <code>/dashboard</code> is actually serving, so a green status means the local proxy is ready.</p></div>
+    <div class="step"><span class="step-num">3</span><h3>Copy base URL</h3><p>Paste the matching local base URL into Claude Code, Codex, Hermes, or another compatible client.</p></div>
+  </section>
   <div class="grid">
-    <section class="card"><div class="label">Status</div><div class="value" id="status">Loading?</div></section>
-    <section class="card"><div class="label">Bind</div><div class="value" id="bind">?</div></section>
-    <section class="card"><div class="label">Local Only</div><div class="value" id="local">?</div></section>
-    <section class="card"><div class="label">Models</div><div class="value" id="models">?</div></section>
+    <section class="card"><div class="label">Status</div><div class="value" id="status">Loading...</div><div class="hint" id="status-hint">Waiting for API data</div></section>
+    <section class="card"><div class="label">Base URL</div><div class="value" id="base-url">...</div><div class="hint" id="profile-hint">Use this in your client</div></section>
+    <section class="card"><div class="label">Security</div><div class="value" id="security">...</div><div class="hint" id="security-hint">Local proxy defaults</div></section>
+    <section class="card"><div class="label">Models</div><div class="value" id="models">...</div><div class="hint" id="model-hint">Available aliases</div></section>
   </div>
-  <p>
-    API endpoints:
-    <a href="/dashboard/api/status">/dashboard/api/status</a>,
-    <a href="/dashboard/api/config">/dashboard/api/config</a>,
-    <a href="/dashboard/api/routes">/dashboard/api/routes</a>,
-    <a href="/dashboard/api/debug-dumps">/dashboard/api/debug-dumps</a>
-  </p>
-  <button id="refresh">Refresh</button>
-  <h2>Status JSON</h2>
-  <pre id="json">Loading?</pre>
+  <section class="grid two">
+    <div class="card">
+      <h2>Client setup</h2>
+      <p><strong>Forwarding ready</strong> once this page turns green: the BAT file has started the local proxy, and client requests can be sent to the matching local URL below. API keys stay local and are masked in this dashboard.</p>
+      <div class="setup-grid" aria-live="polite">
+        <div class="setup-card ready" id="anthropic-card" data-active="false">
+          <strong>Claude Code / Anthropic</strong>
+          <div class="copy-row"><code class="copy-value" id="anthropic-url">ANTHROPIC_BASE_URL=http://127.0.0.1:...</code><button class="copy" data-copy-target="anthropic-url">Copy</button></div>
+          <div class="hint">Use start.bat for /v1/messages forwarding.</div>
+        </div>
+        <div class="setup-card ready" id="openai-card" data-active="false">
+          <strong>Codex / OpenAI</strong>
+          <div class="copy-row"><code class="copy-value" id="openai-url">OPENAI_BASE_URL=http://127.0.0.1:.../v1</code><button class="copy" data-copy-target="openai-url">Copy</button></div>
+          <div class="hint">Use start-codex.bat or start-hermes.bat for /v1/responses and chat completions.</div>
+        </div>
+      </div>
+      <pre id="client-config">Loading client hints... OPENAI_BASE_URL ANTHROPIC_BASE_URL</pre>
+    </div>
+    <div class="card"><h2>Dashboard API</h2><div class="endpoint-list"><a href="/dashboard/api/status">/dashboard/api/status</a><a href="/dashboard/api/config">/dashboard/api/config</a><a href="/dashboard/api/routes">/dashboard/api/routes</a><a href="/dashboard/api/debug-dumps">/dashboard/api/debug-dumps</a></div></div>
+  </section>
+  <section class="grid two">
+    <div class="card"><h2>Routes</h2><div id="routes" class="routes"><div class="empty">Loading routes...</div></div></div>
+    <div class="card"><h2>Debug dumps</h2><div id="debug-summary" class="empty">Loading debug dump metadata...</div></div>
+  </section>
+  <section class="card">
+    <div class="tabs"><button class="tab active" data-view="status-json">Status JSON</button><button class="tab" data-view="config-json">Safe config JSON</button><button class="tab" data-view="routes-json">Routes JSON</button><button class="tab" data-view="debug-json">Debug JSON</button></div>
+    <pre id="status-json">Loading...</pre><pre id="config-json" hidden>Loading...</pre><pre id="routes-json" hidden>Loading...</pre><pre id="debug-json" hidden>Loading...</pre>
+  </section>
 </main>
 <script>
-async function loadStatus() {
-  const res = await fetch('/dashboard/api/status');
-  const data = await res.json();
-  document.getElementById('status').textContent = data.health && data.health.ok ? 'Running' : 'Issue';
-  document.getElementById('bind').textContent = `${data.bind.host}:${data.bind.port}`;
-  document.getElementById('local').textContent = String(data.security.local_only);
-  document.getElementById('models').textContent = String(data.models.count);
-  document.getElementById('json').textContent = JSON.stringify(data, null, 2);
+let autoRefresh = true;
+let timer = null;
+function text(id, value) { document.getElementById(id).textContent = value; }
+function pretty(value) { return JSON.stringify(value, null, 2); }
+function clientHints(status) {
+  const port = status.bind && status.bind.port;
+  const routes = status.routes || [];
+  const hasClaude = routes.includes('POST /v1/messages');
+  const hasOpenAI = routes.includes('POST /v1/responses') || routes.includes('POST /v1/chat/completions');
+  const base = `http://127.0.0.1:${port}`;
+  const lines = [];
+  if (hasClaude) { lines.push('Claude Code / Anthropic-compatible', `ANTHROPIC_BASE_URL=${base}`, 'ANTHROPIC_API_KEY=<your Flowith API key>'); }
+  if (hasOpenAI) { if (lines.length) lines.push(''); lines.push('Codex / OpenAI-compatible', `OPENAI_BASE_URL=${base}/v1`, 'OPENAI_API_KEY=<your Flowith API key>'); }
+  return lines.join('\\n') || `Base URL: ${base}`;
 }
-document.getElementById('refresh').addEventListener('click', loadStatus);
-loadStatus().catch(err => { document.getElementById('json').textContent = String(err); });
+function activeSurface(status) {
+  const routes = Array.isArray(status.routes) ? status.routes : [];
+  const hasClaude = routes.includes('POST /v1/messages');
+  const hasOpenAI = routes.includes('POST /v1/responses') || routes.includes('POST /v1/chat/completions');
+  if (hasClaude && hasOpenAI) return 'Claude + OpenAI compatible';
+  if (hasClaude) return 'Claude / Anthropic compatible';
+  if (hasOpenAI) return 'Codex / OpenAI compatible';
+  return 'No forwarding routes reported';
+}
+function renderRoutes(routes) {
+  const host = document.getElementById('routes');
+  host.innerHTML = '';
+  for (const [group, items] of Object.entries(routes || {})) {
+    if (!Array.isArray(items)) continue;
+    const section = document.createElement('div'); section.className = 'route-group';
+    const title = document.createElement('strong'); title.textContent = group;
+    const list = document.createElement('div'); list.className = 'route-list';
+    for (const item of items) { const chip = document.createElement('span'); chip.className = 'route'; chip.textContent = item; list.appendChild(chip); }
+    section.appendChild(title); section.appendChild(list); host.appendChild(section);
+  }
+  if (!host.childElementCount) host.innerHTML = '<div class="empty">No routes reported.</div>';
+}
+function renderDebug(debug) {
+  const files = debug.files || [];
+  const latest = files.length ? `\nLatest: ${files[0].name} (${files[0].size_bytes} bytes)` : '\\nNo dump files found.';
+  text('debug-summary', `Debug dumps are ${debug.enabled ? 'enabled' : 'disabled'}. Count: ${debug.count || 0}.${latest}`);
+}
+async function loadStatus() {
+  const [statusRes, configRes, routesRes, debugRes] = await Promise.all([fetch('/dashboard/api/status'), fetch('/dashboard/api/config'), fetch('/dashboard/api/routes'), fetch('/dashboard/api/debug-dumps')]);
+  if (!statusRes.ok) throw new Error(`status endpoint returned ${statusRes.status}`);
+  const status = await statusRes.json();
+  const config = configRes.ok ? await configRes.json() : {error: `config endpoint returned ${configRes.status}`};
+  const routes = routesRes.ok ? await routesRes.json() : {error: `routes endpoint returned ${routesRes.status}`};
+  const debug = debugRes.ok ? await debugRes.json() : {error: `debug endpoint returned ${debugRes.status}`};
+  const ok = status.health && status.health.ok;
+  const routeList = Array.isArray(status.routes) ? status.routes : [];
+  const hasClaude = routeList.includes('POST /v1/messages');
+  const hasOpenAI = routeList.includes('POST /v1/responses') || routeList.includes('POST /v1/chat/completions');
+  text('status', ok ? 'Running' : 'Issue');
+  text('status-pill', ok ? 'Running locally' : 'Needs attention');
+  document.getElementById('status-dot').className = `dot ${ok ? 'ok' : 'bad'}`;
+  text('status-hint', `Version ${status.version || 'unknown'}`);
+  text('base-url', `127.0.0.1:${status.bind.port}`);
+  text('profile-hint', activeSurface(status));
+  text('security', status.security.local_only ? 'Local only' : 'Network');
+  text('security-hint', status.security.require_server_key ? 'Server key required' : 'Loopback access without extra auth');
+  text('models', String(status.models.count));
+  text('model-hint', `Default: ${status.models.default}`);
+  text('forwarding-summary', ok ? `Ready: requests sent to http://127.0.0.1:${status.bind.port} are forwarded by this BAT-launched local proxy.` : 'Proxy is reachable, but health is not OK yet. Refresh after startup finishes.');
+  text('forwarding-state', ok ? 'Direct forwarding ready' : 'Forwarding not healthy');
+  document.getElementById('forwarding-state').className = `state ${ok ? 'ok' : 'warn'}`;
+  text('profile-state', activeSurface(status));
+  document.getElementById('anthropic-card').dataset.active = String(hasClaude);
+  document.getElementById('openai-card').dataset.active = String(hasOpenAI);
+  text('client-config', clientHints(status));
+  text('anthropic-url', `ANTHROPIC_BASE_URL=http://127.0.0.1:${status.bind.port}`);
+  text('openai-url', `OPENAI_BASE_URL=http://127.0.0.1:${status.bind.port}/v1`);
+  renderRoutes(routes); renderDebug(debug);
+  text('status-json', pretty(status)); text('config-json', pretty(config)); text('routes-json', pretty(routes)); text('debug-json', pretty(debug));
+}
+function showError(err) { document.getElementById('status-dot').className = 'dot bad'; text('status-pill', 'Dashboard error'); text('status', 'Error'); text('status-json', String(err)); document.getElementById('status-json').classList.add('error'); }
+function schedule() { clearInterval(timer); timer = autoRefresh ? setInterval(() => loadStatus().catch(showError), 5000) : null; }
+document.getElementById('refresh').addEventListener('click', () => loadStatus().catch(showError));
+document.getElementById('auto').addEventListener('click', (event) => { autoRefresh = !autoRefresh; event.currentTarget.textContent = `Auto refresh: ${autoRefresh ? 'on' : 'off'}`; schedule(); });
+document.querySelectorAll('[data-copy-target]').forEach(button => button.addEventListener('click', async () => {
+  const target = document.getElementById(button.dataset.copyTarget);
+  const value = target ? target.textContent : '';
+  if (navigator.clipboard && value) await navigator.clipboard.writeText(value);
+  button.textContent = 'Copied';
+  setTimeout(() => { button.textContent = 'Copy'; }, 1200);
+}));
+document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => { document.querySelectorAll('.tab').forEach(item => item.classList.toggle('active', item === tab)); document.querySelectorAll('pre[id$="-json"]').forEach(panel => panel.hidden = panel.id !== tab.dataset.view); }));
+loadStatus().catch(showError); schedule();
 </script>
 </body>
 </html>
@@ -556,6 +713,7 @@ app.include_router(create_codex_router(
     require_discovery_api_key=_require_discovery_api_key,
     get_client_for_key=_get_client_for_key,
     with_xml_tool_stop_sequence=lambda stop_sequences: _with_xml_tool_stop_sequence(stop_sequences),
+    request_log_enabled=lambda: FLOWITH_REQUEST_LOG,
 ))
 
 

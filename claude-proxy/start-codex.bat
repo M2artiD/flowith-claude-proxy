@@ -107,21 +107,21 @@ exit /b %ERRORLEVEL%
 set "_DASHBOARD_PORT=%~1"
 if /i "%FLOWITH_OPEN_DASHBOARD%"=="false" exit /b 0
 if /i "%FLOWITH_OPEN_DASHBOARD%"=="0" exit /b 0
-powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$port=[int]$env:_DASHBOARD_PORT; $inner='for($i=0; $i -lt 30; $i++) { try { $r=Invoke-WebRequest -Uri ''http://127.0.0.1:' + $port + '/health'' -UseBasicParsing -TimeoutSec 1; if ($r.StatusCode -eq 200 -and $r.Content -match ''\"ok\"\s*:\s*true'') { Start-Process ''http://127.0.0.1:' + $port + '/dashboard''; break } } catch { Start-Sleep -Milliseconds 500 } }'; Start-Process powershell -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command',$inner)" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$inner='$port=[int]$env:_DASHBOARD_PORT; for($i=0; $i -lt 40; $i++) { try { $r=Invoke-WebRequest -Uri (''http://127.0.0.1:{0}/dashboard'' -f $port) -UseBasicParsing -TimeoutSec 1; if ($r.StatusCode -eq 200) { Start-Process (''http://127.0.0.1:{0}/dashboard'' -f $port); break } } catch { Start-Sleep -Milliseconds 500 } }'; Start-Process powershell -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command',$inner)" >nul 2>&1
 exit /b 0
 
 :check_port
 set "_PORT=%~1"
 netstat -ano | findstr /r /c:":%_PORT% .*LISTENING" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 exit /b 0
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$port=[int]$env:_PORT; try { $r=Invoke-WebRequest -Uri ('http://127.0.0.1:{0}/health' -f $port) -UseBasicParsing -TimeoutSec 2; if ($r.StatusCode -eq 200 -and $r.Content -match '\"ok\"\s*:\s*true') { exit 10 } } catch {}; exit 20" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$port=[int]$env:_PORT; try { $h=Invoke-WebRequest -Uri ('http://127.0.0.1:{0}/health' -f $port) -UseBasicParsing -TimeoutSec 2; $d=Invoke-WebRequest -Uri ('http://127.0.0.1:{0}/dashboard' -f $port) -UseBasicParsing -TimeoutSec 2; if ($h.StatusCode -eq 200 -and $h.Content -match '\"ok\"\s*:\s*true' -and $d.StatusCode -eq 200) { exit 10 } } catch {}; exit 20" >nul 2>&1
 if %ERRORLEVEL% EQU 10 (
     echo [OK] Proxy already running on http://127.0.0.1:%_PORT%
     echo      Reuse this instance, or stop it before launching a fresh one.
     set "PORT_ALREADY_RUNNING=1"
     exit /b 0
 )
-echo [ERROR] Port %_PORT% is already in use by a non-proxy or unhealthy process.
+echo [ERROR] Port %_PORT% is already in use by a non-dashboard or unhealthy process.
 echo         Kill the previous instance, or change the port, then retry.
 echo         Tip: from project root, run clean.bat --stop-proxy to stop known proxy listeners.
 echo         Owning PIDs:
