@@ -1029,6 +1029,13 @@ def _chat_stream_events(
         yield _openai_sse(None, "[DONE]").encode("utf-8")
         return
 
+    # If the upstream never streamed reasoning chunks but returned reasoning_content
+    # in the final coalesced result (non-stream fallback), emit it now so clients
+    # don't see an empty reasoning field even though upstream produced real content.
+    final_reasoning = result.get("reasoning_content", "") or ""
+    if final_reasoning and streamed_reasoning_chunks == 0:
+        yield from _emit_reasoning_delta(final_reasoning)
+
     if has_tools:
         if raw_stream_chunks == 0 and result.get("content"):
             xml_buffer += str(result.get("content") or "")
@@ -1040,6 +1047,13 @@ def _chat_stream_events(
         })
         for tool_call in native_tool_calls:
             yield from _emit_tool_call_delta(tool_call)
+    else:
+        # Same fallback as _responses_stream_events: if upstream returned no
+        # incremental text chunks but has final content, flush it here instead
+        # of silently emitting a blank assistant turn.
+        final_content = result.get("content", "") or ""
+        if final_content and streamed_text_chunks == 0:
+            yield from _emit_text_delta(final_content)
 
     _trace_hermes(
         "chat_stream_final "
