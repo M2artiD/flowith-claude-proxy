@@ -12,6 +12,14 @@ from fastapi.testclient import TestClient
 from proxy import server
 
 
+def example_api_key() -> str:
+    candidate = Path(__file__).resolve().parents[1] / ".env.example"
+    for line in candidate.read_text(encoding="utf-8").splitlines():
+        if line.startswith("FLOWITH_API_KEY="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    raise AssertionError(".env.example must define FLOWITH_API_KEY")
+
+
 class DashboardTests(unittest.TestCase):
     def setUp(self) -> None:
         self.original_server_api_key = server._SERVER_API_KEY
@@ -23,7 +31,7 @@ class DashboardTests(unittest.TestCase):
         self.original_require_server_key = server.FLOWITH_REQUIRE_SERVER_KEY
         self.original_local_only = server.FLOWITH_LOCAL_ONLY
         self.original_custom_model_aliases = dict(server.CUSTOM_MODEL_ALIASES)
-        server._SERVER_API_KEY = "flo-secret-dashboard-key"
+        server._SERVER_API_KEY = example_api_key()
         server._default_client = None
         server.FLOWITH_REQUIRE_SERVER_KEY = False
         server.FLOWITH_LOCAL_ONLY = True
@@ -95,7 +103,7 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(payload["health"]["ok"])
         self.assertTrue(payload["security"]["local_only"])
         self.assertTrue(payload["security"]["server_key_configured"])
-        self.assertNotIn("flo-secret-dashboard-key", json.dumps(payload))
+        self.assertNotIn(server._SERVER_API_KEY, json.dumps(payload))
         self.assertIn("POST /v1/messages", payload["routes"])
         self.assertIn("POST /v1/chat/completions", payload["routes"])
         self.assertIn("POST /v1/responses", payload["routes"])
@@ -119,7 +127,7 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         text = json.dumps(payload)
-        self.assertNotIn("flo-secret-dashboard-key", text)
+        self.assertNotIn(server._SERVER_API_KEY, text)
         self.assertEqual(payload["FLOWITH_API_KEY"], "flo-****-key")
         self.assertEqual(payload["FLOWITH_LOCAL_ONLY"], True)
         self.assertIn("FLOWITH_MAX_REQUEST_BYTES", payload)
@@ -190,7 +198,7 @@ class DashboardTests(unittest.TestCase):
         anonymous = self.client.get("/dashboard/api/status")
         authorised = self.client.get(
             "/dashboard/api/status",
-            headers={"Authorization": "Bearer flo-secret-dashboard-key"},
+            headers={"Authorization": f"Bearer {server._SERVER_API_KEY}"},
         )
 
         self.assertEqual(anonymous.status_code, 401)

@@ -51,3 +51,7 @@ output_*.py
 output_*.txt
 output_*.json
 output_*.env
+
+# Local Codex artifacts
+.codex/skills/
+memory/

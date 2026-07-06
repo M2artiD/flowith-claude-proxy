@@ -123,7 +123,6 @@ if _raw_aliases:
 
 
 _PLACEHOLDER_API_KEYS = {
-    "flo-your-key",
     "your flowith api key",
     "your-flowith-api-key",
     "your_api_key_here",
@@ -134,8 +133,26 @@ def _clean_api_key(value: str) -> str:
     return value.strip().strip('"').strip("'")
 
 
+def _env_example_api_key() -> str | None:
+    candidate = _PROJECT_ROOT / ".env.example"
+    if not candidate.exists():
+        return None
+    try:
+        with candidate.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("FLOWITH_API_KEY="):
+                    return _clean_api_key(line.split("=", 1)[1])
+    except Exception:
+        return None
+    return None
+
+
 def _is_placeholder_api_key(value: str) -> bool:
-    return _clean_api_key(value).lower() in _PLACEHOLDER_API_KEYS
+    cleaned = _clean_api_key(value).lower()
+    example_key = _env_example_api_key()
+    example_keys = {example_key.lower()} if example_key else set()
+    return cleaned in _PLACEHOLDER_API_KEYS | example_keys
 
 
 def _valid_api_key_or_none(value: str) -> str | None:

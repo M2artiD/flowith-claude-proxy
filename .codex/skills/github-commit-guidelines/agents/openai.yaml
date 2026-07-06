@@ -1,7 +1,0 @@
-interface:
-  display_name: "GitHub Commit Guidelines"
-  short_description: "Commit safely without unrelated files"
-  default_prompt: "Use $github-commit-guidelines to prepare a safe, verified commit."
-
-policy:
-  allow_implicit_invocation: true

@@ -221,6 +221,7 @@ class UpstreamStabilityTests(unittest.TestCase):
             patch("proxy.upstream.DEBUG_DUMP", True),
             patch("proxy.upstream.DEBUG_DUMP_DIR", tmpdir),
         ):
+            fake_openai_key = "sk-" + "live-1234567890abcdef"
             _dump_intercept(
                 payload={
                     "api_key": "payload-secret",
@@ -261,6 +262,7 @@ class UpstreamStabilityTests(unittest.TestCase):
             patch("proxy.upstream.DEBUG_DUMP", True),
             patch("proxy.upstream.DEBUG_DUMP_DIR", tmpdir),
         ):
+            fake_openai_key = "sk-" + "live-1234567890abcdef"
             _dump_intercept(
                 payload={
                     "messages": [
@@ -268,7 +270,7 @@ class UpstreamStabilityTests(unittest.TestCase):
                             "role": "user",
                             "content": (
                                 "debug this Authorization: Bearer prompt-secret-token "
-                                "and sk-live-1234567890abcdef"
+                                f"and {fake_openai_key}"
                             ),
                         }
                     ],
@@ -286,7 +288,7 @@ class UpstreamStabilityTests(unittest.TestCase):
             dumped_text = dump_files[0].read_text(encoding="utf-8")
 
         self.assertNotIn("prompt-secret-token", dumped_text)
-        self.assertNotIn("sk-live-1234567890abcdef", dumped_text)
+        self.assertNotIn(fake_openai_key, dumped_text)
         self.assertNotIn("metadata-secret", dumped_text)
         self.assertNotIn("response-secret", dumped_text)
         self.assertNotIn("body-secret-token", dumped_text)

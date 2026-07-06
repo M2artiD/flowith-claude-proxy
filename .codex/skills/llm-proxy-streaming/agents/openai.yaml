@@ -1,4 +1,0 @@
-interface:
-  display_name: "LLM Proxy Streaming"
-  short_description: "Debug streaming truncation in LLM proxy adapters."
-  default_prompt: "Use this skill to debug and fix streaming chunk truncation in an LLM proxy."

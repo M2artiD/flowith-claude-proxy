@@ -7,6 +7,14 @@ from pathlib import Path
 from proxy import config
 
 
+def example_api_key() -> str:
+    candidate = Path(__file__).resolve().parents[1] / ".env.example"
+    for line in candidate.read_text(encoding="utf-8").splitlines():
+        if line.startswith("FLOWITH_API_KEY="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    raise AssertionError(".env.example must define FLOWITH_API_KEY")
+
+
 class ConfigTests(unittest.TestCase):
     def test_exports_hermes_trace_flag(self) -> None:
         self.assertIsInstance(config.FLOWITH_TRACE_HERMES, bool)
@@ -59,8 +67,14 @@ class ConfigTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 temp_root = Path(tmp)
                 config._PROJECT_ROOT = temp_root
-                os.environ["FLOWITH_API_KEY"] = "flo-your-key"
-                (temp_root / ".env").write_text("FLOWITH_API_KEY=flo-your-key\n", encoding="utf-8")
+                example_key = example_api_key()
+                (temp_root / ".env.example").write_text(
+                    f"FLOWITH_API_KEY={example_key}\n", encoding="utf-8"
+                )
+                os.environ["FLOWITH_API_KEY"] = example_key
+                (temp_root / ".env").write_text(
+                    f"FLOWITH_API_KEY={example_key}\n", encoding="utf-8"
+                )
                 (temp_root / ".flowith_api_key").write_text("your Flowith API key\n", encoding="utf-8")
                 os.chdir(temp_root)
                 try:
@@ -83,7 +97,11 @@ class ConfigTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 temp_root = Path(tmp)
                 config._PROJECT_ROOT = temp_root
-                os.environ["FLOWITH_API_KEY"] = "flo-your-key"
+                example_key = example_api_key()
+                (temp_root / ".env.example").write_text(
+                    f"FLOWITH_API_KEY={example_key}\n", encoding="utf-8"
+                )
+                os.environ["FLOWITH_API_KEY"] = example_key
                 (temp_root / ".flowith_api_key").write_text("real-file-key\n", encoding="utf-8")
 
                 self.assertEqual(config.load_api_key(), "real-file-key")

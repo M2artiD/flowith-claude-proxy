@@ -1,7 +1,0 @@
-interface:
-  display_name: "Hermes Proxy Compatibility"
-  short_description: "Validate Hermes OpenAI-compatible proxy behavior"
-  default_prompt: "Use $hermes-proxy-compat to run Hermes proxy smoke checks."
-
-policy:
-  allow_implicit_invocation: true
