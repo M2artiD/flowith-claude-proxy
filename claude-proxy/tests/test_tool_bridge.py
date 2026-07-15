@@ -3,13 +3,17 @@ import os
 from contextlib import redirect_stdout
 from io import StringIO
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from proxy import server
 from proxy.adapter import (
+    build_tool_xml_prompt,
     claude_request_to_flowith_messages,
+    find_xml_tool_call_start,
     flowith_result_to_claude_response,
+    has_xml_tool_call_marker,
     parse_xml_tool_calls,
 )
 
@@ -32,6 +36,68 @@ class FakeFlowithClient:
 
 
 class ToolBridgeTests(unittest.TestCase):
+    def test_parse_tool_call_repairs_singular_parameters_close(self) -> None:
+        text = (
+            "<tool_call>\n"
+            "<name>shell_command</name>\n"
+            "<parameters>\n"
+            '{"command":"Get-Location"}\n'
+            "</parameter>\n"
+            "</tool_call>"
+        )
+
+        tools = parse_xml_tool_calls(text)
+
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["name"], "shell_command")
+        self.assertEqual(tools[0]["input"], {"command": "Get-Location"})
+
+    def test_tool_prompt_requires_explicitly_requested_actions(self) -> None:
+        prompt = build_tool_xml_prompt([
+            {
+                "name": "shell_command",
+                "description": "Run a shell command.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            }
+        ])
+
+        self.assertIn("explicitly asks you to use a tool", prompt)
+        self.assertIn("Do not claim that you cannot access or execute", prompt)
+        self.assertTrue(prompt.endswith("tool observation reports the failure."))
+        example_prefix = prompt.split("<tool_call>", 2)[1]
+        self.assertNotIn("I need to", example_prefix)
+
+    def test_tool_prompt_forbids_avoiding_visible_app_actions(self) -> None:
+        prompt = build_tool_xml_prompt([
+            {
+                "name": "shell_command",
+                "description": "Run a shell command.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            }
+        ])
+
+        self.assertIn("CMD, PowerShell, a terminal, browser, window, GUI application, or process", prompt)
+        self.assertIn("launch it visibly", prompt)
+        self.assertIn("Do not evade tool use", prompt)
+        self.assertIn("tell the user to perform the action manually", prompt)
+        self.assertIn("Creating or writing a file at a user-requested path", prompt)
+        self.assertIn("Never say that an action is starting, in progress, or complete", prompt)
+        self.assertIn("until an <observation> confirms it", prompt)
+        self.assertIn("Never promise to call a tool later", prompt)
+        self.assertIn("one concise user-visible action note", prompt)
+        self.assertIn("exact command", prompt)
+        self.assertIn("not hidden chain-of-thought", prompt)
+        self.assertIn("must not include a result, success/failure claim, or final answer", prompt)
+        self.assertIn("greetings, casual conversation, or explanation-only questions", prompt)
+
     def setUp(self) -> None:
         self.original_server_api_key = server._SERVER_API_KEY
         self.original_default_client = server._default_client
@@ -438,6 +504,16 @@ class ToolBridgeTests(unittest.TestCase):
         self.assertEqual(tool_calls[0]["name"], "Bash")
         self.assertEqual(tool_calls[0]["input"], {"command": "ls"})
 
+    def test_prose_mentioning_tag_names_in_backticks_is_not_a_tool_call(self) -> None:
+        text = (
+            "No raw XML tags (`<tool_call>`, `<function_calls>`, "
+            "`<parameter>`, CDATA markers) leaked into visible text output."
+        )
+
+        self.assertFalse(has_xml_tool_call_marker(text))
+        self.assertEqual(find_xml_tool_call_start(text), -1)
+        self.assertEqual(parse_xml_tool_calls(text), [])
+
     def test_streaming_partial_tool_call_emits_only_tool_use(self) -> None:
         class StreamingFakeFlowithClient:
             def call_api(self, messages, **kwargs):
@@ -550,6 +626,112 @@ class ToolBridgeTests(unittest.TestCase):
         self.assertNotIn("Upstream stream ended without content", events)
         self.assertIn('"stop_reason": "end_turn"', events)
         self.assertIn('"type": "message_stop"', events)
+
+    def test_streaming_exhausted_empty_response_finishes_with_retry_message(self) -> None:
+        class EmptyStreamingFakeFlowithClient:
+            def call_api(self, messages, **kwargs):
+                return {
+                    "success": False,
+                    "empty_response": True,
+                    "error": "Upstream returned no content after the bounded retry budget.",
+                }
+
+        events = b"".join(
+            server._stream_claude_events(
+                EmptyStreamingFakeFlowithClient(),
+                messages=[{"role": "user", "content": "use a tool"}],
+                requested_model="claude-fable-5",
+                has_tools=True,
+            )
+        ).decode("utf-8")
+
+        self.assertNotIn('"type": "error"', events)
+        self.assertIn("upstream returned no content", events)
+        self.assertIn('"stop_reason": "end_turn"', events)
+        self.assertIn('"type": "message_stop"', events)
+
+    def test_streaming_empty_long_context_retries_with_recent_messages(self) -> None:
+        class ContextFallbackClient:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def call_api(self, messages, **kwargs):
+                self.calls.append(messages)
+                if len(self.calls) == 1:
+                    return {
+                        "success": False,
+                        "empty_response": True,
+                        "error": "Upstream returned no content after the bounded retry budget.",
+                    }
+                kwargs["on_chunk"](
+                    '<tool_call>\n<name>get_weather</name>\n'
+                    '<parameters>{"city":"Shanghai"}</parameters>\n</tool_call>'
+                )
+                return {"success": True, "content": "", "usage": {}, "finish_reason": "stop"}
+
+        client = ContextFallbackClient()
+        messages = [
+            {"role": "system", "content": "tool instructions"},
+            {"role": "user", "content": "old history " * 20},
+            {"role": "assistant", "content": "old answer " * 20},
+            {"role": "user", "content": "Use get_weather for Shanghai."},
+        ]
+
+        with patch.object(server, "FLOWITH_EMPTY_CONTEXT_FALLBACK_CHARS", 120, create=True):
+            events = b"".join(
+                server._stream_claude_events(
+                    client,
+                    messages=messages,
+                    requested_model="claude-fable-5",
+                    has_tools=True,
+                )
+            ).decode("utf-8")
+
+        self.assertEqual(len(client.calls), 2)
+        retried_messages = client.calls[1]
+        self.assertEqual(retried_messages[0]["role"], "system")
+        self.assertIn("Shanghai", retried_messages[-1]["content"])
+        self.assertNotIn("old history", "\n".join(m["content"] for m in retried_messages))
+        self.assertIn('"type": "tool_use"', events)
+        self.assertIn('"stop_reason": "tool_use"', events)
+
+    def test_fable_long_context_is_compacted_before_the_first_upstream_call(self) -> None:
+        class CapturingClient:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def call_api(self, messages, **kwargs):
+                self.calls.append(messages)
+                kwargs["on_chunk"](
+                    '<tool_call>\n<name>get_weather</name>\n'
+                    '<parameters>{"city":"Shanghai"}</parameters>\n</tool_call>'
+                )
+                return {"success": True, "content": "", "usage": {}, "finish_reason": "stop"}
+
+        client = CapturingClient()
+        messages = [
+            {"role": "system", "content": "tool instructions"},
+            {"role": "user", "content": "old history " * 20},
+            {"role": "assistant", "content": "old answer " * 20},
+            {"role": "user", "content": "Use get_weather for Shanghai."},
+        ]
+
+        with patch.object(server, "FLOWITH_FABLE_CONTEXT_COMPACT_CHARS", 120, create=True):
+            events = b"".join(
+                server._stream_claude_events(
+                    client,
+                    messages=messages,
+                    requested_model="claude-fable-5",
+                    upstream_model="claude-fable-5",
+                    has_tools=True,
+                )
+            ).decode("utf-8")
+
+        self.assertEqual(len(client.calls), 1)
+        sent_messages = client.calls[0]
+        self.assertIn("Shanghai", sent_messages[-1]["content"])
+        self.assertNotIn("old history", "\n".join(m["content"] for m in sent_messages))
+        self.assertIn('"type": "tool_use"', events)
 
     def test_streaming_with_tools_preserves_plain_text_before_and_after_xml_tool_call(self) -> None:
         class StreamingFakeFlowithClient:

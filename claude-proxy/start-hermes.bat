@@ -12,6 +12,7 @@ if %ERRORLEVEL% NEQ 0 (
 if not defined FLOWITH_API_PROFILE set "FLOWITH_API_PROFILE=codex"
 if not defined FLOWITH_API_PORT set "FLOWITH_API_PORT=8789"
 if not defined FLOWITH_TOOL_MODE set "FLOWITH_TOOL_MODE=xml"
+if not defined FLOWITH_RESPONSES_COMPACT_FINAL_TEXT set "FLOWITH_RESPONSES_COMPACT_FINAL_TEXT=true"
 if not defined FLOWITH_OPEN_DASHBOARD if exist .env (
     for /f "usebackq tokens=1,* delims==" %%A in (`findstr /b /i "FLOWITH_OPEN_DASHBOARD=" .env 2^>nul`) do set "FLOWITH_OPEN_DASHBOARD=%%B"
 )

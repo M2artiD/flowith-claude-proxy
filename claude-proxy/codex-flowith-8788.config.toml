@@ -1,0 +1,11 @@
+model_provider = "flowith8788"
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
+model_catalog_json = 'C:\Users\qiyan\Desktop\flowith-claude-proxy\claude-proxy\codex-5.6-model-catalog.json'
+
+[model_providers.flowith8788]
+name = "Flowith 8788"
+base_url = "http://127.0.0.1:8788/v1"
+wire_api = "responses"
+env_key = "FLOWITH_API_KEY"
+requires_openai_auth = false

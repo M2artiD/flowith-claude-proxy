@@ -100,6 +100,36 @@ Base URL: http://127.0.0.1:8788/v1
 Model: claude-4.6-sonnet
 ```
 
+Codex 0.144.x needs model metadata before it attaches local tools to custom
+GPT-5.6 model names. Copy `claude-proxy\codex-flowith-8788.config.toml` to
+`%USERPROFILE%\.codex\flowith-8788.config.toml`, then launch Codex with the
+independent profile:
+
+```powershell
+codex -p flowith-8788
+```
+
+The profile keeps the normal Codex configuration unchanged, selects the real
+`gpt-5.6-sol` name, and loads `codex-5.6-model-catalog.json` so Codex includes
+terminal and function tools in Responses requests. `gpt-5.4-flowith-5.6`
+remains available only as a compatibility fallback for clients that cannot
+load a model catalog.
+
+For Codex Desktop, use the existing Codex `flowith` provider in CC Switch and
+then fully quit and reopen Codex Desktop. The Desktop app does not use the CLI
+`-p flowith-8788` invocation and an already-running app does not reload a newly
+selected provider. Switching CC Switch to `flowith` changes only the active
+Codex selection; it does not modify the saved `botcf` provider, which can be
+selected again later. Start a new task with `gpt-5.6-sol` after reopening.
+
+For GPT-5.6 tool calls, the proxy emits one concise user-visible action note
+before the function call. The note includes the operational reason, tool name,
+and exact command or concrete action, but never an unverified result. After the
+real tool observation, Codex displays the verified outcome or continues with
+the next tool. Greetings, casual conversation, and explanation-only questions
+answer normally without a forced tool call. Explicit terminal, file, browser,
+GUI, build, test, or other action requests still require a real tool call.
+
 PowerShell example:
 
 ```powershell
@@ -175,7 +205,7 @@ FLOWITH_LOCAL_ONLY=true
 FLOWITH_REQUIRE_SERVER_KEY=false
 FLOWITH_OPEN_DASHBOARD=true
 FLOWITH_TOOL_MODE=xml
-FLOWITH_MODEL_ALIASES={"claude-4.6-sonnet":"claude-4.6-sonnet","claude-opus-4.7":"claude-opus-4.7","claude-opus-4.8":"claude-opus-4.8","claude-haiku-4-5":"claude-haiku-4-5","claude-fable-5":"claude-fable-5","gpt-5.5":"gpt-5.5","gpt-5.4":"gpt-5.4","gpt-4.1":"gpt-4.1","gemini-2.5-pro":"gemini-2.5-pro","deepseek-chat":"deepseek-chat"}
+FLOWITH_MODEL_ALIASES={"claude-4.6-sonnet":"claude-4.6-sonnet","claude-opus-4.7":"claude-opus-4.7","claude-opus-4.8":"claude-opus-4.8","claude-haiku-4-5":"claude-haiku-4-5","claude-fable-5":"claude-fable-5","gpt-5.5":"gpt-5.5","gpt-5.4":"gpt-5.4","gpt-5.4-flowith-5.6":"gpt-5.6-sol","gpt-4.1":"gpt-4.1","gemini-2.5-pro":"gemini-2.5-pro","deepseek-chat":"deepseek-chat"}
 FLOWITH_DEBUG_DUMP=false
 ```
 

@@ -1,0 +1,133 @@
+{
+  "models": [
+    {
+      "additional_speed_tiers": [],
+      "availability_nux": null,
+      "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
+      "context_window": 128000,
+      "default_reasoning_level": "high",
+      "default_reasoning_summary": "none",
+      "description": "Flowith GPT-5.6 Sol",
+      "display_name": "gpt-5.6-sol",
+      "effective_context_window_percent": 95,
+      "experimental_supported_tools": [],
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "max_context_window": 128000,
+      "priority": 1000,
+      "service_tiers": [],
+      "shell_type": "shell_command",
+      "slug": "gpt-5.6-sol",
+      "support_verbosity": false,
+      "supported_in_api": true,
+      "supported_reasoning_levels": [
+        {
+          "description": "Disable Thinking",
+          "effort": "none"
+        },
+        {
+          "description": "Enabled Thinking",
+          "effort": "high"
+        }
+      ],
+      "supports_image_detail_original": false,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": true,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "limit": 10000,
+        "mode": "bytes"
+      },
+      "upgrade": null,
+      "visibility": "list"
+    },
+    {
+      "additional_speed_tiers": [],
+      "availability_nux": null,
+      "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
+      "context_window": 128000,
+      "default_reasoning_level": "high",
+      "default_reasoning_summary": "none",
+      "description": "Flowith GPT-5.6 Terra",
+      "display_name": "gpt-5.6-terra",
+      "effective_context_window_percent": 95,
+      "experimental_supported_tools": [],
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "max_context_window": 128000,
+      "priority": 999,
+      "service_tiers": [],
+      "shell_type": "shell_command",
+      "slug": "gpt-5.6-terra",
+      "support_verbosity": false,
+      "supported_in_api": true,
+      "supported_reasoning_levels": [
+        {
+          "description": "Disable Thinking",
+          "effort": "none"
+        },
+        {
+          "description": "Enabled Thinking",
+          "effort": "high"
+        }
+      ],
+      "supports_image_detail_original": false,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": true,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "limit": 10000,
+        "mode": "bytes"
+      },
+      "upgrade": null,
+      "visibility": "list"
+    },
+    {
+      "additional_speed_tiers": [],
+      "availability_nux": null,
+      "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
+      "context_window": 128000,
+      "default_reasoning_level": "high",
+      "default_reasoning_summary": "none",
+      "description": "Flowith GPT-5.6 Luna",
+      "display_name": "gpt-5.6-luna",
+      "effective_context_window_percent": 95,
+      "experimental_supported_tools": [],
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "max_context_window": 128000,
+      "priority": 998,
+      "service_tiers": [],
+      "shell_type": "shell_command",
+      "slug": "gpt-5.6-luna",
+      "support_verbosity": false,
+      "supported_in_api": true,
+      "supported_reasoning_levels": [
+        {
+          "description": "Disable Thinking",
+          "effort": "none"
+        },
+        {
+          "description": "Enabled Thinking",
+          "effort": "high"
+        }
+      ],
+      "supports_image_detail_original": false,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": true,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "limit": 10000,
+        "mode": "bytes"
+      },
+      "upgrade": null,
+      "visibility": "list"
+    }
+  ]
+}

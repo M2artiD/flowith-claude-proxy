@@ -1,4 +1,5 @@
 import json
+import time
 import threading
 import tempfile
 import unittest
@@ -65,6 +66,30 @@ class BlockingStreamResponse(FakeStreamResponse):
     def close(self):
         self.closed = True
         self.close_event.set()
+
+
+class IdleStreamResponse:
+    """A dead stream: delivers zero content and blocks until the watchdog
+    closes the socket, mirroring a hung upstream that never sends a byte."""
+
+    status_code = 200
+    headers = {}
+    text = ""
+
+    def __init__(self):
+        self.closed = False
+        self._closed_event = threading.Event()
+
+    def iter_lines(self, decode_unicode=False):
+        # Block as if waiting for bytes that never arrive; the watchdog aborts us
+        # by calling close(), which unblocks the wait and ends the (empty) stream.
+        self._closed_event.wait(timeout=5)
+        return
+        yield  # pragma: no cover - makes this a generator that yields nothing
+
+    def close(self):
+        self.closed = True
+        self._closed_event.set()
 
 
 class FakeSession:
@@ -332,6 +357,57 @@ class UpstreamStabilityTests(unittest.TestCase):
         self.assertLessEqual(len(dump["request"]["payload"]["messages"][0]["content"]), 80)
         self.assertIn("[truncated", dump["request"]["payload"]["messages"][0]["content"])
 
+    def test_debug_dump_write_failure_is_swallowed(self):
+        from proxy.upstream import _dump_intercept
+
+        with (
+            patch("proxy.upstream.DEBUG_DUMP", True),
+            patch("proxy.upstream.Path.mkdir", side_effect=OSError("disk unavailable")),
+        ):
+            _dump_intercept(
+                payload={"messages": [{"role": "user", "content": "ping"}]},
+                response_status=200,
+                response_headers={"Content-Type": "application/json"},
+                response_body='{"ok": true}',
+                is_stream=False,
+                upstream_model="claude-test",
+            )
+
+    def test_debug_dump_concurrent_prune_does_not_raise(self):
+        from proxy.upstream import _dump_intercept
+
+        errors = []
+
+        def _dump(i):
+            try:
+                _dump_intercept(
+                    payload={"messages": [{"role": "user", "content": f"msg-{i}"}]},
+                    response_status=200,
+                    response_headers={"Content-Type": "application/json"},
+                    response_body=f"body-{i}",
+                    is_stream=False,
+                    upstream_model="claude-test",
+                )
+            except Exception as e:  # pragma: no cover - failure path under test
+                errors.append(e)
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("proxy.upstream.DEBUG_DUMP", True),
+            patch("proxy.upstream.DEBUG_DUMP_DIR", tmpdir),
+            patch("proxy.upstream.DEBUG_DUMP_MAX_FILES", 3),
+        ):
+            threads = [threading.Thread(target=_dump, args=(i,)) for i in range(20)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+
+            dump_files = list(Path(tmpdir).glob("flowith_*.json"))
+
+        self.assertEqual(errors, [])
+        self.assertLessEqual(len(dump_files), 3)
+
     def test_http_error_response_does_not_expose_upstream_body_details(self):
         outcomes = [
             FakeHTTPErrorResponse(
@@ -580,6 +656,47 @@ class UpstreamStabilityTests(unittest.TestCase):
         self.assertEqual(len(sessions), 2)
         self.assertEqual(sleep_mock.call_count, 1)
 
+    def test_nonstreaming_empty_response_is_retried_before_returning_success(self):
+        class EmptyResponse(FakeResponse):
+            text = '{"model":"ok","choices":[{"message":{"content":""},"finish_reason":"stop"}],"usage":{}}'
+
+            def json(self):
+                return {
+                    "model": "ok",
+                    "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
+                    "usage": {},
+                }
+
+        outcomes = [EmptyResponse(), FakeResponse()]
+        sessions = []
+
+        def make_session():
+            session = FakeSession(outcomes)
+            sessions.append(session)
+            return session
+
+        with (
+            patch.object(requests, "Session", side_effect=make_session),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 2),
+            patch("proxy.upstream.time.sleep") as sleep_mock,
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api(
+                [{"role": "user", "content": "ping"}],
+                stream=False,
+                max_retries=1,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["content"], "pong")
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual(sleep_mock.call_count, 1)
+
 
     def test_streaming_error_chunk_returns_failure_not_success(self):
         error_stream = FakeStreamResponse([
@@ -613,6 +730,36 @@ class UpstreamStabilityTests(unittest.TestCase):
 
         self.assertFalse(result["success"])
         self.assertIn("provider overloaded", result["error"])
+
+    def test_streaming_partial_stream_without_terminal_event_is_failure(self):
+        partial_stream = FakeStreamResponse([
+            'data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}',
+        ])
+        chunks = []
+
+        with (
+            patch.object(requests, "Session", return_value=FakeSession([partial_stream])),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 1),
+            patch("proxy.upstream.FLOWITH_SSL_RETRY_EXTRA", 0),
+            patch("proxy.upstream.time.sleep"),
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api(
+                [{"role": "user", "content": "ping"}],
+                stream=True,
+                on_chunk=chunks.append,
+                max_retries=1,
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["content"], "partial")
+        self.assertIn("ended before completion", result["error"])
+        self.assertEqual(chunks, ["partial"])
 
     def test_streaming_debug_body_is_not_accumulated_when_debug_dump_is_disabled(self):
         stream = FakeStreamResponse([
@@ -678,6 +825,38 @@ class UpstreamStabilityTests(unittest.TestCase):
         self.assertEqual(result["content"], long_piece)
         self.assertLessEqual(len(captured["response_body"].encode("utf-8")), 96)
         self.assertIn("[truncated", captured["response_body"])
+
+    def test_streaming_success_is_not_delayed_by_slow_debug_dump(self):
+        stream = FakeStreamResponse([
+            'data: {"choices":[{"index":0,"delta":{"content":"pong"},"finish_reason":null}]}',
+            'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ])
+
+        def slow_dump(**kwargs):
+            threading.Event().wait(0.2)
+
+        with (
+            patch.object(requests, "Session", return_value=FakeSession([stream])),
+            patch("proxy.upstream.DEBUG_DUMP", True),
+            patch("proxy.upstream._dump_intercept", side_effect=slow_dump),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 1),
+            patch("proxy.upstream.FLOWITH_SSL_RETRY_EXTRA", 0),
+            patch("proxy.upstream.time.sleep"),
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            start = time.perf_counter()
+            result = client.call_api([{"role": "user", "content": "ping"}], stream=True)
+            elapsed = time.perf_counter() - start
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["content"], "pong")
+        self.assertLess(elapsed, 0.1)
 
     def test_streaming_success_closes_upstream_response(self):
         stream = FakeStreamResponse([
@@ -758,6 +937,146 @@ class UpstreamStabilityTests(unittest.TestCase):
         self.assertTrue(stream.closed)
         self.assertFalse(result_holder["result"]["success"])
         self.assertIn("cancelled", result_holder["result"]["error"])
+
+
+    def test_streaming_idle_stream_is_aborted_by_watchdog_and_retried_as_empty(self):
+        # First stream hangs with no content -> watchdog aborts on the idle
+        # timeout. That must be treated as an empty stream (fast bounded retry),
+        # not a generic error, and the retry should then succeed.
+        idle_stream = IdleStreamResponse()
+        good_stream = FakeStreamResponse([
+            'data: {"choices":[{"index":0,"delta":{"content":"pong"},"finish_reason":null}]}',
+            'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ])
+        outcomes = [idle_stream, good_stream]
+        sessions = []
+        chunks = []
+
+        def make_session():
+            session = FakeSession(outcomes)
+            sessions.append(session)
+            return session
+
+        with (
+            patch.object(requests, "Session", side_effect=make_session),
+            patch("proxy.upstream.FLOWITH_STREAM_IDLE_TIMEOUT", 0.2),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 2),
+            patch("proxy.upstream.time.sleep") as sleep_mock,
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api(
+                [{"role": "user", "content": "ping"}],
+                stream=True,
+                on_chunk=chunks.append,
+                max_retries=1,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["content"], "pong")
+        self.assertEqual(chunks, ["pong"])
+        self.assertTrue(idle_stream.closed)
+        self.assertEqual(len(sessions), 2)
+        # Routed through the empty-stream path: exactly one fast empty-retry delay,
+        # not the generic exponential-backoff schedule.
+        self.assertEqual(sleep_mock.call_count, 1)
+
+    def test_idle_timeout_does_not_repeat_the_generic_retry_budget(self):
+        idle_stream = IdleStreamResponse()
+        good_stream = FakeStreamResponse([
+            'data: {"choices":[{"index":0,"delta":{"content":"late"},"finish_reason":null}]}',
+            'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ])
+        outcomes = [idle_stream, good_stream]
+        sessions = []
+
+        def make_session():
+            session = FakeSession(outcomes)
+            sessions.append(session)
+            return session
+
+        with (
+            patch.object(requests, "Session", side_effect=make_session),
+            patch("proxy.upstream.FLOWITH_STREAM_IDLE_TIMEOUT", 0.2),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 2),
+            patch("proxy.upstream.FLOWITH_EMPTY_RETRY_WINDOW", 0),
+            patch("proxy.upstream.FLOWITH_EMPTY_RETRY_TOTAL", 0),
+            patch("proxy.upstream.time.sleep"),
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api(
+                [{"role": "user", "content": "ping"}],
+                stream=True,
+                max_retries=1,
+            )
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["empty_response"])
+        self.assertEqual(sum(len(session.calls) for session in sessions), 1)
+
+    def test_streaming_healthy_stream_is_not_killed_by_idle_watchdog(self):
+        # A stream that keeps delivering content must never trip the watchdog,
+        # even with a very short idle timeout, because each delta refreshes the
+        # activity clock.
+        class SlowButAliveStream:
+            status_code = 200
+            headers = {}
+            text = ""
+
+            def __init__(self, pieces):
+                self.pieces = pieces
+                self.closed = False
+
+            def iter_lines(self, decode_unicode=False):
+                for piece in self.pieces:
+                    time.sleep(0.05)
+                    yield (
+                        'data: {"choices":[{"index":0,"delta":'
+                        f'{{"content":"{piece}"}},"finish_reason":null}}]}}'
+                    )
+                yield 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}'
+                yield "data: [DONE]"
+
+            def close(self):
+                self.closed = True
+
+        alive_stream = SlowButAliveStream(["a", "b", "c", "d"])
+        chunks = []
+
+        with (
+            patch.object(requests, "Session", return_value=FakeSession([alive_stream])),
+            patch("proxy.upstream.FLOWITH_STREAM_IDLE_TIMEOUT", 0.2),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 1),
+            patch("proxy.upstream.FLOWITH_SSL_RETRY_EXTRA", 0),
+            patch("proxy.upstream.time.sleep"),
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-test",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api(
+                [{"role": "user", "content": "ping"}],
+                stream=True,
+                on_chunk=chunks.append,
+                max_retries=1,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["content"], "abcd")
+        self.assertEqual(chunks, ["a", "b", "c", "d"])
 
 
 if __name__ == "__main__":

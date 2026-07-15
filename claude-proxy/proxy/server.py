@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import json
 import ipaddress
+import logging
 import os
 import queue
 import threading
@@ -56,6 +57,12 @@ from .config import (
     DEFAULT_PORT,
     FLOWITH_BASE_URL,
     FLOWITH_CONNECT_TIMEOUT,
+    FLOWITH_EMPTY_RETRY_DELAY,
+    FLOWITH_EMPTY_RETRY_DELAY_MAX,
+    FLOWITH_EMPTY_CONTEXT_FALLBACK_CHARS,
+    FLOWITH_EMPTY_RETRY_TOTAL,
+    FLOWITH_EMPTY_RETRY_WINDOW,
+    FLOWITH_FABLE_CONTEXT_COMPACT_CHARS,
     FLOWITH_LOCAL_ONLY,
     FLOWITH_MAX_CONCURRENCY,
     FLOWITH_MAX_REQUEST_BYTES,
@@ -68,6 +75,8 @@ from .config import (
     load_api_key,
 )
 from .upstream import FlowithClient
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Flowith Claude-Compatible Proxy",
@@ -430,6 +439,12 @@ def _dashboard_config_payload() -> dict[str, Any]:
         "FLOWITH_SEMAPHORE_TIMEOUT": FLOWITH_SEMAPHORE_TIMEOUT,
         "FLOWITH_TIMEOUT": API_TIMEOUT,
         "FLOWITH_CONNECT_TIMEOUT": FLOWITH_CONNECT_TIMEOUT,
+        "FLOWITH_EMPTY_RETRY_WINDOW": FLOWITH_EMPTY_RETRY_WINDOW,
+        "FLOWITH_EMPTY_RETRY_DELAY": FLOWITH_EMPTY_RETRY_DELAY,
+        "FLOWITH_EMPTY_RETRY_DELAY_MAX": FLOWITH_EMPTY_RETRY_DELAY_MAX,
+        "FLOWITH_EMPTY_CONTEXT_FALLBACK_CHARS": FLOWITH_EMPTY_CONTEXT_FALLBACK_CHARS,
+        "FLOWITH_FABLE_CONTEXT_COMPACT_CHARS": FLOWITH_FABLE_CONTEXT_COMPACT_CHARS,
+        "FLOWITH_EMPTY_RETRY_TOTAL": FLOWITH_EMPTY_RETRY_TOTAL,
         "FLOWITH_SSL_VERIFY": FLOWITH_SSL_VERIFY,
         "FLOWITH_TOOL_MODE": FLOWITH_TOOL_MODE,
         "FLOWITH_REQUEST_LOG": FLOWITH_REQUEST_LOG,
@@ -829,7 +844,8 @@ async def create_message(
 
     if not stream:
         result = await run_in_threadpool(
-            client.call_api,
+            _call_api_with_empty_context_fallback,
+            client,
             messages,
             model=flowith_model,
             max_retries=2,
@@ -973,9 +989,12 @@ def _extract_first_json_object(text: str) -> dict[str, Any] | None:
 def _normalise_hook_json_result(result: dict[str, Any]) -> dict[str, Any]:
     content = str(result.get("content", "") or "").strip()
     if not content:
+        # Fail-open on an empty upstream reply: a hook JSON check that cannot be
+        # evaluated must not block the stop, or Claude Code re-injects the prompt
+        # and the session spins in an infinite Stop-hook loop.
         normalised = dict(result)
         normalised["content"] = json.dumps(
-            {"ok": False, "reason": "Upstream returned empty content for the hook JSON check."},
+            {"ok": True, "reason": "Upstream returned no content for the hook JSON check; allowing stop to avoid a hook loop."},
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -1146,6 +1165,92 @@ def _with_xml_tool_stop_sequence(
     return sequences
 
 
+def _message_content_chars(messages: list[dict[str, Any]]) -> int:
+    return sum(len(str(message.get("content", "") or "")) for message in messages)
+
+
+def _recent_context_fallback_messages(
+    messages: list[dict[str, Any]],
+    limit: int | None = None,
+) -> list[dict[str, Any]] | None:
+    if limit is None:
+        limit = FLOWITH_EMPTY_CONTEXT_FALLBACK_CHARS
+    if limit <= 0 or _message_content_chars(messages) <= limit:
+        return None
+
+    system_messages = [message for message in messages if message.get("role") == "system"]
+    system_chars = _message_content_chars(system_messages)
+    if system_chars >= limit:
+        return None
+
+    recent_messages: list[dict[str, Any]] = []
+    used_chars = system_chars
+    for message in reversed(messages):
+        if message.get("role") == "system":
+            continue
+        message_chars = len(str(message.get("content", "") or ""))
+        if used_chars + message_chars > limit:
+            continue
+        recent_messages.append(message)
+        used_chars += message_chars
+
+    if not recent_messages:
+        return None
+    fallback = system_messages + list(reversed(recent_messages))
+    if len(fallback) == len(messages):
+        return None
+    return fallback
+
+
+def _is_fable_model(client: FlowithClient, requested_model: Any) -> bool:
+    model = requested_model or getattr(client, "model", "")
+    return str(model or "").strip().lower() == "claude-fable-5"
+
+
+def _call_api_with_empty_context_fallback(
+    client: FlowithClient,
+    messages: list[dict[str, Any]],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    send_messages = messages
+    preemptively_compacted = False
+    if _is_fable_model(client, kwargs.get("model")):
+        compacted_messages = _recent_context_fallback_messages(
+            messages,
+            FLOWITH_FABLE_CONTEXT_COMPACT_CHARS,
+        )
+        if compacted_messages is not None:
+            send_messages = compacted_messages
+            preemptively_compacted = True
+            logger.warning(
+                "Preemptively compacting Fable context (%s -> %s chars, %s -> %s messages)",
+                _message_content_chars(messages),
+                _message_content_chars(send_messages),
+                len(messages),
+                len(send_messages),
+            )
+
+    result = client.call_api(send_messages, **kwargs)
+    if not result.get("empty_response"):
+        return result
+
+    if preemptively_compacted:
+        return result
+
+    fallback_messages = _recent_context_fallback_messages(messages)
+    if fallback_messages is None:
+        return result
+
+    logger.warning(
+        "Retrying empty upstream response with compacted context (%s -> %s chars, %s -> %s messages)",
+        _message_content_chars(messages),
+        _message_content_chars(fallback_messages),
+        len(messages),
+        len(fallback_messages),
+    )
+    return client.call_api(fallback_messages, **kwargs)
+
+
 def _stream_claude_events(
     client: FlowithClient,
     messages: list[dict[str, Any]],
@@ -1188,7 +1293,8 @@ def _stream_claude_events(
 
     def worker() -> None:
         try:
-            res = client.call_api(
+            res = _call_api_with_empty_context_fallback(
+                client,
                 messages,
                 model=upstream_model,
                 max_retries=1,
@@ -1280,7 +1386,7 @@ def _stream_claude_events(
                     xml_parsing = has_xml_tool_call_marker(remaining)
                     return remaining
             except Exception:
-                pass
+                logger.exception("Failed to parse buffered XML tool call; falling back to plain text")
             xml_parsing = False
             return buf
 
@@ -1397,11 +1503,24 @@ def _stream_claude_events(
         res = result_holder.get("result") or {}
         if not res.get("success"):
             err_msg = str(res.get("error", "upstream error"))
-            if "Upstream stream ended without content" in err_msg and not streamed_any:
-                # Empty upstream SSE after retries is a transient provider quirk.
-                # Do not surface it as an Anthropic API error because Claude Code
-                # treats stream error events as hard failures; finish the turn
-                # cleanly instead.
+            empty_response = bool(res.get("empty_response")) or (
+                "Upstream stream ended without content" in err_msg
+            )
+            if empty_response and not streamed_any:
+                # Empty upstream SSE after all retries (base + empty budget) is a
+                # transient provider quirk. Do NOT surface it as an Anthropic API
+                # error because Claude Code treats stream error events as hard
+                # failures. But a silent end_turn with zero content is worse: it
+                # looks like the assistant chose to say nothing, which stalls
+                # tool-calling on long tasks. Emit a short visible marker so the
+                # turn is a recoverable non-empty response instead of a no-op.
+                yield sse_content_block_start(0, block_type="text").encode("utf-8")
+                yield sse_content_block_delta(
+                    "[proxy] upstream returned no content after bounded retries; "
+                    "compact the conversation or start a new task, then retry.",
+                    0,
+                ).encode("utf-8")
+                yield sse_content_block_stop(0).encode("utf-8")
                 yield sse_message_delta(output_tokens=0, stop_reason="end_turn").encode("utf-8")
                 yield sse_message_stop().encode("utf-8")
                 return

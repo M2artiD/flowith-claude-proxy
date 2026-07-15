@@ -45,12 +45,22 @@ def strip_model_thinking(text: str) -> str:
 # Model aliases
 # ---------------------------------------------------------------
 def map_model(claude_model: str, default: str = "claude-5-sonnet") -> str:
-    """Passthrough model name as-is. Only apply user-defined custom aliases."""
+    """Passthrough model name as-is. Only apply user-defined custom aliases.
+
+    Claude Code appends a context-window suffix like ``[1M]`` to the model id
+    (e.g. ``claude-fable-5[1M]``); Flowith does not understand it, so a
+    bracketed suffix is stripped before alias lookup unless the exact name
+    (including the suffix) has its own alias entry.
+    """
     if not claude_model:
         return default
     from .config import CUSTOM_MODEL_ALIASES
     if claude_model in CUSTOM_MODEL_ALIASES:
         return CUSTOM_MODEL_ALIASES[claude_model]
+    if claude_model.endswith("]") and "[" in claude_model:
+        stripped = claude_model[: claude_model.rindex("[")].strip()
+        if stripped:
+            return CUSTOM_MODEL_ALIASES.get(stripped, stripped)
     return claude_model
 
 
@@ -298,9 +308,35 @@ def _build_tool_xml_prompt(
         "# Tool Use\n\n"
         "You have access to tools through this proxy. Use a tool only when it is "
         "needed to answer or act correctly. If the user request can be answered "
-        "directly, answer normally in plain text and do not emit XML.\n\n"
-        "When you need to call a tool, output exactly this XML block and stop "
-        "immediately after it:\n\n"
+        "directly, answer normally in plain text and do not emit XML. In particular, "
+        "do not call tools for greetings, casual conversation, or explanation-only "
+        "questions that can be answered from the current context.\n\n"
+        "A tool is required when the user explicitly asks you to use a tool, run "
+        "a command, inspect external state, read or write files, or perform an "
+        "action whose result you do not already know. Do not claim that you cannot "
+        "access or execute an available tool; call it using the XML protocol below.\n\n"
+        "Opening or launching CMD, PowerShell, a terminal, browser, window, GUI "
+        "application, or process is a tool-required action. If a shell or command "
+        "tool can do it, call that tool immediately. When the user explicitly asks "
+        "for a visible application or window, launch it visibly; do not claim that "
+        "a visible GUI cannot be opened from the chat.\n\n"
+        "Creating or writing a file at a user-requested path is also a tool-required "
+        "action. Use the available shell or file tool instead of merely printing a "
+        "command or file contents for the user to run or save.\n\n"
+        "Do not evade tool use. Do not explain how the user could do the action, "
+        "suggest a keyboard shortcut, print a command without executing it, or "
+        "tell the user to perform the action manually. Never promise to call "
+        "a tool later. Never say that an action is starting, in progress, or complete "
+        "until an <observation> confirms it. Before that observation, provide one "
+        "concise user-visible action note and then emit the tool call immediately; "
+        "the note must not stand alone.\n\n"
+        "When you need to call a tool, first output one concise user-visible action note. "
+        "State the short operational reason, the tool being used, and the exact command "
+        "or concrete tool action when applicable. This is an execution summary for the "
+        "user, not hidden chain-of-thought. The note must not include a result, "
+        "success/failure claim, or final answer because no observation exists yet. "
+        "Immediately follow the note with exactly this "
+        "XML block and stop after it:\n\n"
         "<tool_call>\n"
         "<name>TOOL_NAME</name>\n"
         "<parameters>\n"
@@ -308,21 +344,28 @@ def _build_tool_xml_prompt(
         "</parameters>\n"
         "</tool_call>\n\n"
         "CRITICAL RULES:\n"
-        "1. Use the <tool_call> XML block above when calling tools. Do NOT describe or narrate tool calls in plain text.\n"
+        "1. Before the <tool_call>, output exactly one brief action note with the tool and exact command/action; output no other narration.\n"
         "2. Output ONLY ONE tool call per response.\n"
         "3. The <parameters> body MUST be one valid JSON object matching the input schema.\n"
         "4. STOP writing immediately after </tool_call> and wait for <observation>.\n"
         "5. Treat every <observation> block as the result of your previous tool call.\n"
         f"6. {choice_instruction}\n\n"
         "EXAMPLE - calling a tool named \"Bash\" with parameter \"command\":\n\n"
-        "I need to list the files in the current directory.\n\n"
         "<tool_call>\n"
         "<name>Bash</name>\n"
         "<parameters>\n"
         "{\"command\": \"ls -la\"}\n"
         "</parameters>\n"
         "</tool_call>\n\n"
-        f"## Available Tools\n\n{tool_list}"
+        f"## Available Tools\n\n{tool_list}\n\n"
+        "## Final Tool Policy\n\n"
+        "You CAN call every tool listed above. If the user explicitly requests a "
+        "tool, command, file operation, external lookup, or other action, you MUST "
+        "give the concise action note and emit the matching <tool_call> now. Never "
+        "replace a required tool call with "
+        "a promise, narration, guessed result, refusal, instructions for the user, "
+        "or a claim that execution is unavailable. Only report failure after a real "
+        "tool observation reports the failure."
     )
 
 
@@ -625,6 +668,53 @@ def _rfind_outside_cdata(text: str, needle: str, start: int = 0, end: int | None
         return idx
 
 
+def _is_idx_in_markdown_code(text: str, idx: int) -> bool:
+    """True if position idx sits inside a fenced (```) or inline (`) code span.
+
+    Prose that merely mentions a tag name in backticks (e.g. describing
+    `<tool_call>` as an example) must not be treated as the start of a real
+    tool-call block; only backtick parity up to idx is considered, which is
+    sufficient for well-formed markdown.
+    """
+    prefix = text[:idx]
+    if prefix.count("```") % 2 == 1:
+        return True
+    stripped = prefix.replace("```", "")
+    return stripped.count("`") % 2 == 1
+
+
+def _find_outside_markup(text: str, needle: str, start: int = 0) -> int:
+    """Like _find_outside_cdata, but also skips matches inside markdown code spans.
+
+    Reserved for detecting the OUTER tool-call wrapper tags (<function_calls>,
+    <tool_call>) where a false positive silently breaks streaming; inner
+    invoke/parameter tag matching keeps using _find_outside_cdata unchanged.
+    """
+    pos = start
+    while True:
+        idx = _find_outside_cdata(text, needle, pos)
+        if idx == -1:
+            return -1
+        if _is_idx_in_markdown_code(text, idx):
+            pos = idx + 1
+            continue
+        return idx
+
+
+def _rfind_outside_markup(text: str, needle: str, start: int = 0, end: int | None = None) -> int:
+    if end is None:
+        end = len(text)
+    pos = end
+    while True:
+        idx = _rfind_outside_cdata(text, needle, start, pos)
+        if idx == -1:
+            return -1
+        if _is_idx_in_markdown_code(text, idx):
+            pos = idx
+            continue
+        return idx
+
+
 def _extract_cdata_or_text(raw: str) -> str:
     stripped = raw.strip()
     if not stripped.startswith(_CDATA_START):
@@ -782,6 +872,20 @@ def _parse_invoke_elements(func_body: str, results: list[dict[str, Any]]) -> Non
 
 def _parse_tool_call_block(raw_block: str, allow_partial: bool = False) -> dict[str, Any] | None:
     match = _TOOL_CALL_RE.search(raw_block)
+    if not match and _TAG_PARAMETERS_CLOSE not in raw_block:
+        # GPT-5.6 occasionally closes the JSON wrapper as </parameter>
+        # (singular, borrowed from the legacy invoke format). Repair only the
+        # first close after <parameters> and only when the proper plural close
+        # is entirely absent, so literal tag text inside valid JSON is untouched.
+        params_open = raw_block.find(_TAG_PARAMETERS_OPEN)
+        singular_close = raw_block.find(_TAG_PARAM_CLOSE, params_open + len(_TAG_PARAMETERS_OPEN))
+        if params_open != -1 and singular_close != -1:
+            repaired = (
+                raw_block[:singular_close]
+                + _TAG_PARAMETERS_CLOSE
+                + raw_block[singular_close + len(_TAG_PARAM_CLOSE):]
+            )
+            match = _TOOL_CALL_RE.search(repaired)
     if not match and allow_partial:
         match = _PARTIAL_TOOL_CALL_RE.search(raw_block)
     if not match:
@@ -810,7 +914,7 @@ def _parse_function_call_spans(text: str) -> list[tuple[int, int, list[dict[str,
     spans: list[tuple[int, int, list[dict[str, Any]]]] = []
     pos = 0
     while True:
-        start = _find_outside_cdata(text, _TAG_FUNC_OPEN, pos)
+        start = _find_outside_markup(text, _TAG_FUNC_OPEN, pos)
         if start == -1:
             break
         content_start = start + len(_TAG_FUNC_OPEN)
@@ -830,7 +934,7 @@ def _parse_tool_call_spans(text: str) -> list[tuple[int, int, list[dict[str, Any
     spans: list[tuple[int, int, list[dict[str, Any]]]] = []
     pos = 0
     while True:
-        start = _find_outside_cdata(text, _TAG_TOOL_CALL_OPEN, pos)
+        start = _find_outside_markup(text, _TAG_TOOL_CALL_OPEN, pos)
         if start == -1:
             break
         tag_end = text.find(">", start)
@@ -879,8 +983,8 @@ def _xml_tool_call_spans(text: str) -> list[tuple[int, int, list[dict[str, Any]]
 
 def find_xml_tool_call_start(text: str) -> int:
     candidates = [
-        _find_outside_cdata(text, _TAG_FUNC_OPEN),
-        _find_outside_cdata(text, _TAG_TOOL_CALL_OPEN),
+        _find_outside_markup(text, _TAG_FUNC_OPEN),
+        _find_outside_markup(text, _TAG_TOOL_CALL_OPEN),
     ]
     candidates = [idx for idx in candidates if idx != -1]
     return min(candidates) if candidates else -1
@@ -888,10 +992,10 @@ def find_xml_tool_call_start(text: str) -> int:
 
 def find_xml_tool_call_end(text: str) -> int:
     ends: list[int] = []
-    func_close = _rfind_outside_cdata(text, _TAG_FUNC_CLOSE)
+    func_close = _rfind_outside_markup(text, _TAG_FUNC_CLOSE)
     if func_close != -1:
         ends.append(func_close + len(_TAG_FUNC_CLOSE))
-    tool_close = _rfind_outside_cdata(text, _TAG_TOOL_CALL_CLOSE)
+    tool_close = _rfind_outside_markup(text, _TAG_TOOL_CALL_CLOSE)
     if tool_close != -1:
         ends.append(tool_close + len(_TAG_TOOL_CALL_CLOSE))
     return max(ends) if ends else -1
@@ -922,6 +1026,7 @@ def split_text_and_xml_tool_calls(text: str) -> list[dict[str, Any]]:
 
     blocks: list[dict[str, Any]] = []
     cursor = 0
+    emitted_tool_use = False
     for start, end, tools in spans:
         pre_text = text[cursor:start].strip()
         if pre_text:
@@ -930,11 +1035,16 @@ def split_text_and_xml_tool_calls(text: str) -> list[dict[str, Any]]:
             block = dict(tool)
             block["type"] = "tool_use"
             blocks.append(block)
+            emitted_tool_use = True
         cursor = end
 
-    post_text = text[cursor:].strip()
-    if post_text:
-        blocks.append({"type": "text", "text": post_text})
+    # Trailing prose after a tool call is the model "explaining" its call; some
+    # variants emit mojibake/hallucinated text here. Anthropic clients treat a
+    # text block after tool_use as the assistant's answer, so drop it.
+    if not emitted_tool_use:
+        post_text = text[cursor:].strip()
+        if post_text:
+            blocks.append({"type": "text", "text": post_text})
     return blocks
 
 

@@ -2,6 +2,7 @@ import io
 import os
 import unittest
 from contextlib import redirect_stdout
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -13,6 +14,7 @@ class FakeFlowithClient:
         self.calls = []
         self.next_result = None
         self.next_stream_chunks = None
+        self.next_stream_result = None
 
     def call_api(self, messages, **kwargs):
         self.calls.append({"messages": messages, **kwargs})
@@ -20,6 +22,8 @@ class FakeFlowithClient:
             chunks = self.next_stream_chunks or ["hel", "lo"]
             for chunk in chunks:
                 kwargs["on_chunk"](chunk)
+            if self.next_stream_result is not None:
+                return self.next_stream_result
             return {
                 "success": True,
                 "content": "".join(chunks),
@@ -544,6 +548,173 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn("Use a tool only when it is needed", upstream_call["messages"][0]["content"])
         self.assertIn("### shell", upstream_call["messages"][0]["content"])
 
+    def test_responses_gpt_5_6_first_turn_requires_a_tool(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "run a command",
+                "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            },
+        )
+
+        prompt = self.fake_client.calls[0]["messages"][0]["content"]
+        self.assertIn("You must call one available tool.", prompt)
+        self.assertEqual(self.fake_client.calls[0]["model"], "gpt-5.6-sol")
+
+    def test_responses_gpt_5_6_code_request_requires_a_tool(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "code a 3d pokeball in one html file and save it to the desktop",
+                "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            },
+        )
+
+        last_message = self.fake_client.calls[0]["messages"][-1]
+        self.assertEqual(last_message["role"], "system")
+        self.assertIn("TOOL CALL REQUIRED FOR THIS TURN", last_message["content"])
+
+    def test_responses_gpt_5_6_greeting_does_not_require_a_tool(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "你好",
+                "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            },
+        )
+
+        messages = self.fake_client.calls[0]["messages"]
+        self.assertFalse(any("TOOL CALL REQUIRED FOR THIS TURN" in message["content"] for message in messages))
+
+    def test_responses_gpt_5_6_explanation_question_does_not_require_a_tool(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "这是什么意思？请直接解释。",
+                "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            },
+        )
+
+        messages = self.fake_client.calls[0]["messages"]
+        self.assertFalse(any("TOOL CALL REQUIRED FOR THIS TURN" in message["content"] for message in messages))
+
+    def test_responses_gpt_5_6_negated_action_does_not_require_a_tool(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "不要运行命令，只解释 Get-Location 是什么意思。",
+                "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            },
+        )
+
+        messages = self.fake_client.calls[0]["messages"]
+        self.assertFalse(any("TOOL CALL REQUIRED FOR THIS TURN" in message["content"] for message in messages))
+
+    def test_responses_gpt_5_6_required_tool_rule_is_last_message(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "open cmd",
+                "tools": [{"type": "function", "name": "shell_command", "parameters": {"type": "object"}}],
+            },
+        )
+
+        last_message = self.fake_client.calls[0]["messages"][-1]
+        self.assertEqual(last_message["role"], "system")
+        self.assertIn("TOOL CALL REQUIRED FOR THIS TURN", last_message["content"])
+        self.assertIn("concise user-visible action note", last_message["content"])
+        self.assertIn("exact command", last_message["content"])
+        self.assertIn("then output the XML tool call", last_message["content"])
+        self.assertIn("must not include a result, success/failure claim, or final answer", last_message["content"])
+
+    def test_responses_gpt_5_6_new_user_turn_after_tool_history_requires_tool(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {"type": "message", "role": "user", "content": "first action"},
+                    {"type": "function_call", "call_id": "call_old", "name": "shell_command", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call_old", "output": "done"},
+                    {"type": "message", "role": "user", "content": "open cmd"},
+                ],
+                "tools": [{"type": "function", "name": "shell_command", "parameters": {"type": "object"}}],
+            },
+        )
+
+        last_message = self.fake_client.calls[0]["messages"][-1]
+        self.assertEqual(last_message["role"], "system")
+        self.assertIn("TOOL CALL REQUIRED FOR THIS TURN", last_message["content"])
+
+    def test_responses_gpt_5_6_immediate_tool_result_does_not_force_another_tool(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {"type": "function_call", "call_id": "call_now", "name": "shell_command", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call_now", "output": "done"},
+                ],
+                "tools": [{"type": "function", "name": "shell_command", "parameters": {"type": "object"}}],
+            },
+        )
+
+        messages = self.fake_client.calls[0]["messages"]
+        self.assertFalse(any("TOOL CALL REQUIRED FOR THIS TURN" in message["content"] for message in messages))
+
+    def test_responses_gpt_5_6_tool_result_followup_forbids_progress_only_completion(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {"type": "message", "role": "user", "content": "build the requested file and open it"},
+                    {"type": "function_call", "call_id": "call_now", "name": "shell_command", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call_now", "output": "project rules read"},
+                ],
+                "tools": [{"type": "function", "name": "shell_command", "parameters": {"type": "object"}}],
+            },
+        )
+
+        last_message = self.fake_client.calls[0]["messages"][-1]
+        self.assertEqual(last_message["role"], "system")
+        self.assertIn("TOOL RESULT FOLLOW-UP", last_message["content"])
+        self.assertIn("progress update or future-tense promise", last_message["content"])
+        self.assertIn("call the next available tool now", last_message["content"])
+        self.assertIn("user-visible action note", last_message["content"])
+        self.assertIn("exact command", last_message["content"])
+        self.assertIn("must not include a result, success/failure claim, or final answer", last_message["content"])
+
+    def test_responses_codex_5_6_compat_alias_requires_a_tool(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.4-flowith-5.6",
+                "input": "run a command",
+                "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            },
+        )
+
+        prompt = self.fake_client.calls[0]["messages"][0]["content"]
+        self.assertIn("You must call one available tool.", prompt)
+        self.assertEqual(self.fake_client.calls[0]["model"], "gpt-5.6-sol")
+
     def test_responses_input_function_call_output_becomes_observation(self) -> None:
         response = self.client.post(
             "/v1/responses",
@@ -592,6 +763,25 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn('"delta": "lo"', events)
         self.assertIn("event: response.completed", events)
 
+    def test_hermes_compact_final_events_do_not_repeat_streamed_text(self) -> None:
+        with patch("proxy.codex.router.FLOWITH_RESPONSES_COMPACT_FINAL_TEXT", True, create=True):
+            response = self.client.post(
+                "/v1/responses",
+                headers={"Authorization": "Bearer test-key"},
+                json={
+                    "model": "claude-5-sonnet",
+                    "input": "say hello",
+                    "stream": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = response.text
+        self.assertIn('"delta": "hel"', events)
+        self.assertIn('"delta": "lo"', events)
+        self.assertNotIn('"text": "hello"', events)
+        self.assertNotIn('"output_text": "hello"', events)
+
     def test_responses_streaming_preserves_final_partial_think_prefix(self) -> None:
         self.fake_client.next_stream_chunks = ["answer <th"]
 
@@ -609,6 +799,33 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn('"delta": "answer "', response.text)
         self.assertIn('"delta": "<th"', response.text)
         self.assertIn('"output_text": "answer <th"', response.text)
+
+    def test_responses_streaming_partial_upstream_failure_has_terminal_events(self) -> None:
+        self.fake_client.next_stream_chunks = ["partial"]
+        self.fake_client.next_stream_result = {
+            "success": False,
+            "content": "partial",
+            "error": "Upstream stream ended before completion",
+        }
+
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "claude-5-sonnet",
+                "input": "echo partial failure",
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        events = response.text
+        self.assertIn("event: response.output_text.delta", events)
+        self.assertIn('"delta": "partial"', events)
+        self.assertIn("event: response.failed", events)
+        self.assertIn('"status": "failed"', events)
+        self.assertIn("Upstream stream ended before completion", events)
+        self.assertTrue(events.rstrip().endswith("data: [DONE]"))
 
     def test_responses_streaming_with_tools_preserves_final_partial_tool_prefix(self) -> None:
         self.fake_client.next_stream_chunks = ["answer <tool_call"]
@@ -741,6 +958,36 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn('"text": "Need cwd.  Done."', events)
         self.assertIn('"output_text": "Need cwd.  Done."', events)
         self.assertNotIn("<tool_call>", events)
+
+    def test_responses_gpt_5_6_stream_tool_feedback_discards_premature_final_text(self) -> None:
+        self.fake_client.next_stream_chunks = [
+            "To inspect the directory, use shell with exact command `pwd`.\n\nPREMATURE_OK",
+            "<tool_call>\n<name>shell</name>\n",
+            "<parameters>\n",
+            '{"command":"pwd"}',
+            "\n</parameters>\n</tool_call>",
+        ]
+
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "check cwd",
+                "stream": True,
+                "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        events = response.text
+        self.assertIn("To inspect the directory, use shell with exact command `pwd`.", events)
+        self.assertNotIn("PREMATURE_OK", events)
+        self.assertIn('"type": "function_call"', events)
+        self.assertLess(
+            events.index("event: response.output_text.done"),
+            events.index('"type": "function_call"'),
+        )
 
     def test_hermes_root_chat_completions_alias(self) -> None:
         response = self.client.post(

@@ -54,6 +54,37 @@ FLOWITH_RETRY_BACKOFF = _env_float("FLOWITH_RETRY_BACKOFF", 0.5)
 FLOWITH_RETRY_JITTER = _env_float("FLOWITH_RETRY_JITTER", 0.25)
 FLOWITH_RETRY_MAX_DELAY = _env_float("FLOWITH_RETRY_MAX_DELAY", 8)
 FLOWITH_SSL_RETRY_EXTRA = _env_int("FLOWITH_SSL_RETRY_EXTRA", 10)
+# Flowith can return HTTP 200 with no text, reasoning, or tool call. Short retries
+# recover isolated provider glitches, but large Fable contexts can deterministically
+# return empty forever. Keep this budget short so an unrecoverable request becomes
+# an explicit response instead of making the client appear hung for minutes.
+FLOWITH_EMPTY_RETRY_WINDOW = _env_float("FLOWITH_EMPTY_RETRY_WINDOW", 8.0)
+FLOWITH_EMPTY_RETRY_DELAY = _env_float("FLOWITH_EMPTY_RETRY_DELAY", 0.35)
+FLOWITH_EMPTY_RETRY_DELAY_MAX = _env_float("FLOWITH_EMPTY_RETRY_DELAY_MAX", 1.0)
+# Hard upper bound on extra empty-response attempts. Set to 0 only when a finite
+# FLOWITH_EMPTY_RETRY_WINDOW is configured and an uncapped attempt count is wanted.
+FLOWITH_EMPTY_RETRY_TOTAL = _env_int("FLOWITH_EMPTY_RETRY_TOTAL", 8)
+# If an already-retried request is still empty, retain only the system prompt and
+# newest conversation messages below this character budget for one final attempt.
+# Set to 0 to disable this lossy recovery path.
+FLOWITH_EMPTY_CONTEXT_FALLBACK_CHARS = _env_int("FLOWITH_EMPTY_CONTEXT_FALLBACK_CHARS", 90000)
+# Fable starts returning empty streams well before its advertised context size.
+# Compact only Fable requests above this budget before sending them upstream.
+# Set to 0 to disable preemptive compaction.
+FLOWITH_FABLE_CONTEXT_COMPACT_CHARS = _env_int("FLOWITH_FABLE_CONTEXT_COMPACT_CHARS", 90000)
+# A dead upstream stream delivers zero content for its whole life (measured:
+# 240-277s of silence) before finally hanging or sending an empty terminal
+# frame. A healthy stream, by contrast, delivers its first byte within ~83s
+# (measured p90/max across OK samples) and then keeps flowing. So a per-stream
+# idle watchdog cleanly separates the two: if no content/reasoning/tool delta
+# arrives for this many seconds, abort the stream early and retry on the
+# empty-stream path instead of waiting out the full dead-stream lifetime. The
+# default clears the observed OK first-byte max (~83s) with generous margin
+# while sitting well below the dead-stream floor (~240s). Set to 0 to disable.
+FLOWITH_STREAM_IDLE_TIMEOUT = _env_float("FLOWITH_STREAM_IDLE_TIMEOUT", 150.0)
+# Fresh Fable turns normally produce their first delta quickly. Bound no-byte
+# waits separately so a dead Fable stream is retried instead of pinning a task.
+FLOWITH_FABLE_STREAM_IDLE_TIMEOUT = _env_float("FLOWITH_FABLE_STREAM_IDLE_TIMEOUT", 45.0)
 FLOWITH_DISABLE_KEEPALIVE = os.environ.get("FLOWITH_DISABLE_KEEPALIVE", "true").strip().lower() in {
     "1", "true", "yes", "on",
 }
@@ -62,6 +93,11 @@ FLOWITH_TOOL_MODE = os.environ.get("FLOWITH_TOOL_MODE", "xml").strip().lower()
 if FLOWITH_TOOL_MODE not in {"xml", "native"}:
     FLOWITH_TOOL_MODE = "xml"
 
+# Floor for the upstream max_tokens budget. Codex often sends a small
+# max_tokens that truncates XML tool calls mid-stream; raising the floor
+# gives the model room to finish the call. Set to 0 to disable.
+FLOWITH_MIN_MAX_TOKENS = _env_int("FLOWITH_MIN_MAX_TOKENS", 8192)
+
 FLOWITH_SSL_VERIFY = os.environ.get("FLOWITH_SSL_VERIFY", "true").strip().lower() not in {
     "0", "false", "no", "off",
 }
@@ -69,6 +105,12 @@ FLOWITH_SSL_VERIFY = os.environ.get("FLOWITH_SSL_VERIFY", "true").strip().lower(
 FLOWITH_TRACE_HERMES = os.environ.get("FLOWITH_TRACE_HERMES", "false").strip().lower() in {
     "1", "true", "yes", "on",
 }
+
+# Some Hermes builds render both streaming deltas and every final Responses
+# snapshot. Keep final text payloads empty in that compatibility mode.
+FLOWITH_RESPONSES_COMPACT_FINAL_TEXT = os.environ.get(
+    "FLOWITH_RESPONSES_COMPACT_FINAL_TEXT", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 FLOWITH_REQUEST_LOG = os.environ.get("FLOWITH_REQUEST_LOG", "false").strip().lower() in {
     "1", "true", "yes", "on",
@@ -111,13 +153,19 @@ DEFAULT_HOST = os.environ.get("FLOWITH_API_HOST", "127.0.0.1")
 DEFAULT_PORT = _env_int("FLOWITH_API_PORT", 8787)
 
 # Custom model aliases
-CUSTOM_MODEL_ALIASES: dict[str, str] = {}
+# Codex 0.144.x only attaches its local tools to recognized model families.
+# This recognized 5.4-prefixed name keeps those tools while the proxy routes to
+# the actual Flowith GPT-5.6 model.
+DEFAULT_MODEL_ALIASES: dict[str, str] = {
+    "gpt-5.4-flowith-5.6": "gpt-5.6-sol",
+}
+CUSTOM_MODEL_ALIASES: dict[str, str] = dict(DEFAULT_MODEL_ALIASES)
 _raw_aliases = os.environ.get("FLOWITH_MODEL_ALIASES", "").strip()
 if _raw_aliases:
     try:
-        CUSTOM_MODEL_ALIASES = {
+        CUSTOM_MODEL_ALIASES.update({
             str(k): str(v) for k, v in json.loads(_raw_aliases).items()
-        }
+        })
     except (json.JSONDecodeError, AttributeError):
         pass
 

@@ -24,6 +24,11 @@ from .config import (
     DEBUG_DUMP_MAX_FILES,
     FLOWITH_CONNECT_TIMEOUT,
     FLOWITH_DISABLE_KEEPALIVE,
+    FLOWITH_EMPTY_RETRY_DELAY,
+    FLOWITH_EMPTY_RETRY_DELAY_MAX,
+    FLOWITH_EMPTY_RETRY_TOTAL,
+    FLOWITH_EMPTY_RETRY_WINDOW,
+    FLOWITH_FABLE_STREAM_IDLE_TIMEOUT,
     FLOWITH_MAX_CONCURRENCY,
     FLOWITH_POOL_MAXSIZE,
     FLOWITH_RETRY_BACKOFF,
@@ -32,6 +37,7 @@ from .config import (
     FLOWITH_RETRY_TOTAL,
     FLOWITH_SEMAPHORE_TIMEOUT,
     FLOWITH_SSL_RETRY_EXTRA,
+    FLOWITH_STREAM_IDLE_TIMEOUT,
 )
 
 
@@ -115,13 +121,20 @@ def _truncate_debug_value(value: Any) -> Any:
     return value
 
 
+_DEBUG_DUMP_LOCK = threading.Lock()
+
+
 def _prune_debug_dumps(dump_dir: Path) -> None:
     if DEBUG_DUMP_MAX_FILES <= 0:
         return
-    dump_files = sorted(
-        dump_dir.glob("flowith_*.json"),
-        key=lambda p: (p.stat().st_mtime_ns, p.name),
-    )
+    entries: list[tuple[int, str, Path]] = []
+    for p in dump_dir.glob("flowith_*.json"):
+        try:
+            entries.append((p.stat().st_mtime_ns, p.name, p))
+        except OSError:
+            # Concurrent dump/prune already removed it; safe to skip.
+            continue
+    dump_files = [p for _, _, p in sorted(entries, key=lambda e: (e[0], e[1]))]
     for stale in dump_files[:-DEBUG_DUMP_MAX_FILES]:
         try:
             stale.unlink()
@@ -139,29 +152,44 @@ def _dump_intercept(
 ) -> None:
     if not DEBUG_DUMP:
         return
-    dump_dir = Path(DEBUG_DUMP_DIR)
-    dump_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
-    stream_label = "stream" if is_stream else "nonstream"
-    dump_path = dump_dir / f"flowith_{stream_label}_{ts}.json"
-    dump = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "request": {
-            "method": "POST",
-            "url": os.environ.get("FLOWITH_BASE_URL", "https://edge.flowith.io/external/use/llm"),
-            "payload": _truncate_debug_value(_redact_secrets(payload)),
-        },
-        "response": {
-            "status": response_status,
-            "headers": _truncate_debug_value(_redact_secrets(dict(response_headers))),
-            "body": _truncate_debug_value(_redact_secrets(response_body)),
-        },
-        "upstream_model": upstream_model,
-    }
-    with open(dump_path, "w", encoding="utf-8") as f:
-        json.dump(dump, f, ensure_ascii=False, indent=2)
-    _prune_debug_dumps(dump_dir)
-    print(f"[intercept] Dumped upstream {stream_label} call -> {dump_path}", flush=True)
+    try:
+        dump_dir = Path(DEBUG_DUMP_DIR)
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        stream_label = "stream" if is_stream else "nonstream"
+        dump_path = dump_dir / f"flowith_{stream_label}_{ts}.json"
+        dump = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "request": {
+                "method": "POST",
+                "url": os.environ.get("FLOWITH_BASE_URL", "https://edge.flowith.io/external/use/llm"),
+                "payload": _truncate_debug_value(_redact_secrets(payload)),
+            },
+            "response": {
+                "status": response_status,
+                "headers": _truncate_debug_value(_redact_secrets(dict(response_headers))),
+                "body": _truncate_debug_value(_redact_secrets(response_body)),
+            },
+            "upstream_model": upstream_model,
+        }
+        with open(dump_path, "w", encoding="utf-8") as f:
+            json.dump(dump, f, ensure_ascii=False, indent=2)
+        with _DEBUG_DUMP_LOCK:
+            _prune_debug_dumps(dump_dir)
+        print(f"[intercept] Dumped upstream {stream_label} call -> {dump_path}", flush=True)
+    except Exception as e:
+        print(f"[intercept] Failed to dump upstream call: {e}", flush=True)
+
+
+def _dump_intercept_async(**kwargs: Any) -> None:
+    if not DEBUG_DUMP:
+        _dump_intercept(**kwargs)
+        return
+
+    def _run() -> None:
+        _dump_intercept(**kwargs)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 _RETRY_STRATEGY = Retry(
@@ -198,6 +226,12 @@ def _stream_result_delivered_any(result: dict[str, Any]) -> bool:
         or result.get("reasoning_content")
         or result.get("tool_calls")
     )
+
+
+def _stream_idle_timeout(model: str | None) -> float:
+    if str(model or "").strip().lower() == "claude-fable-5":
+        return FLOWITH_FABLE_STREAM_IDLE_TIMEOUT
+    return FLOWITH_STREAM_IDLE_TIMEOUT
 
 
 def _pick_reasoning_field(obj: dict[str, Any]) -> str:
@@ -380,7 +414,19 @@ class FlowithClient:
         base_attempts = max(1, max_retries, FLOWITH_RETRY_TOTAL)
         attempt = 0
         ssl_extra_used = 0
+        # Empty upstream streams cluster in time (measured: long runs of empties
+        # punctuated by brief OK windows), so we retry ACROSS a wall-clock window
+        # long enough to outlast a bad window rather than a fixed count of fast
+        # retries that could all land inside it. empty_window_start marks the first
+        # empty; we keep extending the loop until FLOWITH_EMPTY_RETRY_WINDOW elapses
+        # (or the optional hard count cap trips), backing off from a fast flat delay
+        # to a longer capped one so early isolated empties retry cheaply while a
+        # clustered outage gets ridden out with spaced-out attempts.
+        empty_extra_used = 0
+        empty_window_start: float | None = None
+        last_was_empty_stream = False
         delivered_any = {"v": False}
+        last_stream_result: dict[str, Any] | None = None
 
         if stream:
             _orig_on_chunk = on_chunk
@@ -408,10 +454,11 @@ class FlowithClient:
             on_reasoning = _wrap_reasoning
             on_tool_call = _wrap_tool_call
 
-        while attempt < base_attempts + ssl_extra_used:
+        while attempt < base_attempts + ssl_extra_used + empty_extra_used:
             attempt += 1
             acquired = False
             retryable_ssl_error = False
+            last_was_empty_stream = False
             try:
                 if _UPSTREAM_SEMAPHORE is not None:
                     acquired = _UPSTREAM_SEMAPHORE.acquire(timeout=FLOWITH_SEMAPHORE_TIMEOUT)
@@ -471,13 +518,32 @@ class FlowithClient:
                             response, elapsed_ms, payload,
                             on_chunk, on_reasoning, on_tool_call,
                             cancel_event=cancel_event,
+                            idle_timeout=_stream_idle_timeout(use_model),
                         )
                         if result.get("success") and _stream_result_delivered_any(result):
                             return result
-                        if result.get("error"):
+                        last_stream_result = result
+                        if result.get("idle_timeout"):
+                            # Watchdog aborted a stream that delivered zero content
+                            # for the whole idle window. That's a dead stream, the
+                            # same failure mode as an empty SSE frame -- route it to
+                            # the empty-retry path (bounded window) instead of the
+                            # generic error path (which would burn N x idle_timeout).
+                            last_error = Exception(str(result["error"]))
+                            last_was_empty_stream = True
+                            # An idle timeout already spent the expensive
+                            # first-byte budget. Do not repeat the generic
+                            # six-attempt loop before entering the bounded
+                            # empty-response retry path.
+                            base_attempts = min(base_attempts, attempt)
+                        elif result.get("error"):
                             last_error = Exception(str(result["error"]))
                         else:
+                            # success:True but nothing delivered -> empty SSE frame
+                            # (delta:{}+finish_reason:stop). Provider dice-roll; retry
+                            # fast on the dedicated empty budget.
                             last_error = Exception("Upstream stream ended without content")
+                            last_was_empty_stream = True
                         self._reset_session()
                     else:
                         resp_body = response.text
@@ -498,17 +564,22 @@ class FlowithClient:
                             tool_calls = msg.get("tool_calls")
                             content_val, thinking_from_blocks = _extract_content_and_thinking(msg.get("content"))
                             reasoning_text = _pick_reasoning_field(msg) or thinking_from_blocks
-                            return {
-                                "success": True,
-                                "content": content_val,
-                                "time_ms": elapsed_ms,
-                                "usage": result.get("usage", {}) or {},
-                                "reasoning_content": reasoning_text,
-                                "tool_calls": tool_calls,
-                                "finish_reason": result["choices"][0].get("finish_reason"),
-                                "upstream_model": upstream_model,
-                            }
-                        last_error = Exception("Upstream response has no choices")
+                            if content_val or reasoning_text or tool_calls:
+                                return {
+                                    "success": True,
+                                    "content": content_val,
+                                    "time_ms": elapsed_ms,
+                                    "usage": result.get("usage", {}) or {},
+                                    "reasoning_content": reasoning_text,
+                                    "tool_calls": tool_calls,
+                                    "finish_reason": result["choices"][0].get("finish_reason"),
+                                    "upstream_model": upstream_model,
+                                }
+                            last_error = Exception("Upstream response ended without content")
+                            last_was_empty_stream = True
+                            self._reset_session()
+                        else:
+                            last_error = Exception("Upstream response has no choices")
 
             except requests.exceptions.Timeout:
                 self._reset_session()
@@ -536,19 +607,65 @@ class FlowithClient:
 
             if (
                 retryable_ssl_error
-                and attempt >= base_attempts + ssl_extra_used
+                and attempt >= base_attempts + ssl_extra_used + empty_extra_used
                 and ssl_extra_used < FLOWITH_SSL_RETRY_EXTRA
             ):
                 ssl_extra_used += 1
 
+            # Empty upstream streams cluster in time, so keep extending the loop as
+            # long as we're still inside the empty-retry window (and under the
+            # optional hard count cap) rather than a fixed budget. This lets a run
+            # of empties get ridden out until the upstream recovers instead of
+            # exhausting the allowance and forcing a silent no-content turn.
+            if last_was_empty_stream and attempt >= base_attempts + ssl_extra_used + empty_extra_used:
+                now = time.time()
+                if empty_window_start is None:
+                    empty_window_start = now
+                within_window = (now - empty_window_start) < FLOWITH_EMPTY_RETRY_WINDOW
+                under_cap = FLOWITH_EMPTY_RETRY_TOTAL <= 0 or empty_extra_used < FLOWITH_EMPTY_RETRY_TOTAL
+                if within_window and under_cap:
+                    empty_extra_used += 1
+
             if stream and delivered_any["v"]:
                 # Bytes already sent to the client; re-issuing the upstream call
-                # would produce a duplicated response stream.
+                # would produce a duplicated response stream. Return the parser's
+                # failure payload so callers can preserve any partial content.
+                if last_stream_result is not None:
+                    return last_stream_result
                 break
 
-            if attempt < base_attempts + ssl_extra_used:
-                time.sleep(_retry_delay(attempt))
+            if attempt < base_attempts + ssl_extra_used + empty_extra_used:
+                # Empty streams aren't congestion. They cluster, so back off from a
+                # fast flat delay (cheap for isolated empties) toward a longer
+                # capped delay as the window wears on, spacing out attempts to ride
+                # out a clustered outage instead of hammering inside a dead window.
+                if last_was_empty_stream:
+                    if empty_window_start is not None:
+                        elapsed = time.time() - empty_window_start
+                        frac = min(1.0, elapsed / FLOWITH_EMPTY_RETRY_WINDOW) if FLOWITH_EMPTY_RETRY_WINDOW > 0 else 1.0
+                    else:
+                        frac = 0.0
+                    delay = FLOWITH_EMPTY_RETRY_DELAY + frac * (FLOWITH_EMPTY_RETRY_DELAY_MAX - FLOWITH_EMPTY_RETRY_DELAY)
+                    time.sleep(max(0.0, delay) + random.uniform(0, FLOWITH_RETRY_JITTER))
+                else:
+                    time.sleep(_retry_delay(attempt))
 
+        # If we exhausted the empty-retry window without ever getting content,
+        # surface an explicit, actionable error (rather than a bare
+        # "ended without content") so the caller can re-issue the request instead
+        # of silently emitting an empty turn.
+        if last_was_empty_stream and empty_window_start is not None:
+            waited = time.time() - empty_window_start
+            return {
+                "success": False,
+                "empty_response": True,
+                "error": (
+                    f"Upstream returned no content for {waited:.0f}s and exhausted "
+                    "the bounded empty-response retry budget. Fable commonly does "
+                    "this when the conversation is too large; compact the context, "
+                    "start a new task, or retry the request."
+                ),
+            }
         return {"success": False, "error": str(last_error) if last_error else "unknown error"}
 
     def _parse_stream(
@@ -560,6 +677,7 @@ class FlowithClient:
         on_reasoning: Callable[[str], None] | None,
         on_tool_call: Callable[[dict[str, Any]], None] | None,
         cancel_event: threading.Event | None = None,
+        idle_timeout: float | None = None,
     ) -> dict[str, Any]:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -571,6 +689,7 @@ class FlowithClient:
         debug_body_bytes = 0
         debug_body_omitted_bytes = 0
         stream_error: str | None = None
+        saw_terminal_event = False
 
         def _append_debug_body_line(line: str) -> None:
             nonlocal debug_body_bytes, debug_body_omitted_bytes
@@ -607,15 +726,40 @@ class FlowithClient:
             if callable(close):
                 close()
 
-        cancel_watcher: threading.Thread | None = None
-        if cancel_event is not None:
-            def _watch_cancel() -> None:
-                cancel_event.wait()
-                if cancel_event.is_set():
-                    _close_response()
+        # Idle watchdog: a dead upstream stream delivers zero content for its
+        # whole (240-277s) life, while a healthy one delivers its first byte
+        # within ~83s and then keeps flowing. If no real delta arrives for
+        # FLOWITH_STREAM_IDLE_TIMEOUT seconds we abort early and let the caller
+        # retry on the empty-stream path instead of waiting out the dead life.
+        idle_timeout = idle_timeout if idle_timeout is not None else FLOWITH_STREAM_IDLE_TIMEOUT
+        idle_timeout = idle_timeout if idle_timeout > 0 else 0.0
+        last_activity = [time.time()]
+        idle_timed_out = threading.Event()
+        watcher_stop = threading.Event()
 
-            cancel_watcher = threading.Thread(target=_watch_cancel, daemon=True)
-            cancel_watcher.start()
+        def _mark_activity() -> None:
+            last_activity[0] = time.time()
+
+        watcher: threading.Thread | None = None
+        if cancel_event is not None or idle_timeout > 0:
+            def _watch() -> None:
+                while not watcher_stop.is_set():
+                    if cancel_event is not None and cancel_event.is_set():
+                        _close_response()
+                        return
+                    if idle_timeout > 0:
+                        idle = time.time() - last_activity[0]
+                        if idle >= idle_timeout:
+                            idle_timed_out.set()
+                            _close_response()
+                            return
+                        wait_for = min(1.0, max(0.05, idle_timeout - idle))
+                    else:
+                        wait_for = 1.0
+                    watcher_stop.wait(wait_for)
+
+            watcher = threading.Thread(target=_watch, daemon=True)
+            watcher.start()
 
         try:
             for raw_line in response.iter_lines(decode_unicode=True):
@@ -630,6 +774,7 @@ class FlowithClient:
                 if line.startswith("data:"):
                     line = line[5:].strip()
                 if line == "[DONE]":
+                    saw_terminal_event = True
                     break
                 try:
                     chunk = json.loads(line)
@@ -654,26 +799,31 @@ class FlowithClient:
                     fr = choice.get("finish_reason")
                     if fr:
                         finish_reason = fr
+                        saw_terminal_event = True
 
                     piece_raw = delta.get("content")
                     piece_text, piece_thinking = _extract_content_and_thinking(piece_raw)
                     if piece_text:
+                        _mark_activity()
                         content_parts.append(piece_text)
                         if on_chunk:
                             on_chunk(piece_text)
                     if piece_thinking:
+                        _mark_activity()
                         reasoning_parts.append(piece_thinking)
                         if on_reasoning:
                             on_reasoning(piece_thinking)
 
                     reasoning = _pick_reasoning_field(delta)
                     if reasoning:
+                        _mark_activity()
                         reasoning_parts.append(reasoning)
                         if on_reasoning:
                             on_reasoning(reasoning)
 
                     tc_deltas = delta.get("tool_calls")
                     if tc_deltas:
+                        _mark_activity()
                         for tc in tc_deltas:
                             idx = tc.get("index", 0)
                             if idx not in tool_call_accum:
@@ -690,13 +840,28 @@ class FlowithClient:
                                 entry["function"]["name"] = func_delta["name"]
                             if func_delta.get("arguments"):
                                 entry["function"]["arguments"] += func_delta["arguments"]
+        except Exception as exc:
+            # The watchdog aborts a dead/cancelled stream by closing the socket
+            # out from under iter_lines(), which surfaces here as a read error.
+            # When that close was intentional, swallow it and let the finally
+            # block set the idle/cancel stream_error; otherwise it's a genuine
+            # mid-stream failure and we record it for the retry path.
+            if not (idle_timed_out.is_set() or (cancel_event is not None and cancel_event.is_set())):
+                if stream_error is None:
+                    stream_error = f"Upstream stream read error: {exc}"
         finally:
+            watcher_stop.set()
             _close_response()
+            if idle_timed_out.is_set() and stream_error is None:
+                stream_error = (
+                    f"Upstream stream idle for {idle_timeout:.0f}s "
+                    "(no content delta); aborted as a dead stream"
+                )
             if cancel_event is not None and cancel_event.is_set():
                 if stream_error is None:
                     stream_error = "Upstream stream cancelled"
 
-        _dump_intercept(
+        _dump_intercept_async(
             payload=payload,
             response_status=response.status_code,
             response_headers=dict(response.headers),
@@ -712,6 +877,9 @@ class FlowithClient:
                 for tc in tool_calls:
                     on_tool_call(tc)
 
+        if stream_error is None and not saw_terminal_event:
+            stream_error = "Upstream stream ended before completion"
+
         if stream_error:
             return {
                 "success": False,
@@ -723,6 +891,7 @@ class FlowithClient:
                 "tool_calls": tool_calls,
                 "finish_reason": finish_reason,
                 "upstream_model": upstream_model,
+                "idle_timeout": idle_timed_out.is_set(),
             }
 
         return {

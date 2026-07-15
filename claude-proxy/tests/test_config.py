@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import tempfile
 import unittest
@@ -187,6 +188,52 @@ class ConfigTests(unittest.TestCase):
                 os.environ.pop("FLOWITH_TEST_FLOAT", None)
             else:
                 os.environ["FLOWITH_TEST_FLOAT"] = old_env
+
+class MapModelTests(unittest.TestCase):
+    def _with_aliases(self, aliases: dict) -> None:
+        self._old = dict(config.CUSTOM_MODEL_ALIASES)
+        config.CUSTOM_MODEL_ALIASES.clear()
+        config.CUSTOM_MODEL_ALIASES.update(aliases)
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        config.CUSTOM_MODEL_ALIASES.clear()
+        config.CUSTOM_MODEL_ALIASES.update(self._old)
+
+    def test_strips_context_window_suffix_and_applies_alias(self) -> None:
+        from proxy.adapter import map_model
+        self._with_aliases({"claude-fable-5": "claude-fable-5"})
+        self.assertEqual(map_model("claude-fable-5[1M]"), "claude-fable-5")
+        self.assertEqual(map_model("claude-opus-4-8[1M]"), "claude-opus-4-8")
+
+    def test_exact_suffixed_alias_wins_over_stripping(self) -> None:
+        from proxy.adapter import map_model
+        self._with_aliases({"claude-fable-5[1M]": "special-target"})
+        self.assertEqual(map_model("claude-fable-5[1M]"), "special-target")
+
+    def test_plain_names_pass_through_unchanged(self) -> None:
+        from proxy.adapter import map_model
+        self._with_aliases({})
+        self.assertEqual(map_model("gpt-5.6-sol"), "gpt-5.6-sol")
+
+    def test_codex_5_6_compat_alias_is_builtin(self) -> None:
+        self.assertEqual(
+            config.DEFAULT_MODEL_ALIASES["gpt-5.4-flowith-5.6"],
+            "gpt-5.6-sol",
+        )
+
+
+class CodexModelCatalogTests(unittest.TestCase):
+    def test_gpt_5_6_models_enable_shell_tools(self) -> None:
+        catalog_path = Path(__file__).resolve().parents[1] / "codex-5.6-model-catalog.json"
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        models = {model["slug"]: model for model in catalog["models"]}
+
+        for slug in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            self.assertIn(slug, models)
+            self.assertEqual(models[slug]["shell_type"], "shell_command")
+            self.assertTrue(models[slug]["supported_in_api"])
+
 
 if __name__ == "__main__":
     unittest.main()

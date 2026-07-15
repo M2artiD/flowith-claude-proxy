@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -25,7 +26,12 @@ from ..adapter import (
     parse_xml_tool_calls,
 )
 from .. import __version__
-from ..config import DEFAULT_MODEL, FLOWITH_TRACE_HERMES
+from ..config import (
+    DEFAULT_MODEL,
+    FLOWITH_MIN_MAX_TOKENS,
+    FLOWITH_RESPONSES_COMPACT_FINAL_TEXT,
+    FLOWITH_TRACE_HERMES,
+)
 from ..upstream import FlowithClient
 
 
@@ -33,6 +39,21 @@ _TRACE_HERMES = FLOWITH_TRACE_HERMES
 
 _THINK_OPEN_TAG = "<think>"
 _THINK_CLOSE_TAG = "</think>"
+
+
+def _floor_max_tokens(value: Any) -> int:
+    """Clamp a client-supplied max_tokens up to FLOWITH_MIN_MAX_TOKENS.
+
+    gpt-5.6 spends budget on a long reasoning preamble before emitting the XML
+    tool call; a small client cap (e.g. 256) truncates mid-parameters, leaving
+    malformed tags the parser cannot recover. Flooring guarantees the tool call
+    fits. None (unset) also gets the floor.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = 0
+    return max(n, FLOWITH_MIN_MAX_TOKENS)
 
 
 def _split_stream_think_segments(
@@ -150,6 +171,7 @@ def _log_request_summary(
         f"model={requested_model} "
         f"tools={len(body.get('tools') or [])} "
         f"msgs={_request_log_message_count(body, route)} "
+        f"max_tokens={body.get('max_output_tokens', body.get('max_tokens'))} "
         f"stream={bool(body.get('stream'))}",
         flush=True,
     )
@@ -301,7 +323,7 @@ def create_router(
                     messages,
                     requested_model,
                     upstream_model,
-                    max_tokens=body.get("max_tokens"),
+                    max_tokens=_floor_max_tokens(body.get("max_tokens")),
                     temperature=body.get("temperature"),
                     top_p=body.get("top_p"),
                     tools=chat_tools,
@@ -324,7 +346,7 @@ def create_router(
             stream=False,
             tools=None if chat_tools else body.get("tools"),
             tool_choice=None if chat_tools else body.get("tool_choice"),
-            max_tokens=body.get("max_tokens"),
+            max_tokens=_floor_max_tokens(body.get("max_tokens")),
             temperature=body.get("temperature"),
             top_p=body.get("top_p"),
             stop_sequences=stop_sequences,
@@ -363,16 +385,25 @@ def create_router(
         client, upstream_model = get_client_for_key(api_key, flowith_model)
         messages = _responses_messages_from_input(body.get("input", ""))
         response_tools = _openai_tools_to_anthropic(body.get("tools") or [])
+        response_tool_choice = _responses_tool_choice(
+            body,
+            requested_model,
+            flowith_model,
+        )
         if response_tools:
             messages = _inject_responses_tool_prompt(
                 messages,
                 response_tools,
-                tool_choice=body.get("tool_choice"),
+                tool_choice=response_tool_choice,
+                tool_result_followup=(
+                    _responses_latest_is_tool_output(body)
+                    and _is_gpt_5_6_model(requested_model, flowith_model)
+                ),
             )
         if not messages:
             raise HTTPException(status_code=400, detail="At least one input message is required")
 
-        max_tokens = body.get("max_output_tokens", body.get("max_tokens"))
+        max_tokens = _floor_max_tokens(body.get("max_output_tokens", body.get("max_tokens")))
         stop_sequences = body.get("stop")
         if response_tools:
             stop_sequences = with_xml_tool_stop_sequence(stop_sequences)
@@ -563,10 +594,12 @@ def _inject_responses_tool_prompt(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     tool_choice: Any = None,
+    tool_result_followup: bool = False,
 ) -> list[dict[str, Any]]:
+    normalized_choice = _openai_tool_choice_to_anthropic(tool_choice)
     xml_prompt = build_tool_xml_prompt(
         tools,
-        tool_choice=_openai_tool_choice_to_anthropic(tool_choice),
+        tool_choice=normalized_choice,
     )
     if not xml_prompt:
         return messages
@@ -580,6 +613,40 @@ def _inject_responses_tool_prompt(
         }
     else:
         injected.insert(0, {"role": "system", "content": xml_prompt})
+
+    tool_call_required = normalized_choice == "any" or (
+        isinstance(normalized_choice, dict) and normalized_choice.get("type") == "tool"
+    )
+    if tool_call_required:
+        injected.append({
+            "role": "system",
+            "content": (
+                "TOOL CALL REQUIRED FOR THIS TURN. Do not answer with standalone prose, "
+                "explain how the user could do the action, promise to do it later, or ask "
+                "the user to do it. First output one concise user-visible action note "
+                "stating the operational reason, tool name, and exact command or concrete "
+                "action. This note is not hidden chain-of-thought and must not include a "
+                "result, success/failure claim, or final answer. Immediately then output "
+                "the XML tool call and stop. Only after a real tool observation may you "
+                "report success or failure."
+            ),
+        })
+    elif tool_result_followup:
+        injected.append({
+            "role": "system",
+            "content": (
+                "TOOL RESULT FOLLOW-UP. Re-evaluate the user's full requested outcome "
+                "against the latest observation. If any requested work remains, call the "
+                "next available tool now. Do not end this turn with a progress update or "
+                "future-tense promise such as 'I will', 'next I will', or 'I am going to'. "
+                "Before that call, output one concise user-visible action note naming the "
+                "tool and exact command or concrete action. The note must not include a "
+                "result, success/failure claim, or final answer; then immediately emit the "
+                "XML tool call. "
+                "Answer in prose only when the observations prove the requested work is "
+                "already complete; otherwise emit the XML tool call and stop."
+            ),
+        })
     return injected
 
 
@@ -624,10 +691,123 @@ def _responses_messages_from_input(raw_input: Any) -> list[dict[str, Any]]:
     return messages
 
 
+def _responses_tool_choice(
+    body: dict[str, Any],
+    requested_model: str,
+    effective_model: str | None = None,
+) -> Any:
+    choice = body.get("tool_choice")
+    latest_is_tool_output = _responses_latest_is_tool_output(body)
+    is_gpt_5_6 = _is_gpt_5_6_model(requested_model, effective_model)
+    if (
+        choice in (None, "auto")
+        and is_gpt_5_6
+        and not latest_is_tool_output
+        and _responses_turn_explicitly_requests_action(body)
+    ):
+        return "required"
+    return choice
+
+
+_CN_ACTION_VERBS = (
+    "打开|启动|运行|执行|调用|读取|查看|检查|核对|搜索|查询|联网|下载|上传|"
+    "创建|新建|生成|编写|制作|做成|添加|加入|写入|保存|修改|编辑|调整|修复|处理|删除|移动|复制|"
+    "安装|构建|测试|验证|截图|点击|停止|终止|重启|部署|提交|推送|切换|完成"
+)
+_EN_ACTION_VERBS = (
+    "open|launch|start|run|execute|call|read|inspect|check|search|browse|download|"
+    "upload|create|generate|code|make|write|save|edit|modify|adjust|fix|handle|delete|move|"
+    "copy|install|build|test|verify|click|screenshot|stop|restart|deploy|commit|push|switch"
+)
+_NEGATED_ACTION_RE = re.compile(
+    rf"(?:不要|别|无需|不用|不必)\s*(?:再\s*)?(?:帮我|为我|替我)?\s*(?:{_CN_ACTION_VERBS})"
+    rf"|\b(?:do\s+not|don't|dont|never)\s+(?:please\s+)?(?:{_EN_ACTION_VERBS})\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_ACTION_RE = re.compile(
+    rf"(?:^|[。！？!?；;]\s*)(?:请(?:你)?|麻烦(?:你)?|帮我|为我|给我|替我|现在|马上|立即|快点|继续|直接)?\s*(?:{_CN_ACTION_VERBS})"
+    rf"|(?:^|[.!?;]\s*)(?:please\s+|can\s+you\s+|could\s+you\s+|i\s+need\s+you\s+to\s+)?(?:{_EN_ACTION_VERBS})\b",
+    re.IGNORECASE,
+)
+
+
+def _responses_turn_explicitly_requests_action(body: dict[str, Any]) -> bool:
+    text = _responses_latest_user_text(body)
+    if not text:
+        return False
+    without_negated_actions = _NEGATED_ACTION_RE.sub("", text)
+    return bool(_EXPLICIT_ACTION_RE.search(without_negated_actions))
+
+
+def _responses_latest_user_text(body: dict[str, Any]) -> str:
+    raw_input = body.get("input")
+    if isinstance(raw_input, str):
+        return raw_input
+    if not isinstance(raw_input, list):
+        return ""
+
+    latest_item = next(
+        (item for item in reversed(raw_input) if isinstance(item, (str, dict))),
+        None,
+    )
+    if isinstance(latest_item, str):
+        return latest_item
+    if not isinstance(latest_item, dict):
+        return ""
+
+    item_type = latest_item.get("type")
+    role = latest_item.get("role")
+    if item_type == "message" or role == "user":
+        if role not in (None, "user"):
+            return ""
+        return _extract_openai_text(latest_item.get("content"))
+    if item_type in {"input_text", "output_text"}:
+        return str(latest_item.get("text", "") or "")
+    return ""
+
+
+def _responses_latest_is_tool_output(body: dict[str, Any]) -> bool:
+    raw_input = body.get("input")
+    latest_item = None
+    if isinstance(raw_input, list):
+        latest_item = next(
+            (item for item in reversed(raw_input) if isinstance(item, dict)),
+            None,
+        )
+    latest_is_tool_output = (
+        isinstance(latest_item, dict)
+        and latest_item.get("type") == "function_call_output"
+    )
+    return latest_is_tool_output
+
+
+def _is_gpt_5_6_model(requested_model: str, effective_model: str | None = None) -> bool:
+    return requested_model.startswith("gpt-5.6") or (
+        isinstance(effective_model, str) and effective_model.startswith("gpt-5.6")
+    )
+
+
 def _finish_reason_openai(finish_reason: str | None) -> str:
     if finish_reason in {"length", "tool_calls", "content_filter"}:
         return finish_reason
     return "stop"
+
+
+def _tool_call_truncated(result: dict[str, Any]) -> bool:
+    # A partial XML tool call (opened tag, never closed) parses via
+    # allow_partial and would otherwise ship as a successful tool_calls
+    # result with malformed / half-populated arguments. Only treat it as a
+    # cutoff when upstream actually hit its token ceiling -- a bare "<tool_call"
+    # prefix under a normal stop is prose, not a truncated call.
+    if _finish_reason_openai(result.get("finish_reason")) != "length":
+        return False
+    content = result.get("content", "") or ""
+    if find_xml_tool_call_start(content) == -1:
+        return False
+    if find_xml_tool_call_end(content) == -1:
+        return True
+    # Closed the tag but nothing parsed cleanly -> arguments got cut off.
+    return not parse_xml_tool_calls(content)
 
 
 def _usage_openai(usage: dict[str, Any]) -> dict[str, int]:
@@ -691,10 +871,15 @@ def _chat_completion_response(result: dict[str, Any], requested_model: str) -> d
     content, extracted_reasoning = _extract_think_from_text(content)
     if extracted_reasoning:
         reasoning = (reasoning + "\n" if reasoning else "") + extracted_reasoning
-    tool_calls = _chat_tool_calls_from_result(result)
+    truncated = _tool_call_truncated(result)
+    tool_calls = [] if truncated else _chat_tool_calls_from_result(result)
+    if not content and not tool_calls and not truncated and reasoning:
+        content = reasoning
     message: dict[str, Any] = {"role": "assistant", "content": content}
     finish_reason = _finish_reason_openai(result.get("finish_reason"))
-    if tool_calls:
+    if truncated:
+        finish_reason = "length"
+    elif tool_calls:
         message = {"role": "assistant", "content": None, "tool_calls": tool_calls}
         finish_reason = "tool_calls"
     if reasoning:
@@ -1022,6 +1207,12 @@ def _chat_stream_events(
         f"result_success={result.get('success')}"
     )
     if not result.get("success"):
+        # Flush whatever was held back in xml_buffer to disambiguate a possible
+        # tool-call marker split across chunks -- on error there is no later
+        # chunk coming, so treat it as plain text instead of dropping it.
+        if xml_buffer:
+            segments, xml_buffer = _drain_xml_tool_stream_buffer(xml_buffer, final=True)
+            yield from _emit_tool_segments(segments)
         yield _openai_sse(
             None,
             {"error": {"type": "upstream_error", "message": str(result.get("error", "upstream error"))}},
@@ -1061,7 +1252,10 @@ def _chat_stream_events(
         f"result_finish_reason={result.get('finish_reason')!r} "
         f"final_reason={('tool_calls' if has_tools and emitted_tool_calls else _finish_reason_openai(result.get('finish_reason')))!r}"
     )
-    final_reason = "tool_calls" if has_tools and emitted_tool_calls else _finish_reason_openai(result.get("finish_reason"))
+    if _tool_call_truncated(result):
+        final_reason = "length"
+    else:
+        final_reason = "tool_calls" if has_tools and emitted_tool_calls else _finish_reason_openai(result.get("finish_reason"))
     final_chunk = {
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -1147,7 +1341,10 @@ def _responses_response(result: dict[str, Any], requested_model: str) -> dict[st
         reasoning = (reasoning + "\n" if reasoning else "") + extracted_reasoning
     response_id = "resp_" + new_message_id()[4:]
     message_id = "msg_" + new_message_id()[4:]
-    function_calls = _responses_function_calls_from_result(result)
+    truncated = _tool_call_truncated(result)
+    function_calls = [] if truncated else _responses_function_calls_from_result(result)
+    if not content and not function_calls and not truncated and reasoning:
+        content = reasoning
     output: list[dict[str, Any]] = []
     output_text = content
     if reasoning:
@@ -1179,16 +1376,19 @@ def _responses_response(result: dict[str, Any], requested_model: str) -> dict[st
                 ],
             }
         )
-    return {
+    response: dict[str, Any] = {
         "id": response_id,
         "object": "response",
         "created_at": now,
-        "status": "completed",
+        "status": "incomplete" if truncated else "completed",
         "model": requested_model,
         "output": output,
         "output_text": output_text,
         "usage": _usage_responses(result.get("usage", {}) or {}),
     }
+    if truncated:
+        response["incomplete_details"] = {"reason": "max_output_tokens"}
+    return response
 
 
 def _upstream_error_response(result: dict[str, Any]) -> JSONResponse:
@@ -1201,6 +1401,14 @@ def _upstream_error_response(result: dict[str, Any]) -> JSONResponse:
             }
         },
     )
+
+
+def _concise_tool_action_note(text: str) -> str:
+    for line in text.splitlines():
+        note = line.strip()
+        if note:
+            return note
+    return ""
 
 
 def _responses_stream_events(
@@ -1275,6 +1483,7 @@ def _responses_stream_events(
     yield _openai_sse("response.created", created).encode("utf-8")
 
     has_tools = bool(tools)
+    tool_feedback_mode = has_tools and _is_gpt_5_6_model(requested_model, upstream_model)
     text_item_started = False
     trace_id = response_id[-6:]
     _trace_hermes(f"responses_stream_start trace={trace_id} has_tools={has_tools}")
@@ -1317,6 +1526,7 @@ def _responses_stream_events(
     text_output_index: int | None = None
     raw_stream_chunks = 0
     streamed_text_chunks = 0
+    pending_tool_text = ""
 
     def _emit_text_delta(text: str) -> Generator[bytes, None, None]:
         nonlocal output_text, streamed_text_chunks
@@ -1342,6 +1552,7 @@ def _responses_stream_events(
             return
         text_done_emitted = True
         reported_text = output_text if final_text is None else final_text
+        final_event_text = "" if FLOWITH_RESPONSES_COMPACT_FINAL_TEXT else reported_text
         output_index = text_output_index if text_output_index is not None else 0
         _trace_hermes(f"responses_stream_event trace={trace_id} event=response.output_text.done text_len={len(reported_text)}")
         yield _openai_sse(
@@ -1351,7 +1562,7 @@ def _responses_stream_events(
                 "item_id": message_id,
                 "output_index": output_index,
                 "content_index": 0,
-                "text": reported_text,
+                "text": final_event_text,
             },
         ).encode("utf-8")
         yield _openai_sse(
@@ -1361,7 +1572,7 @@ def _responses_stream_events(
                 "item_id": message_id,
                 "output_index": output_index,
                 "content_index": 0,
-                "part": {"type": "output_text", "text": reported_text, "annotations": []},
+                "part": {"type": "output_text", "text": final_event_text, "annotations": []},
             },
         ).encode("utf-8")
         message_item = {
@@ -1369,7 +1580,7 @@ def _responses_stream_events(
             "type": "message",
             "status": "completed",
             "role": "assistant",
-            "content": [{"type": "output_text", "text": reported_text, "annotations": []}],
+            "content": [{"type": "output_text", "text": final_event_text, "annotations": []}],
         }
         completed_items[output_index] = message_item
         yield _openai_sse(
@@ -1432,9 +1643,23 @@ def _responses_stream_events(
             },
         ).encode("utf-8")
 
+    def _emit_pending_tool_note() -> Generator[bytes, None, None]:
+        nonlocal pending_tool_text
+        note = _concise_tool_action_note(pending_tool_text)
+        pending_tool_text = ""
+        if not note:
+            return
+        yield from _emit_text_delta(note)
+        yield from _emit_text_done()
+
     def _emit_response_segments(segments: list[tuple[str, Any]]) -> Generator[bytes, None, None]:
+        nonlocal pending_tool_text
         for kind, payload in segments:
             if kind == "text":
+                if tool_feedback_mode:
+                    if not emitted_function_calls:
+                        pending_tool_text += str(payload)
+                    continue
                 yield from _emit_text_delta(str(payload))
                 continue
             if kind == "tools":
@@ -1442,6 +1667,8 @@ def _responses_stream_events(
                 _trace_hermes(
                     f"responses_stream_tool_mode trace={trace_id} function_calls={len(function_calls)}"
                 )
+                if tool_feedback_mode and function_calls and not emitted_function_calls:
+                    yield from _emit_pending_tool_note()
                 for function_call in function_calls:
                     yield from _emit_function_call(function_call)
 
@@ -1509,6 +1736,7 @@ def _responses_stream_events(
             return
         reasoning_item_done = True
         reported = reasoning_text_accum if final_text is None else final_text
+        final_event_text = "" if FLOWITH_RESPONSES_COMPACT_FINAL_TEXT else reported
         output_index = reasoning_output_index if reasoning_output_index is not None else 0
         _trace_hermes(
             f"responses_stream_event trace={trace_id} event=response.reasoning_summary_text.done text_len={len(reported)}"
@@ -1520,7 +1748,7 @@ def _responses_stream_events(
                 "item_id": reasoning_item_id,
                 "output_index": output_index,
                 "summary_index": 0,
-                "text": reported,
+                "text": final_event_text,
             },
         ).encode("utf-8")
         yield _openai_sse(
@@ -1530,13 +1758,13 @@ def _responses_stream_events(
                 "item_id": reasoning_item_id,
                 "output_index": output_index,
                 "summary_index": 0,
-                "part": {"type": "summary_text", "text": reported},
+                "part": {"type": "summary_text", "text": final_event_text},
             },
         ).encode("utf-8")
         reasoning_item = {
             "id": reasoning_item_id,
             "type": "reasoning",
-            "summary": [{"type": "summary_text", "text": reported}],
+            "summary": [{"type": "summary_text", "text": final_event_text}],
         }
         completed_items[output_index] = reasoning_item
         yield _openai_sse(
@@ -1608,13 +1836,30 @@ def _responses_stream_events(
         f"result_success={result.get('success')}"
     )
     if not result.get("success"):
+        error_message = str(result.get("error", "upstream error"))
+        if tool_feedback_mode and pending_tool_text and not emitted_function_calls:
+            yield from _emit_text_delta(pending_tool_text)
+            pending_tool_text = ""
+        yield from _emit_reasoning_done()
+        yield from _emit_text_done()
+        completed_output = [completed_items[index] for index in sorted(completed_items)]
         yield _openai_sse(
-            "error",
+            "response.failed",
             {
-                "type": "error",
-                "error": {"type": "upstream_error", "message": str(result.get("error", "upstream error"))},
+                "type": "response.failed",
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "created_at": now,
+                    "status": "failed",
+                    "model": requested_model,
+                    "output": completed_output,
+                    "output_text": "" if FLOWITH_RESPONSES_COMPACT_FINAL_TEXT else output_text,
+                    "error": {"type": "upstream_error", "message": error_message},
+                },
             },
         ).encode("utf-8")
+        yield _openai_sse(None, "[DONE]").encode("utf-8")
         return
 
     usage = _usage_responses(result.get("usage", {}) or {})
@@ -1627,8 +1872,14 @@ def _responses_stream_events(
         _trace_hermes(
             f"responses_stream_tool_mode trace={trace_id} function_calls={len(native_function_calls)}"
         )
+        if tool_feedback_mode and not emitted_function_calls:
+            yield from _emit_pending_tool_note()
         for function_call in native_function_calls:
             yield from _emit_function_call(function_call)
+
+    if tool_feedback_mode and pending_tool_text and not emitted_function_calls:
+        yield from _emit_text_delta(pending_tool_text)
+        pending_tool_text = ""
 
     # Finalize reasoning first; if upstream only returned reasoning at the end (non-stream fallback),
     # emit whatever accumulated in result.reasoning_content.
@@ -1658,22 +1909,27 @@ def _responses_stream_events(
 
     completed_output = [completed_items[index] for index in sorted(completed_items)]
 
+    truncated = _tool_call_truncated(result)
     completed_mode = "function_calls" if emitted_function_calls else "text"
-    _trace_hermes(f"responses_stream_event trace={trace_id} event=response.completed mode={completed_mode}")
+    event_type = "response.incomplete" if truncated else "response.completed"
+    _trace_hermes(f"responses_stream_event trace={trace_id} event={event_type} mode={completed_mode}")
+    response_payload: dict[str, Any] = {
+        "id": response_id,
+        "object": "response",
+        "created_at": now,
+        "status": "incomplete" if truncated else "completed",
+        "model": requested_model,
+        "output": completed_output,
+        "output_text": "" if FLOWITH_RESPONSES_COMPACT_FINAL_TEXT else output_text,
+        "usage": usage,
+    }
+    if truncated:
+        response_payload["incomplete_details"] = {"reason": "max_output_tokens"}
     yield _openai_sse(
-        "response.completed",
+        event_type,
         {
-            "type": "response.completed",
-            "response": {
-                "id": response_id,
-                "object": "response",
-                "created_at": now,
-                "status": "completed",
-                "model": requested_model,
-                "output": completed_output,
-                "output_text": output_text,
-                "usage": usage,
-            },
+            "type": event_type,
+            "response": response_payload,
         },
     ).encode("utf-8")
     yield _openai_sse(None, "[DONE]").encode("utf-8")
