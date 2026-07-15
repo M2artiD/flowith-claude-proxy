@@ -1190,7 +1190,10 @@ def _recent_context_fallback_messages(
             continue
         message_chars = len(str(message.get("content", "") or ""))
         if used_chars + message_chars > limit:
-            continue
+            # Keep a contiguous recent suffix. Skipping an oversized message
+            # and then adding older ones can detach a tool observation from its
+            # tool call or send stale turns while omitting the current context.
+            break
         recent_messages.append(message)
         used_chars += message_chars
 

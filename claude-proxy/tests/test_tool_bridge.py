@@ -98,6 +98,24 @@ class ToolBridgeTests(unittest.TestCase):
         self.assertIn("must not include a result, success/failure claim, or final answer", prompt)
         self.assertIn("greetings, casual conversation, or explanation-only questions", prompt)
 
+    def test_tool_prompt_caps_large_top_level_descriptions(self) -> None:
+        description = "tool details " * 2_000
+
+        prompt = build_tool_xml_prompt([
+            {
+                "name": "large_tool",
+                "description": description,
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                },
+            }
+        ])
+
+        self.assertIn(description[:300], prompt)
+        self.assertNotIn(description[:301], prompt)
+        self.assertLess(len(prompt), 5_000)
+
     def setUp(self) -> None:
         self.original_server_api_key = server._SERVER_API_KEY
         self.original_default_client = server._default_client
@@ -732,6 +750,21 @@ class ToolBridgeTests(unittest.TestCase):
         self.assertIn("Shanghai", sent_messages[-1]["content"])
         self.assertNotIn("old history", "\n".join(m["content"] for m in sent_messages))
         self.assertIn('"type": "tool_use"', events)
+
+    def test_context_compaction_keeps_a_contiguous_recent_suffix(self) -> None:
+        messages = [
+            {"role": "system", "content": "tool instructions"},
+            {"role": "user", "content": "stale request"},
+            {"role": "assistant", "content": "large intermediate output " * 20},
+            {"role": "user", "content": "current request must use Bash"},
+        ]
+
+        compacted = server._recent_context_fallback_messages(messages, limit=100)
+
+        self.assertEqual(
+            compacted,
+            [messages[0], messages[-1]],
+        )
 
     def test_streaming_with_tools_preserves_plain_text_before_and_after_xml_tool_call(self) -> None:
         class StreamingFakeFlowithClient:

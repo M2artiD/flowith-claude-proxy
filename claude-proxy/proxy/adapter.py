@@ -289,7 +289,12 @@ def _build_tool_xml_prompt(
         name = tool.get("name", "")
         if not name:
             continue
-        desc = tool.get("description", "")
+        # Claude Code tool descriptions can be several kilobytes each. Sending
+        # all of that prose through the XML bridge made the generated system
+        # prompt larger than Fable's reliable context window before any
+        # conversation history was added. The schema below carries the exact
+        # callable shape; a short description is enough for tool selection.
+        desc = str(tool.get("description", "") or "")[:300]
         schema = _compact_schema(tool.get("input_schema", {}) or {})
         schema_json = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
         lines = [f"### {name}"]

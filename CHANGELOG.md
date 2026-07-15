@@ -2,6 +2,7 @@
 
 ## 2026-07-15
 
+- Fixed Fable empty replies and missing tool calls in real Claude Code requests with the full tool catalog: oversized tool descriptions are now bounded, and long-context trimming keeps a continuous recent suffix instead of stitching stale turns around skipped messages.
 - Balanced GPT-5.6 tool enforcement: greetings, casual conversation, explanation-only questions, and explicitly negated actions no longer force tools, while terminal/file/browser/build requests still require real calls.
 - Added user-visible GPT-5.6 tool feedback before every call: a concise operational reason, tool name, and exact command/action. The Responses stream now removes premature result text and closes the feedback item before emitting the function call.
 - Prevented GPT-5.6 from ending a multi-step tool task after an intermediate observation with only a progress update or future-tense promise; incomplete work must continue with the next tool call.
