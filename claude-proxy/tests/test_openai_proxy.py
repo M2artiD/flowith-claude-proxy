@@ -1047,6 +1047,48 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertNotIn('"text": "hello"', events)
         self.assertNotIn('"output_text": "hello"', events)
 
+    def test_hermes_chat_injects_single_answer_rule(self) -> None:
+        with patch("proxy.codex.router.FLOWITH_HERMES_SINGLE_ANSWER", True, create=True):
+            response = self.client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer test-key"},
+                json={
+                    "model": "gpt-5.6-terra",
+                    "messages": [{"role": "user", "content": "Explain Result::Ok."}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        prompts = [str(message.get("content", "")) for message in self.fake_client.calls[0]["messages"]]
+        self.assertTrue(any("HERMES SINGLE-ANSWER RULE" in prompt for prompt in prompts))
+        self.assertTrue(any("Each distinct point" in prompt for prompt in prompts))
+
+    def test_hermes_responses_injects_single_answer_rule(self) -> None:
+        with patch("proxy.codex.router.FLOWITH_HERMES_SINGLE_ANSWER", True, create=True):
+            response = self.client.post(
+                "/v1/responses",
+                headers={"Authorization": "Bearer test-key"},
+                json={"model": "gpt-5.6-terra", "input": "Explain Result::Ok."},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        prompts = [str(message.get("content", "")) for message in self.fake_client.calls[0]["messages"]]
+        self.assertTrue(any("HERMES SINGLE-ANSWER RULE" in prompt for prompt in prompts))
+
+    def test_single_answer_rule_disabled_by_default(self) -> None:
+        response = self.client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-terra",
+                "messages": [{"role": "user", "content": "Explain Result::Ok."}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        prompts = [str(message.get("content", "")) for message in self.fake_client.calls[0]["messages"]]
+        self.assertFalse(any("HERMES SINGLE-ANSWER RULE" in prompt for prompt in prompts))
+
     def test_responses_streaming_preserves_final_partial_think_prefix(self) -> None:
         self.fake_client.next_stream_chunks = ["answer <th"]
 

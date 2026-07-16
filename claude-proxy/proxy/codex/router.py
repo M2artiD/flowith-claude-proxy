@@ -28,6 +28,7 @@ from ..adapter import (
 from .. import __version__
 from ..config import (
     DEFAULT_MODEL,
+    FLOWITH_HERMES_SINGLE_ANSWER,
     FLOWITH_MIN_MAX_TOKENS,
     FLOWITH_RESPONSES_COMPACT_FINAL_TEXT,
     FLOWITH_SSE_HEARTBEAT_INTERVAL,
@@ -140,6 +141,15 @@ def _trace_hermes(message: str) -> None:
 
 _SENTINEL_DONE = object()
 
+_HERMES_SINGLE_ANSWER_PROMPT = (
+    "HERMES SINGLE-ANSWER RULE: Produce one consolidated answer per user turn. "
+    "Each distinct point must be stated once. Keep necessary detail, code, and one useful "
+    "example, but merge or omit paraphrased restatements, repeated conclusions, recap "
+    "sections, and alternate versions of the same answer. Do not emit a draft or status "
+    "message that merely restates the final answer. Preserve genuinely different facts, "
+    "requested steps, and required tool calls."
+)
+
 ReadJsonObject = Callable[[Request], Awaitable[dict[str, Any]]]
 RequireProfile = Callable[..., None]
 RequireApiKey = Callable[[str | None, str | None], str]
@@ -147,6 +157,20 @@ RequireDiscoveryApiKey = Callable[[str | None, str | None], None]
 GetClientForKey = Callable[[str, str], tuple[FlowithClient, str | None]]
 WithXmlToolStopSequence = Callable[[list[str] | str | None], list[str]]
 RequestLogEnabled = Callable[[], bool]
+
+
+def _inject_hermes_single_answer_prompt(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not FLOWITH_HERMES_SINGLE_ANSWER:
+        return messages
+
+    insert_at = 0
+    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+        insert_at += 1
+    return [
+        *messages[:insert_at],
+        {"role": "system", "content": _HERMES_SINGLE_ANSWER_PROMPT},
+        *messages[insert_at:],
+    ]
 
 
 def _request_log_message_count(body: dict[str, Any], route: str) -> int:
@@ -304,6 +328,7 @@ def create_router(
         flowith_model = map_model(requested_model, default=DEFAULT_MODEL)
         client, upstream_model = get_client_for_key(api_key, flowith_model)
         messages = _chat_messages_from_body(body)
+        messages = _inject_hermes_single_answer_prompt(messages)
         chat_tools = _openai_tools_to_anthropic(body.get("tools") or [])
         if chat_tools:
             messages = _inject_responses_tool_prompt(
@@ -386,6 +411,7 @@ def create_router(
         flowith_model = map_model(requested_model, default=DEFAULT_MODEL)
         client, upstream_model = get_client_for_key(api_key, flowith_model)
         messages = _responses_messages_from_input(body.get("input", ""))
+        messages = _inject_hermes_single_answer_prompt(messages)
         response_tools = _openai_tools_to_anthropic(body.get("tools") or [])
         response_tool_choice = _responses_tool_choice(
             body,

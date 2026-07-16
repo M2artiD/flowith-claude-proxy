@@ -2,6 +2,7 @@
 
 ## 2026-07-16
 
+- Added a Hermes-only single-answer mode for port 8789: chat/responses requests ask the model to state each distinct point once while retaining necessary detail and examples, and the CN Desktop configuration no longer renders interim assistant status messages as separate chat answers. Existing Responses final-snapshot compaction remains active.
 - Tightened the GPT-5.6 action gate without returning to force-tools-on-every-turn behavior: Chinese object-fronted requests such as `这些话为我提炼成...写在当前工作区` and colloquial continuations such as `继续啊` now require execution, while greetings, negated actions, and explanation-only quotations remain tool-optional.
 - Added bounded Fable empty-response recovery on the Anthropic path: after context compaction and same-model recovery are exhausted without delivering a delta, the proxy can make one transparent request with a configured non-Fable model; a Fable first-byte idle timeout now returns immediately to this route-level fallback instead of spending another full same-model watchdog window.
 - Closed an action-classification gap found by a real Codex CLI probe: mandatory Chinese forms such as `必须实际调用`, delivery phrases such as `写一个...`, and English `use <tool> to <verb>` requests now enter the GPT-5.6 required-tool path instead of accepting a promise plus a premature success marker.

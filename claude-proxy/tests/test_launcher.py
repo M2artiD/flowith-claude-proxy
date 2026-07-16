@@ -68,6 +68,13 @@ class LauncherBatchTests(unittest.TestCase):
         self.assertIn('$ProgressPreference = "SilentlyContinue"', text)
         self.assertIn("-UseBasicParsing", text)
 
+    def test_hermes_launcher_enables_single_answer_mode(self) -> None:
+        text = self._read("start-hermes.bat")
+        self.assertIn(
+            'set "FLOWITH_HERMES_SINGLE_ANSWER=true"',
+            text,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -124,6 +124,13 @@ FLOWITH_RESPONSES_COMPACT_FINAL_TEXT = os.environ.get(
     "FLOWITH_RESPONSES_COMPACT_FINAL_TEXT", "false"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
+# Hermes can surface semantically redundant interim/draft/final prose even
+# when the transport emitted each event only once. Keep this opt-in and enable
+# it only in the dedicated 8789 launcher so normal Codex behavior is unchanged.
+FLOWITH_HERMES_SINGLE_ANSWER = os.environ.get(
+    "FLOWITH_HERMES_SINGLE_ANSWER", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+
 FLOWITH_REQUEST_LOG = os.environ.get("FLOWITH_REQUEST_LOG", "false").strip().lower() in {
     "1", "true", "yes", "on",
 }
