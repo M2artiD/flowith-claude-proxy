@@ -760,7 +760,7 @@ def _responses_tool_choice(
 
 _CN_ACTION_VERBS = (
     "打开|启动|运行|执行|调用|读取|查看|检查|核对|搜索|查询|联网|下载|上传|"
-    "创建|新建|生成|编写|制作|做成|添加|加入|写入|保存|修改|编辑|调整|修复|处理|删除|移动|复制|"
+    "创建|新建|生成|编写|制作|做成|提炼|整理|归纳|转换|转成|添加|加入|写入|保存|修改|编辑|调整|修复|处理|删除|移动|复制|"
     "安装|构建|测试|验证|截图|点击|停止|终止|重启|部署|提交|推送|切换|完成"
 )
 _EN_ACTION_VERBS = (
@@ -782,11 +782,12 @@ _EXPLICIT_ACTION_RE = re.compile(
     rf"|(?:^|[.!?;]\s*)"
     rf"(?:please\s+|can\s+you\s+|could\s+you\s+|i\s+need\s+you\s+to\s+|"
     rf"(?:you\s+)?must\s+(?:actually\s+)?)?(?:{_EN_ACTION_VERBS})\b"
-    rf"|(?:^|[.!?;]\s*)use\b.{{0,80}}?\bto\s+(?:{_EN_ACTION_VERBS})\b",
+    rf"|(?:^|[.!?;]\s*)use\b.{{0,80}}?\bto\s+(?:{_EN_ACTION_VERBS})\b"
+    rf"|(?:帮我|为我|给我|替我)\s*(?:{_CN_ACTION})",
     re.IGNORECASE,
 )
 _TERSE_ACTION_CONTINUATION_RE = re.compile(
-    r"^(?:去吧|继续|开始|动手|照做|执行吧|做吧|快点|赶紧|接着做|"
+    r"^(?:(?:去吧|继续|开始|动手|照做|执行吧|做吧|快点|赶紧|接着做)(?:啊|呀|吧|呢)?|"
     r"go\s+ahead|do\s+it|proceed|continue|start\s+now)[。.!！]?\s*$",
     re.IGNORECASE,
 )
@@ -797,6 +798,11 @@ _ACTION_FAILURE_REPORT_RE = re.compile(
 )
 _EXPLANATION_QUESTION_RE = re.compile(
     r"(?:为什么|怎么回事|是什么意思|请解释|解释一下|\bwhy\b|what\s+does|how\s+come)",
+    re.IGNORECASE,
+)
+_EXPLANATION_ONLY_RE = re.compile(
+    r"(?:只(?:需|要)?\s*(?:解释|说明|回答)|仅\s*(?:解释|说明|回答)|"
+    r"\bonly\s+(?:explain|describe|answer)\b)",
     re.IGNORECASE,
 )
 
@@ -813,6 +819,8 @@ def _responses_turn_explicitly_requests_action(body: dict[str, Any]) -> bool:
     if not user_texts:
         return False
     latest = user_texts[-1].strip()
+    if _EXPLANATION_QUESTION_RE.search(latest) and _EXPLANATION_ONLY_RE.search(latest):
+        return False
     if _text_explicitly_requests_action(latest):
         return True
     if _EXPLANATION_QUESTION_RE.search(latest):

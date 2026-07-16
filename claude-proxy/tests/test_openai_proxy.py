@@ -616,6 +616,22 @@ class OpenAIProxyTests(unittest.TestCase):
         last_message = self.fake_client.calls[0]["messages"][-1]
         self.assertIn("TOOL CALL REQUIRED FOR THIS TURN", last_message["content"])
 
+    def test_responses_gpt_5_6_object_fronted_workspace_write_requires_a_tool(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "这些话为我提炼成skills写在当前工作区",
+                "tools": [
+                    {"type": "function", "name": "shell_command", "parameters": {"type": "object"}}
+                ],
+            },
+        )
+
+        last_message = self.fake_client.calls[0]["messages"][-1]
+        self.assertIn("TOOL CALL REQUIRED FOR THIS TURN", last_message["content"])
+
     def test_responses_gpt_5_6_greeting_does_not_require_a_tool(self) -> None:
         self.client.post(
             "/v1/responses",
@@ -643,6 +659,38 @@ class OpenAIProxyTests(unittest.TestCase):
 
         messages = self.fake_client.calls[0]["messages"]
         self.assertFalse(any("TOOL CALL REQUIRED FOR THIS TURN" in message["content"] for message in messages))
+
+    def test_responses_gpt_5_6_quoted_action_explanation_does_not_require_a_tool(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "‘为我创建一个技能’是什么意思？只解释这句话。",
+                "tools": [
+                    {"type": "function", "name": "shell_command", "parameters": {"type": "object"}}
+                ],
+            },
+        )
+
+        messages = self.fake_client.calls[0]["messages"]
+        self.assertFalse(any("TOOL CALL REQUIRED FOR THIS TURN" in message["content"] for message in messages))
+
+    def test_responses_gpt_5_6_explanation_plus_explicit_repair_requires_a_tool(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "为什么会失败？请帮我修复它。",
+                "tools": [
+                    {"type": "function", "name": "shell_command", "parameters": {"type": "object"}}
+                ],
+            },
+        )
+
+        last_message = self.fake_client.calls[0]["messages"][-1]
+        self.assertIn("TOOL CALL REQUIRED FOR THIS TURN", last_message["content"])
 
     def test_responses_gpt_5_6_negated_action_does_not_require_a_tool(self) -> None:
         self.client.post(
@@ -705,6 +753,30 @@ class OpenAIProxyTests(unittest.TestCase):
                     {"type": "message", "role": "user", "content": "写一个互动 HTML 到桌面"},
                     {"type": "message", "role": "assistant", "content": "我会处理。"},
                     {"type": "message", "role": "user", "content": "去吧"},
+                ],
+                "tools": [
+                    {"type": "function", "name": "shell_command", "parameters": {"type": "object"}}
+                ],
+            },
+        )
+
+        last_message = self.fake_client.calls[0]["messages"][-1]
+        self.assertIn("TOOL CALL REQUIRED FOR THIS TURN", last_message["content"])
+
+    def test_responses_gpt_5_6_colloquial_continue_inherits_object_fronted_action(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": "这些话为我提炼成skills写在当前工作区",
+                    },
+                    {"type": "message", "role": "assistant", "content": "我会先检查技能规范。"},
+                    {"type": "message", "role": "user", "content": "继续啊"},
                 ],
                 "tools": [
                     {"type": "function", "name": "shell_command", "parameters": {"type": "object"}}
@@ -1333,6 +1405,63 @@ class OpenAIProxyTests(unittest.TestCase):
                 for message in correcting_client.calls[1]["messages"]
             )
         )
+
+    def test_responses_object_fronted_action_corrects_repeated_no_tool_promise(self) -> None:
+        class CorrectingClient:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def call_api(self, messages, **kwargs):
+                self.calls.append({"messages": [dict(message) for message in messages], **kwargs})
+                if len(self.calls) == 1:
+                    line = (
+                        "我将用 `shell_command` 检查当前目录、技能脚手架与校验脚本，"
+                        "具体执行 `Get-ChildItem`。"
+                    )
+                    text = f"{line}\n{line}"
+                    kwargs["on_chunk"](text)
+                    return {
+                        "success": True,
+                        "content": text,
+                        "usage": {},
+                        "finish_reason": "stop",
+                    }
+
+                chunks = [
+                    "使用 `shell_command` 执行 `Get-ChildItem`，确认当前工作区结构。",
+                    "<tool_call>\n<name>shell_command</name>\n",
+                    "<parameters>\n",
+                    '{"command":"Get-ChildItem"}',
+                    "\n</parameters>\n</tool_call>",
+                ]
+                for chunk in chunks:
+                    kwargs["on_chunk"](chunk)
+                return {
+                    "success": True,
+                    "content": "".join(chunks),
+                    "usage": {},
+                    "finish_reason": "stop",
+                }
+
+        correcting_client = CorrectingClient()
+        server._default_client = correcting_client
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "这些话为我提炼成skills写在当前工作区",
+                "stream": True,
+                "tools": [
+                    {"type": "function", "name": "shell_command", "parameters": {"type": "object"}}
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(correcting_client.calls), 2)
+        self.assertNotIn("技能脚手架与校验脚本", response.text)
+        self.assertIn('"type": "function_call"', response.text)
 
     def test_responses_required_action_allows_two_corrections_before_failing(self) -> None:
         class TwiceAvoidingClient:
