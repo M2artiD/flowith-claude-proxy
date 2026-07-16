@@ -531,6 +531,17 @@ class FlowithClient:
                             # generic error path (which would burn N x idle_timeout).
                             last_error = Exception(str(result["error"]))
                             last_was_empty_stream = True
+                            if str(use_model or "").strip().lower() == "claude-fable-5":
+                                # A Fable idle timeout already consumed its full
+                                # first-byte watchdog. Return immediately so the
+                                # route can switch to a non-Fable fallback instead
+                                # of spending another watchdog window on Fable.
+                                return {
+                                    "success": False,
+                                    "empty_response": True,
+                                    "idle_timeout": True,
+                                    "error": str(result["error"]),
+                                }
                             # An idle timeout already spent the expensive
                             # first-byte budget. Do not repeat the generic
                             # six-attempt loop before entering the bounded

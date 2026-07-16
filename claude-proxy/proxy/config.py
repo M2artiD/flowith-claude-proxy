@@ -72,6 +72,13 @@ FLOWITH_EMPTY_CONTEXT_FALLBACK_CHARS = _env_int("FLOWITH_EMPTY_CONTEXT_FALLBACK_
 # Compact only Fable requests above this budget before sending them upstream.
 # Set to 0 to disable preemptive compaction.
 FLOWITH_FABLE_CONTEXT_COMPACT_CHARS = _env_int("FLOWITH_FABLE_CONTEXT_COMPACT_CHARS", 90000)
+# Once Fable still returns empty after compaction/retries, switch models instead
+# of reporting a successful-looking empty turn. Defaults to the normal proxy
+# model; set blank to disable or choose another non-Fable Flowith model.
+FLOWITH_FABLE_FALLBACK_MODEL = os.environ.get(
+    "FLOWITH_FABLE_FALLBACK_MODEL",
+    DEFAULT_MODEL,
+).strip()
 # A dead upstream stream delivers zero content for its whole life (measured:
 # 240-277s of silence) before finally hanging or sending an empty terminal
 # frame. A healthy stream, by contrast, delivers its first byte within ~83s

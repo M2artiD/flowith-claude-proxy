@@ -668,6 +668,63 @@ class ToolBridgeTests(unittest.TestCase):
         self.assertIn('"stop_reason": "end_turn"', events)
         self.assertIn('"type": "message_stop"', events)
 
+    def test_fable_exhausted_empty_response_uses_non_fable_model_fallback(self) -> None:
+        class ModelFallbackClient:
+            model = "claude-fable-5"
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def call_api(self, messages, **kwargs):
+                self.calls.append({"messages": messages, "model": kwargs.get("model")})
+                if kwargs.get("model") == "claude-fable-5":
+                    return {
+                        "success": False,
+                        "empty_response": True,
+                        "error": "Upstream returned no content after the bounded retry budget.",
+                    }
+                kwargs["on_chunk"](
+                    '<tool_call>\n<name>Bash</name>\n'
+                    '<parameters>{"command":"pwd"}</parameters>\n</tool_call>'
+                )
+                return {"success": True, "content": "", "usage": {}, "finish_reason": "stop"}
+
+        client = ModelFallbackClient()
+        messages = [
+            {"role": "system", "content": "tool instructions"},
+            {"role": "user", "content": "old history " * 20},
+            {"role": "assistant", "content": "old answer " * 20},
+            {"role": "user", "content": "Use Bash to run pwd."},
+        ]
+
+        with (
+            patch.object(server, "FLOWITH_FABLE_CONTEXT_COMPACT_CHARS", 120),
+            patch.object(
+                server,
+                "FLOWITH_FABLE_FALLBACK_MODEL",
+                "claude-5-sonnet",
+                create=True,
+            ),
+        ):
+            events = b"".join(
+                server._stream_claude_events(
+                    client,
+                    messages=messages,
+                    requested_model="claude-fable-5",
+                    upstream_model="claude-fable-5",
+                    has_tools=True,
+                )
+            ).decode("utf-8")
+
+        self.assertEqual(
+            [call["model"] for call in client.calls],
+            ["claude-fable-5", "claude-5-sonnet"],
+        )
+        self.assertEqual(client.calls[0]["messages"], client.calls[1]["messages"])
+        self.assertIn('"type": "tool_use"', events)
+        self.assertIn('"stop_reason": "tool_use"', events)
+        self.assertNotIn("[proxy] upstream returned no content", events)
+
     def test_streaming_empty_long_context_retries_with_recent_messages(self) -> None:
         class ContextFallbackClient:
             def __init__(self) -> None:

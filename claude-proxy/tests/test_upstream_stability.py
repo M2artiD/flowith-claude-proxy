@@ -1025,6 +1025,41 @@ class UpstreamStabilityTests(unittest.TestCase):
         self.assertTrue(result["empty_response"])
         self.assertEqual(sum(len(session.calls) for session in sessions), 1)
 
+    def test_fable_idle_timeout_returns_immediately_for_model_fallback(self):
+        idle_stream = IdleStreamResponse()
+        outcomes = [idle_stream, idle_stream]
+        sessions = []
+
+        def make_session():
+            session = FakeSession(outcomes)
+            sessions.append(session)
+            return session
+
+        with (
+            patch.object(requests, "Session", side_effect=make_session),
+            patch("proxy.upstream.FLOWITH_FABLE_STREAM_IDLE_TIMEOUT", 0.05),
+            patch("proxy.upstream.FLOWITH_RETRY_TOTAL", 6),
+            patch("proxy.upstream.FLOWITH_EMPTY_RETRY_WINDOW", 8),
+            patch("proxy.upstream.FLOWITH_EMPTY_RETRY_TOTAL", 8),
+            patch("proxy.upstream.time.sleep"),
+        ):
+            client = FlowithClient(
+                api_key="test-key",
+                model="claude-fable-5",
+                base_url="https://edge.flowith.io/external/use/llm",
+                ssl_verify=True,
+            )
+            result = client.call_api(
+                [{"role": "user", "content": "ping"}],
+                stream=True,
+                max_retries=1,
+            )
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["empty_response"])
+        self.assertTrue(result["idle_timeout"])
+        self.assertEqual(sum(len(session.calls) for session in sessions), 1)
+
     def test_streaming_healthy_stream_is_not_killed_by_idle_watchdog(self):
         # A stream that keeps delivering content must never trip the watchdog,
         # even with a very short idle timeout, because each delta refreshes the

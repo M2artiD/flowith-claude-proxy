@@ -63,6 +63,7 @@ from .config import (
     FLOWITH_EMPTY_RETRY_TOTAL,
     FLOWITH_EMPTY_RETRY_WINDOW,
     FLOWITH_FABLE_CONTEXT_COMPACT_CHARS,
+    FLOWITH_FABLE_FALLBACK_MODEL,
     FLOWITH_LOCAL_ONLY,
     FLOWITH_MAX_CONCURRENCY,
     FLOWITH_MAX_REQUEST_BYTES,
@@ -444,6 +445,7 @@ def _dashboard_config_payload() -> dict[str, Any]:
         "FLOWITH_EMPTY_RETRY_DELAY_MAX": FLOWITH_EMPTY_RETRY_DELAY_MAX,
         "FLOWITH_EMPTY_CONTEXT_FALLBACK_CHARS": FLOWITH_EMPTY_CONTEXT_FALLBACK_CHARS,
         "FLOWITH_FABLE_CONTEXT_COMPACT_CHARS": FLOWITH_FABLE_CONTEXT_COMPACT_CHARS,
+        "FLOWITH_FABLE_FALLBACK_MODEL": FLOWITH_FABLE_FALLBACK_MODEL,
         "FLOWITH_EMPTY_RETRY_TOTAL": FLOWITH_EMPTY_RETRY_TOTAL,
         "FLOWITH_SSL_VERIFY": FLOWITH_SSL_VERIFY,
         "FLOWITH_TOOL_MODE": FLOWITH_TOOL_MODE,
@@ -1210,6 +1212,32 @@ def _is_fable_model(client: FlowithClient, requested_model: Any) -> bool:
     return str(model or "").strip().lower() == "claude-fable-5"
 
 
+def _call_non_fable_model_fallback(
+    client: FlowithClient,
+    messages: list[dict[str, Any]],
+    previous_result: dict[str, Any],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    configured = str(FLOWITH_FABLE_FALLBACK_MODEL or "").strip()
+    if not configured:
+        return previous_result
+
+    fallback_model = map_model(configured, default=DEFAULT_MODEL)
+    if not fallback_model or fallback_model.strip().lower() == "claude-fable-5":
+        return previous_result
+
+    fallback_kwargs = dict(kwargs)
+    fallback_kwargs["model"] = fallback_model
+    logger.warning(
+        "Fable returned no content after recovery; retrying once with fallback model %s",
+        fallback_model,
+    )
+    result = client.call_api(messages, **fallback_kwargs)
+    result.setdefault("fallback_from_model", "claude-fable-5")
+    result.setdefault("fallback_model", fallback_model)
+    return result
+
+
 def _call_api_with_empty_context_fallback(
     client: FlowithClient,
     messages: list[dict[str, Any]],
@@ -1217,7 +1245,8 @@ def _call_api_with_empty_context_fallback(
 ) -> dict[str, Any]:
     send_messages = messages
     preemptively_compacted = False
-    if _is_fable_model(client, kwargs.get("model")):
+    is_fable = _is_fable_model(client, kwargs.get("model"))
+    if is_fable:
         compacted_messages = _recent_context_fallback_messages(
             messages,
             FLOWITH_FABLE_CONTEXT_COMPACT_CHARS,
@@ -1237,21 +1266,24 @@ def _call_api_with_empty_context_fallback(
     if not result.get("empty_response"):
         return result
 
-    if preemptively_compacted:
-        return result
+    if not preemptively_compacted:
+        fallback_messages = _recent_context_fallback_messages(messages)
+        if fallback_messages is not None:
+            logger.warning(
+                "Retrying empty upstream response with compacted context (%s -> %s chars, %s -> %s messages)",
+                _message_content_chars(messages),
+                _message_content_chars(fallback_messages),
+                len(messages),
+                len(fallback_messages),
+            )
+            send_messages = fallback_messages
+            result = client.call_api(send_messages, **kwargs)
+            if not result.get("empty_response"):
+                return result
 
-    fallback_messages = _recent_context_fallback_messages(messages)
-    if fallback_messages is None:
-        return result
-
-    logger.warning(
-        "Retrying empty upstream response with compacted context (%s -> %s chars, %s -> %s messages)",
-        _message_content_chars(messages),
-        _message_content_chars(fallback_messages),
-        len(messages),
-        len(fallback_messages),
-    )
-    return client.call_api(fallback_messages, **kwargs)
+    if is_fable:
+        return _call_non_fable_model_fallback(client, send_messages, result, kwargs)
+    return result
 
 
 def _stream_claude_events(
