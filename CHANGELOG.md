@@ -1,7 +1,15 @@
 # Changelog
 
+## 2026-07-16
+
+- Closed an action-classification gap found by a real Codex CLI probe: mandatory Chinese forms such as `必须实际调用`, delivery phrases such as `写一个...`, and English `use <tool> to <verb>` requests now enter the GPT-5.6 required-tool path instead of accepting a promise plus a premature success marker.
+- Tightened GPT-5.6 continuation handling: terse approvals and short failure reports now inherit an active task, tool-output detection survives trailing reasoning/metadata and custom output shapes, no-tool correction allows two buffered retries, and complex tool notes carry a public decision brief with diagnosis, tradeoff, action, and validation instead of mechanical step counting.
+- Strengthened GPT-5.6 execution visibility and anti-avoidance on the Codex Responses path: high reasoning requests are forwarded to Flowith thinking controls, explicit public plans can retain up to four numbered steps with adjacent duplicates removed, and required actions or unfinished tool-result progress receive up to two buffered corrections when the model returns prose without a tool call.
+- Kept reasoning reporting honest: Flowith `gpt-5.6-sol` currently returns no separate reasoning channel even when `thinking=true`, so the proxy preserves a concise public execution plan instead of fabricating hidden chain-of-thought.
+
 ## 2026-07-15
 
+- Prevented Codex from reporting `idle timeout waiting for SSE` during slow Flowith turns: the Responses stream now emits a real `response.in_progress` event every five seconds instead of relying only on SSE comments that Codex does not count as event activity.
 - Fixed Fable empty replies and missing tool calls in real Claude Code requests with the full tool catalog: oversized tool descriptions are now bounded, and long-context trimming keeps a continuous recent suffix instead of stitching stale turns around skipped messages.
 - Balanced GPT-5.6 tool enforcement: greetings, casual conversation, explanation-only questions, and explicitly negated actions no longer force tools, while terminal/file/browser/build requests still require real calls.
 - Added user-visible GPT-5.6 tool feedback before every call: a concise operational reason, tool name, and exact command/action. The Responses stream now removes premature result text and closes the feedback item before emitting the function call.

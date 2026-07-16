@@ -30,12 +30,14 @@ from ..config import (
     DEFAULT_MODEL,
     FLOWITH_MIN_MAX_TOKENS,
     FLOWITH_RESPONSES_COMPACT_FINAL_TEXT,
+    FLOWITH_SSE_HEARTBEAT_INTERVAL,
     FLOWITH_TRACE_HERMES,
 )
 from ..upstream import FlowithClient
 
 
 _TRACE_HERMES = FLOWITH_TRACE_HERMES
+_SSE_HEARTBEAT_INTERVAL = max(1.0, FLOWITH_SSE_HEARTBEAT_INTERVAL)
 
 _THINK_OPEN_TAG = "<think>"
 _THINK_CLOSE_TAG = "</think>"
@@ -390,20 +392,22 @@ def create_router(
             requested_model,
             flowith_model,
         )
+        tool_result_followup = (
+            _responses_latest_is_tool_output(body)
+            and _is_gpt_5_6_model(requested_model, flowith_model)
+        )
         if response_tools:
             messages = _inject_responses_tool_prompt(
                 messages,
                 response_tools,
                 tool_choice=response_tool_choice,
-                tool_result_followup=(
-                    _responses_latest_is_tool_output(body)
-                    and _is_gpt_5_6_model(requested_model, flowith_model)
-                ),
+                tool_result_followup=tool_result_followup,
             )
         if not messages:
             raise HTTPException(status_code=400, detail="At least one input message is required")
 
         max_tokens = _floor_max_tokens(body.get("max_output_tokens", body.get("max_tokens")))
+        enable_thinking, thinking_budget_tokens = _responses_thinking_options(body)
         stop_sequences = body.get("stop")
         if response_tools:
             stop_sequences = with_xml_tool_stop_sequence(stop_sequences)
@@ -419,6 +423,10 @@ def create_router(
                     temperature=body.get("temperature"),
                     top_p=body.get("top_p"),
                     tools=response_tools,
+                    require_tool=_tool_choice_requires_call(response_tool_choice),
+                    correct_no_tool_progress=tool_result_followup,
+                    thinking=enable_thinking,
+                    thinking_budget_tokens=thinking_budget_tokens,
                     stop_sequences=stop_sequences,
                 ),
                 media_type="text/event-stream; charset=utf-8",
@@ -435,6 +443,8 @@ def create_router(
             model=upstream_model,
             max_retries=2,
             stream=False,
+            thinking=enable_thinking,
+            thinking_budget_tokens=thinking_budget_tokens,
             max_tokens=max_tokens,
             temperature=body.get("temperature"),
             top_p=body.get("top_p"),
@@ -590,6 +600,13 @@ def _openai_tool_choice_to_anthropic(tool_choice: Any) -> Any:
     return "auto"
 
 
+def _tool_choice_requires_call(tool_choice: Any) -> bool:
+    normalized = _openai_tool_choice_to_anthropic(tool_choice)
+    return normalized == "any" or (
+        isinstance(normalized, dict) and normalized.get("type") == "tool"
+    )
+
+
 def _inject_responses_tool_prompt(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
@@ -614,18 +631,21 @@ def _inject_responses_tool_prompt(
     else:
         injected.insert(0, {"role": "system", "content": xml_prompt})
 
-    tool_call_required = normalized_choice == "any" or (
-        isinstance(normalized_choice, dict) and normalized_choice.get("type") == "tool"
-    )
+    tool_call_required = _tool_choice_requires_call(tool_choice)
     if tool_call_required:
         injected.append({
             "role": "system",
             "content": (
                 "TOOL CALL REQUIRED FOR THIS TURN. Do not answer with standalone prose, "
                 "explain how the user could do the action, promise to do it later, or ask "
-                "the user to do it. First output one concise user-visible action note "
-                "stating the operational reason, tool name, and exact command or concrete "
-                "action. This note is not hidden chain-of-thought and must not include a "
+                "the user to do it. First output a concise user-visible action note: an "
+                "execution summary stating the operational reason, tool name, and exact command or concrete "
+                "action. For a simple action use one line. If the user explicitly asks for "
+                "a plan, or the task involves design, debugging, repair, or verification, "
+                "use a short public decision brief with at most four items covering: the "
+                "current diagnosis/design choice, the key constraint or tradeoff, the exact "
+                "next tool action, and the evidence that will validate it. This "
+                "summary is not hidden chain-of-thought and must not include a "
                 "result, success/failure claim, or final answer. Immediately then output "
                 "the XML tool call and stop. Only after a real tool observation may you "
                 "report success or failure."
@@ -640,7 +660,9 @@ def _inject_responses_tool_prompt(
                 "next available tool now. Do not end this turn with a progress update or "
                 "future-tense promise such as 'I will', 'next I will', or 'I am going to'. "
                 "Before that call, output one concise user-visible action note naming the "
-                "tool and exact command or concrete action. The note must not include a "
+                "tool and exact command or concrete action. For non-trivial remaining work, "
+                "include a short public decision brief covering the current diagnosis, key "
+                "tradeoff, next action, and validation evidence. The note must not include a "
                 "result, success/failure claim, or final answer; then immediately emit the "
                 "XML tool call. "
                 "Answer in prose only when the observations prove the requested work is "
@@ -648,6 +670,32 @@ def _inject_responses_tool_prompt(
             ),
         })
     return injected
+
+
+_RESPONSES_REASONING_BUDGETS = {
+    "minimal": 512,
+    "low": 1024,
+    "medium": 2048,
+    "high": 4096,
+    "xhigh": 6144,
+}
+
+
+def _responses_thinking_options(body: dict[str, Any]) -> tuple[bool | None, int | None]:
+    reasoning = body.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return None, None
+
+    effort = str(reasoning.get("effort") or "").strip().lower()
+    summary = str(reasoning.get("summary") or "").strip().lower()
+    enabled = effort not in {"", "none"} or summary not in {"", "none"}
+    if not enabled:
+        return False, None
+
+    budget = _RESPONSES_REASONING_BUDGETS.get(effort)
+    if budget is None:
+        budget = _RESPONSES_REASONING_BUDGETS["medium"]
+    return True, budget
 
 
 def _responses_messages_from_input(raw_input: Any) -> list[dict[str, Any]]:
@@ -668,15 +716,16 @@ def _responses_messages_from_input(raw_input: Any) -> list[dict[str, Any]]:
 
         item_type = item.get("type")
         role = item.get("role", "user")
-        if item_type == "function_call":
+        if item_type in {"function_call", "custom_tool_call"}:
+            raw_arguments = item.get("arguments", item.get("input", "{}"))
             messages.append({
                 "role": "assistant",
                 "content": format_tool_call_xml(
                     item.get("name", ""),
-                    _json_arguments(item.get("arguments", "{}")),
+                    _json_arguments(raw_arguments),
                 ),
             })
-        elif item_type == "function_call_output":
+        elif item_type in {"function_call_output", "custom_tool_call_output"}:
             messages.append({
                 "role": "user",
                 "content": format_observation_xml(str(item.get("output", "") or "")),
@@ -719,66 +768,111 @@ _EN_ACTION_VERBS = (
     "upload|create|generate|code|make|write|save|edit|modify|adjust|fix|handle|delete|move|"
     "copy|install|build|test|verify|click|screenshot|stop|restart|deploy|commit|push|switch"
 )
+_CN_DIRECT_WRITE_ACTION = r"写(?=\s*(?:一个|个|份|段|到|在|好|完|出))"
+_CN_ACTION = rf"(?:{_CN_ACTION_VERBS}|{_CN_DIRECT_WRITE_ACTION})"
 _NEGATED_ACTION_RE = re.compile(
-    rf"(?:不要|别|无需|不用|不必)\s*(?:再\s*)?(?:帮我|为我|替我)?\s*(?:{_CN_ACTION_VERBS})"
+    rf"(?:不要|别|无需|不用|不必)\s*(?:再\s*)?(?:帮我|为我|替我)?\s*(?:{_CN_ACTION})"
     rf"|\b(?:do\s+not|don't|dont|never)\s+(?:please\s+)?(?:{_EN_ACTION_VERBS})\b",
     re.IGNORECASE,
 )
 _EXPLICIT_ACTION_RE = re.compile(
-    rf"(?:^|[。！？!?；;]\s*)(?:请(?:你)?|麻烦(?:你)?|帮我|为我|给我|替我|现在|马上|立即|快点|继续|直接)?\s*(?:{_CN_ACTION_VERBS})"
-    rf"|(?:^|[.!?;]\s*)(?:please\s+|can\s+you\s+|could\s+you\s+|i\s+need\s+you\s+to\s+)?(?:{_EN_ACTION_VERBS})\b",
+    rf"(?:^|[。！？!?；;]\s*)"
+    rf"(?:请(?:你)?|请务必|麻烦(?:你)?|帮我|为我|给我|替我|现在|马上|立即|快点|继续|直接|"
+    rf"必须(?:实际)?|务必(?:实际)?|需要(?:你)?(?:实际)?)?\s*(?:{_CN_ACTION})"
+    rf"|(?:^|[.!?;]\s*)"
+    rf"(?:please\s+|can\s+you\s+|could\s+you\s+|i\s+need\s+you\s+to\s+|"
+    rf"(?:you\s+)?must\s+(?:actually\s+)?)?(?:{_EN_ACTION_VERBS})\b"
+    rf"|(?:^|[.!?;]\s*)use\b.{{0,80}}?\bto\s+(?:{_EN_ACTION_VERBS})\b",
+    re.IGNORECASE,
+)
+_TERSE_ACTION_CONTINUATION_RE = re.compile(
+    r"^(?:去吧|继续|开始|动手|照做|执行吧|做吧|快点|赶紧|接着做|"
+    r"go\s+ahead|do\s+it|proceed|continue|start\s+now)[。.!！]?\s*$",
+    re.IGNORECASE,
+)
+_ACTION_FAILURE_REPORT_RE = re.compile(
+    r"(?:未能|失败|报错|错误|打不开|无法加载|没(?:有)?载入|不能用|坏了|崩溃|"
+    r"doesn['’]?t\s+work|didn['’]?t\s+work|failed|error|won['’]?t\s+load|not\s+loading)",
+    re.IGNORECASE,
+)
+_EXPLANATION_QUESTION_RE = re.compile(
+    r"(?:为什么|怎么回事|是什么意思|请解释|解释一下|\bwhy\b|what\s+does|how\s+come)",
     re.IGNORECASE,
 )
 
 
-def _responses_turn_explicitly_requests_action(body: dict[str, Any]) -> bool:
-    text = _responses_latest_user_text(body)
+def _text_explicitly_requests_action(text: str) -> bool:
     if not text:
         return False
     without_negated_actions = _NEGATED_ACTION_RE.sub("", text)
     return bool(_EXPLICIT_ACTION_RE.search(without_negated_actions))
 
 
-def _responses_latest_user_text(body: dict[str, Any]) -> str:
+def _responses_turn_explicitly_requests_action(body: dict[str, Any]) -> bool:
+    user_texts = _responses_user_texts(body)
+    if not user_texts:
+        return False
+    latest = user_texts[-1].strip()
+    if _text_explicitly_requests_action(latest):
+        return True
+    if _EXPLANATION_QUESTION_RE.search(latest):
+        return False
+    continues_prior_action = bool(
+        _TERSE_ACTION_CONTINUATION_RE.fullmatch(latest)
+        or _ACTION_FAILURE_REPORT_RE.search(latest)
+    )
+    return continues_prior_action and any(
+        _text_explicitly_requests_action(text) for text in user_texts[:-1]
+    )
+
+
+def _responses_user_texts(body: dict[str, Any]) -> list[str]:
     raw_input = body.get("input")
     if isinstance(raw_input, str):
-        return raw_input
+        return [raw_input]
     if not isinstance(raw_input, list):
-        return ""
+        return []
 
-    latest_item = next(
-        (item for item in reversed(raw_input) if isinstance(item, (str, dict))),
-        None,
-    )
-    if isinstance(latest_item, str):
-        return latest_item
-    if not isinstance(latest_item, dict):
-        return ""
+    texts: list[str] = []
+    for item in raw_input:
+        if isinstance(item, str):
+            texts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        role = item.get("role")
+        if item_type == "message" and role in (None, "user"):
+            texts.append(_extract_openai_text(item.get("content")))
+        elif role == "user":
+            texts.append(_extract_openai_text(item.get("content")))
+        elif item_type == "input_text":
+            texts.append(str(item.get("text", "") or ""))
+    return [text for text in texts if text]
 
-    item_type = latest_item.get("type")
-    role = latest_item.get("role")
-    if item_type == "message" or role == "user":
-        if role not in (None, "user"):
-            return ""
-        return _extract_openai_text(latest_item.get("content"))
-    if item_type in {"input_text", "output_text"}:
-        return str(latest_item.get("text", "") or "")
-    return ""
+
+def _responses_latest_user_text(body: dict[str, Any]) -> str:
+    user_texts = _responses_user_texts(body)
+    return user_texts[-1] if user_texts else ""
 
 
 def _responses_latest_is_tool_output(body: dict[str, Any]) -> bool:
     raw_input = body.get("input")
-    latest_item = None
-    if isinstance(raw_input, list):
-        latest_item = next(
-            (item for item in reversed(raw_input) if isinstance(item, dict)),
-            None,
-        )
-    latest_is_tool_output = (
-        isinstance(latest_item, dict)
-        and latest_item.get("type") == "function_call_output"
-    )
-    return latest_is_tool_output
+    if not isinstance(raw_input, list):
+        return False
+
+    last_user_index = -1
+    last_tool_output_index = -1
+    for index, item in enumerate(raw_input):
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        role = item.get("role")
+        if item_type in {"function_call_output", "custom_tool_call_output"}:
+            last_tool_output_index = index
+        if role == "user" or (item_type == "message" and role in (None, "user")):
+            last_user_index = index
+    return last_tool_output_index > last_user_index
 
 
 def _is_gpt_5_6_model(requested_model: str, effective_model: str | None = None) -> bool:
@@ -1154,7 +1248,7 @@ def _chat_stream_events(
     try:
         while True:
             try:
-                item = q.get(timeout=10)
+                item = q.get(timeout=_SSE_HEARTBEAT_INTERVAL)
             except queue.Empty:
                 # SSE comment heartbeat: keeps intermediaries alive and gives
                 # the generator a chance to observe client disconnect.
@@ -1403,12 +1497,90 @@ def _upstream_error_response(result: dict[str, Any]) -> JSONResponse:
     )
 
 
-def _concise_tool_action_note(text: str) -> str:
-    for line in text.splitlines():
-        note = line.strip()
-        if note:
-            return note
-    return ""
+_PLAN_LINE_RE = re.compile(r"^(?:[-*\u2022]|\d{1,2}[.)]|[（(]\d{1,2}[）)])\s*")
+_PLAN_HEADER_RE = re.compile(
+    r"(?:plan|steps?|计划|步骤|执行方案|决策摘要|执行摘要|实施判断|"
+    r"decision\s+brief|execution\s+brief)[：:]?\s*$",
+    re.IGNORECASE,
+)
+_UNFINISHED_PROGRESS_RE = re.compile(
+    r"(?:\b(?:i(?:'ll| will| am going to)|next\s+i(?:'ll| will))\b.{0,120}"
+    r"(?:use|run|read|check|write|open|verify|create)|"
+    r"(?:^我用|我(?:先|会|将|现在)|接下来|下一步).{0,120}"
+    r"(?:使用|调用|执行|读取|检查|写入|打开|验证|创建|生成))",
+    re.IGNORECASE,
+)
+_COMPLETION_EVIDENCE_RE = re.compile(
+    r"(?:\b(?:completed|finished|succeeded|saved|created|verified|exit code)\b|"
+    r"(?:已经|已完成|已写入|已保存|已创建|已验证|成功|退出码))",
+    re.IGNORECASE,
+)
+
+
+def _bounded_tool_action_note(text: str, *, max_chars: int = 900, max_steps: int = 4) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+
+    selected = [lines[0]]
+    previous = lines[0].casefold()
+    plan_mode = bool(_PLAN_HEADER_RE.search(lines[0])) or bool(_PLAN_LINE_RE.match(lines[0]))
+    steps = 1 if _PLAN_LINE_RE.match(lines[0]) else 0
+
+    for line in lines[1:]:
+        normalized = line.casefold()
+        if normalized == previous:
+            continue
+        previous = normalized
+        if not plan_mode or not _PLAN_LINE_RE.match(line) or steps >= max_steps:
+            break
+        candidate = "\n".join([*selected, line])
+        if len(candidate) > max_chars:
+            break
+        selected.append(line)
+        steps += 1
+
+    note = "\n".join(selected)
+    return note[:max_chars].rstrip()
+
+
+def _result_has_tool_intent(result: dict[str, Any]) -> bool:
+    if result.get("tool_calls"):
+        return True
+    content = str(result.get("content", "") or "")
+    return bool(parse_xml_tool_calls(content)) or find_xml_tool_call_start(content) >= 0 or _tool_call_truncated(result)
+
+
+def _looks_like_unfinished_tool_progress(result: dict[str, Any]) -> bool:
+    content = str(result.get("content", "") or "").strip()
+    if not content or _COMPLETION_EVIDENCE_RE.search(content):
+        return False
+    return bool(_UNFINISHED_PROGRESS_RE.search(content))
+
+
+_MAX_NO_TOOL_CORRECTIONS = 2
+
+
+def _required_tool_retry_messages(
+    messages: list[dict[str, Any]],
+    correction_attempt: int = 1,
+) -> list[dict[str, Any]]:
+    return [
+        *messages,
+        {
+            "role": "system",
+            "content": (
+                f"RETRY CORRECTION {correction_attempt}/{_MAX_NO_TOOL_CORRECTIONS}: "
+                "The previous response did not call a tool even though "
+                "this turn requires one. Discard the previous prose. Output a concise "
+                "user-visible decision brief with at most four items covering diagnosis or "
+                "design choice, the key constraint/tradeoff, the exact next tool action, and "
+                "the validation evidence. Then immediately emit one valid "
+                "XML tool call and stop. Do not apologize, promise future work, report a "
+                "result, or answer without the tool call."
+            ),
+        },
+    ]
 
 
 def _responses_stream_events(
@@ -1420,6 +1592,10 @@ def _responses_stream_events(
     temperature: float | None = None,
     top_p: float | None = None,
     tools: list[dict[str, Any]] | None = None,
+    require_tool: bool = False,
+    correct_no_tool_progress: bool = False,
+    thinking: bool | None = None,
+    thinking_budget_tokens: int | None = None,
     stop_sequences: list[str] | str | None = None,
 ) -> Generator[bytes, None, None]:
     response_id = "resp_" + new_message_id()[4:]
@@ -1446,22 +1622,77 @@ def _responses_stream_events(
             _safe_put(("reasoning", piece))
 
     def worker() -> None:
-        try:
-            result_holder["result"] = client.call_api(
-                messages,
+        def _call(
+            call_messages: list[dict[str, Any]],
+            chunk_callback: Callable[[str], None],
+            reasoning_callback: Callable[[str], None],
+        ) -> dict[str, Any]:
+            return client.call_api(
+                call_messages,
                 model=upstream_model,
                 max_retries=1,
                 stream=True,
-                on_chunk=on_chunk,
-                on_reasoning=on_reasoning,
+                on_chunk=chunk_callback,
+                on_reasoning=reasoning_callback,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 tools=None,
                 tool_choice=None,
+                thinking=thinking,
+                thinking_budget_tokens=thinking_budget_tokens,
                 stop_sequences=stop_sequences,
                 cancel_event=cancel_event,
             )
+
+        try:
+            if not require_tool and not correct_no_tool_progress:
+                result_holder["result"] = _call(messages, on_chunk, on_reasoning)
+                return
+
+            selected_events: list[tuple[str, str]] = []
+
+            def _capture_text(piece: str) -> None:
+                if piece:
+                    selected_events.append(("text", piece))
+
+            def _capture_reasoning(piece: str) -> None:
+                if piece:
+                    selected_events.append(("reasoning", piece))
+
+            call_messages = messages
+            result: dict[str, Any] = {}
+            for attempt in range(_MAX_NO_TOOL_CORRECTIONS + 1):
+                selected_events = []
+                result = _call(call_messages, _capture_text, _capture_reasoning)
+                needs_correction = (
+                    result.get("success")
+                    and not _result_has_tool_intent(result)
+                    and (require_tool or _looks_like_unfinished_tool_progress(result))
+                )
+                if not needs_correction:
+                    break
+                if attempt >= _MAX_NO_TOOL_CORRECTIONS:
+                    selected_events = []
+                    result = {
+                        "success": False,
+                        "error": (
+                            "Model did not produce the required tool call after "
+                            f"{_MAX_NO_TOOL_CORRECTIONS} corrections"
+                        ),
+                        "content": "",
+                        "reasoning_content": "",
+                        "usage": result.get("usage", {}) or {},
+                    }
+                    break
+                call_messages = _required_tool_retry_messages(
+                    messages,
+                    correction_attempt=attempt + 1,
+                )
+
+            for kind, piece in selected_events:
+                _safe_put((kind, piece))
+            result_holder["result"] = result
         except Exception as e:
             result_holder["result"] = {"success": False, "error": str(e)}
         finally:
@@ -1645,7 +1876,7 @@ def _responses_stream_events(
 
     def _emit_pending_tool_note() -> Generator[bytes, None, None]:
         nonlocal pending_tool_text
-        note = _concise_tool_action_note(pending_tool_text)
+        note = _bounded_tool_action_note(pending_tool_text)
         pending_tool_text = ""
         if not note:
             return
@@ -1779,9 +2010,20 @@ def _responses_stream_events(
     try:
         while True:
             try:
-                item = q.get(timeout=10)
+                item = q.get(timeout=_SSE_HEARTBEAT_INTERVAL)
             except queue.Empty:
-                yield b": ping\n\n"
+                progress = {
+                    "type": "response.in_progress",
+                    "response": {
+                        "id": response_id,
+                        "object": "response",
+                        "created_at": now,
+                        "status": "in_progress",
+                        "model": requested_model,
+                        "output": [],
+                    },
+                }
+                yield _openai_sse("response.in_progress", progress).encode("utf-8")
                 continue
             if item is _SENTINEL_DONE:
                 break

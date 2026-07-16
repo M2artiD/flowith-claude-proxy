@@ -1,7 +1,10 @@
 import io
+import json
 import os
+import queue
 import unittest
 from contextlib import redirect_stdout
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -578,6 +581,41 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertEqual(last_message["role"], "system")
         self.assertIn("TOOL CALL REQUIRED FOR THIS TURN", last_message["content"])
 
+    def test_responses_gpt_5_6_mandatory_tool_phrase_requires_a_tool(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": (
+                    "这是端到端验收。必须实际调用 shell_command 执行 PowerShell "
+                    "命令 Get-Location；不要仅描述命令。"
+                ),
+                "tools": [
+                    {"type": "function", "name": "shell_command", "parameters": {"type": "object"}}
+                ],
+            },
+        )
+
+        last_message = self.fake_client.calls[0]["messages"][-1]
+        self.assertIn("TOOL CALL REQUIRED FOR THIS TURN", last_message["content"])
+
+    def test_responses_gpt_5_6_use_tool_to_run_phrase_requires_a_tool(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "Use shell_command to run Get-Location.",
+                "tools": [
+                    {"type": "function", "name": "shell_command", "parameters": {"type": "object"}}
+                ],
+            },
+        )
+
+        last_message = self.fake_client.calls[0]["messages"][-1]
+        self.assertIn("TOOL CALL REQUIRED FOR THIS TURN", last_message["content"])
+
     def test_responses_gpt_5_6_greeting_does_not_require_a_tool(self) -> None:
         self.client.post(
             "/v1/responses",
@@ -639,6 +677,80 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn("then output the XML tool call", last_message["content"])
         self.assertIn("must not include a result, success/failure claim, or final answer", last_message["content"])
 
+    def test_responses_gpt_5_6_terse_continuation_inherits_prior_action(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {"type": "message", "role": "user", "content": "build an offline interactive HTML file"},
+                    {"type": "message", "role": "assistant", "content": "I can do that."},
+                    {"type": "message", "role": "user", "content": "去吧"},
+                ],
+                "tools": [{"type": "function", "name": "shell_command", "parameters": {"type": "object"}}],
+            },
+        )
+
+        last_message = self.fake_client.calls[0]["messages"][-1]
+        self.assertIn("TOOL CALL REQUIRED FOR THIS TURN", last_message["content"])
+
+    def test_responses_gpt_5_6_chinese_write_then_terse_continuation_requires_a_tool(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {"type": "message", "role": "user", "content": "写一个互动 HTML 到桌面"},
+                    {"type": "message", "role": "assistant", "content": "我会处理。"},
+                    {"type": "message", "role": "user", "content": "去吧"},
+                ],
+                "tools": [
+                    {"type": "function", "name": "shell_command", "parameters": {"type": "object"}}
+                ],
+            },
+        )
+
+        last_message = self.fake_client.calls[0]["messages"][-1]
+        self.assertIn("TOOL CALL REQUIRED FOR THIS TURN", last_message["content"])
+
+    def test_responses_gpt_5_6_failure_report_inherits_prior_action(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {"type": "message", "role": "user", "content": "create and verify an interactive HTML file"},
+                    {"type": "message", "role": "assistant", "content": "The file is ready."},
+                    {"type": "message", "role": "user", "content": "3D 引擎未能载入"},
+                ],
+                "tools": [{"type": "function", "name": "shell_command", "parameters": {"type": "object"}}],
+            },
+        )
+
+        last_message = self.fake_client.calls[0]["messages"][-1]
+        self.assertIn("TOOL CALL REQUIRED FOR THIS TURN", last_message["content"])
+
+    def test_responses_gpt_5_6_failure_explanation_question_does_not_force_tool(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {"type": "message", "role": "user", "content": "create an interactive HTML file"},
+                    {"type": "message", "role": "assistant", "content": "The file is ready."},
+                    {"type": "message", "role": "user", "content": "为什么 3D 引擎未能载入？只解释原因。"},
+                ],
+                "tools": [{"type": "function", "name": "shell_command", "parameters": {"type": "object"}}],
+            },
+        )
+
+        messages = self.fake_client.calls[0]["messages"]
+        self.assertFalse(any("TOOL CALL REQUIRED FOR THIS TURN" in message["content"] for message in messages))
+
     def test_responses_gpt_5_6_new_user_turn_after_tool_history_requires_tool(self) -> None:
         self.client.post(
             "/v1/responses",
@@ -699,6 +811,54 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn("user-visible action note", last_message["content"])
         self.assertIn("exact command", last_message["content"])
         self.assertIn("must not include a result, success/failure claim, or final answer", last_message["content"])
+
+    def test_responses_tool_result_followup_ignores_trailing_reasoning_item(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {"type": "message", "role": "user", "content": "finish the file"},
+                    {"type": "function_call", "call_id": "call_now", "name": "shell_command", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call_now", "output": "download failed"},
+                    {"type": "reasoning", "summary": []},
+                ],
+                "tools": [{"type": "function", "name": "shell_command", "parameters": {"type": "object"}}],
+            },
+        )
+
+        last_message = self.fake_client.calls[0]["messages"][-1]
+        self.assertIn("TOOL RESULT FOLLOW-UP", last_message["content"])
+
+    def test_responses_custom_tool_output_becomes_followup_observation(self) -> None:
+        self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {"type": "message", "role": "user", "content": "finish the file"},
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": "call_custom",
+                        "name": "exec_command",
+                        "input": '{"cmd":"Get-Location"}',
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call_custom",
+                        "output": "Process exited with code 1",
+                    },
+                    {"type": "reasoning", "summary": []},
+                ],
+                "tools": [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}],
+            },
+        )
+
+        messages = self.fake_client.calls[0]["messages"]
+        self.assertTrue(any("<observation>" in message["content"] for message in messages))
+        self.assertIn("TOOL RESULT FOLLOW-UP", messages[-1]["content"])
 
     def test_responses_codex_5_6_compat_alias_requires_a_tool(self) -> None:
         self.client.post(
@@ -762,6 +922,39 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertIn('"delta": "hel"', events)
         self.assertIn('"delta": "lo"', events)
         self.assertIn("event: response.completed", events)
+
+    def test_responses_streaming_emits_protocol_heartbeat_while_upstream_is_idle(self) -> None:
+        class OneIdleQueue(queue.Queue):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.forced_idle = False
+
+            def get(self, block=True, timeout=None):
+                if not self.forced_idle:
+                    self.forced_idle = True
+                    raise queue.Empty
+                return super().get(block=block, timeout=timeout)
+
+        isolated_queue_module = SimpleNamespace(
+            Queue=OneIdleQueue,
+            Empty=queue.Empty,
+            Full=queue.Full,
+        )
+        with patch("proxy.codex.router.queue", isolated_queue_module):
+            response = self.client.post(
+                "/v1/responses",
+                headers={"Authorization": "Bearer test-key"},
+                json={
+                    "model": "gpt-5.6-sol",
+                    "input": "say hello",
+                    "stream": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("event: response.in_progress", response.text)
+        self.assertIn('"status": "in_progress"', response.text)
+        self.assertIn("event: response.completed", response.text)
 
     def test_hermes_compact_final_events_do_not_repeat_streamed_text(self) -> None:
         with patch("proxy.codex.router.FLOWITH_RESPONSES_COMPACT_FINAL_TEXT", True, create=True):
@@ -988,6 +1181,304 @@ class OpenAIProxyTests(unittest.TestCase):
             events.index("event: response.output_text.done"),
             events.index('"type": "function_call"'),
         )
+
+    def test_responses_forwards_high_reasoning_to_flowith_thinking(self) -> None:
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "explain the approach",
+                "stream": True,
+                "reasoning": {"effort": "high", "summary": "auto"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        call = self.fake_client.calls[0]
+        self.assertIs(call["thinking"], True)
+        self.assertGreater(call["thinking_budget_tokens"], 0)
+
+    def test_responses_gpt_5_6_tool_feedback_preserves_bounded_deduplicated_plan(self) -> None:
+        self.fake_client.next_stream_chunks = [
+            (
+                "执行计划：\n"
+                "1. 使用 `shell` 执行精确命令 `pwd`。\n"
+                "2. 根据真实输出继续。\n"
+                "2. 根据真实输出继续。\n"
+                "PREMATURE_OK"
+            ),
+            "<tool_call>\n<name>shell</name>\n",
+            "<parameters>\n",
+            '{"command":"pwd"}',
+            "\n</parameters>\n</tool_call>",
+        ]
+
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "plan carefully, then check cwd",
+                "stream": True,
+                "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        events = response.text
+        self.assertIn("执行计划：", events)
+        self.assertIn("1. 使用 `shell` 执行精确命令 `pwd`。", events)
+        delta_text = "".join(
+            json.loads(line[6:]).get("delta", "")
+            for line in events.splitlines()
+            if line.startswith("data: {")
+            and json.loads(line[6:]).get("type") == "response.output_text.delta"
+        )
+        self.assertEqual(delta_text.count("2. 根据真实输出继续。"), 1)
+        self.assertNotIn("PREMATURE_OK", events)
+        self.assertIn('"type": "function_call"', events)
+
+    def test_responses_gpt_5_6_tool_feedback_preserves_public_decision_brief(self) -> None:
+        self.fake_client.next_stream_chunks = [
+            (
+                "决策摘要：\n"
+                "- 判断：CDN 加载失败，必须消除网络依赖。\n"
+                "- 取舍：内嵌引擎会增大文件，但换来真正离线运行。\n"
+                "- 动作：使用 `shell_command` 下载并内嵌可用资源。\n"
+                "- 验证：无头浏览器渲染并检查截图像素。\n"
+                "PREMATURE_OK"
+            ),
+            "<tool_call>\n<name>shell_command</name>\n",
+            "<parameters>\n",
+            '{"command":"Invoke-WebRequest https://example.test/three.js"}',
+            "\n</parameters>\n</tool_call>",
+        ]
+
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "repair the offline 3D page and explain the key tradeoff",
+                "stream": True,
+                "tools": [
+                    {"type": "function", "name": "shell_command", "parameters": {"type": "object"}}
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        events = response.text
+        for expected in ["判断：", "取舍：", "动作：", "验证："]:
+            self.assertIn(expected, events)
+        self.assertNotIn("PREMATURE_OK", events)
+        self.assertIn('"type": "function_call"', events)
+
+    def test_responses_required_action_corrects_one_no_tool_response_before_delivery(self) -> None:
+        class CorrectingClient:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def call_api(self, messages, **kwargs):
+                self.calls.append({"messages": [dict(message) for message in messages], **kwargs})
+                if len(self.calls) == 1:
+                    text = "I will open it later without using a tool."
+                    kwargs["on_chunk"](text)
+                    return {
+                        "success": True,
+                        "content": text,
+                        "usage": {},
+                        "finish_reason": "stop",
+                    }
+
+                chunks = [
+                    "I will use `shell_command` with exact command `Start-Process cmd.exe`.",
+                    "<tool_call>\n<name>shell_command</name>\n",
+                    "<parameters>\n",
+                    '{"command":"Start-Process cmd.exe"}',
+                    "\n</parameters>\n</tool_call>",
+                ]
+                for chunk in chunks:
+                    kwargs["on_chunk"](chunk)
+                return {
+                    "success": True,
+                    "content": "".join(chunks),
+                    "usage": {},
+                    "finish_reason": "stop",
+                }
+
+        correcting_client = CorrectingClient()
+        server._default_client = correcting_client
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "open cmd",
+                "stream": True,
+                "tools": [
+                    {"type": "function", "name": "shell_command", "parameters": {"type": "object"}}
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(correcting_client.calls), 2)
+        self.assertNotIn("without using a tool", response.text)
+        self.assertIn('"type": "function_call"', response.text)
+        self.assertTrue(
+            any(
+                "RETRY CORRECTION" in str(message.get("content", ""))
+                for message in correcting_client.calls[1]["messages"]
+            )
+        )
+
+    def test_responses_required_action_allows_two_corrections_before_failing(self) -> None:
+        class TwiceAvoidingClient:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def call_api(self, messages, **kwargs):
+                self.calls.append({"messages": [dict(message) for message in messages], **kwargs})
+                if len(self.calls) < 3:
+                    text = "I will perform the requested action later."
+                    kwargs["on_chunk"](text)
+                    return {"success": True, "content": text, "usage": {}, "finish_reason": "stop"}
+
+                chunks = [
+                    "决策摘要：\n- 动作：使用 `shell_command` 执行 `Get-Location`。",
+                    "<tool_call>\n<name>shell_command</name>\n",
+                    "<parameters>\n",
+                    '{"command":"Get-Location"}',
+                    "\n</parameters>\n</tool_call>",
+                ]
+                for chunk in chunks:
+                    kwargs["on_chunk"](chunk)
+                return {
+                    "success": True,
+                    "content": "".join(chunks),
+                    "usage": {},
+                    "finish_reason": "stop",
+                }
+
+        correcting_client = TwiceAvoidingClient()
+        server._default_client = correcting_client
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "run Get-Location",
+                "stream": True,
+                "tools": [
+                    {"type": "function", "name": "shell_command", "parameters": {"type": "object"}}
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(correcting_client.calls), 3)
+        self.assertNotIn("later", response.text)
+        self.assertIn('"type": "function_call"', response.text)
+
+    def test_responses_tool_result_followup_corrects_progress_without_next_tool(self) -> None:
+        class FollowupCorrectingClient:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def call_api(self, messages, **kwargs):
+                self.calls.append({"messages": [dict(message) for message in messages], **kwargs})
+                if len(self.calls) == 1:
+                    text = "我用 `exec_command` 读取前端验证规范，并检查桌面文件。"
+                    kwargs["on_chunk"](text)
+                    return {"success": True, "content": text, "usage": {}, "finish_reason": "stop"}
+
+                chunks = [
+                    "下一步使用 `shell_command` 执行精确命令 `Get-Item target.html`。",
+                    "<tool_call>\n<name>shell_command</name>\n",
+                    "<parameters>\n",
+                    '{"command":"Get-Item target.html"}',
+                    "\n</parameters>\n</tool_call>",
+                ]
+                for chunk in chunks:
+                    kwargs["on_chunk"](chunk)
+                return {
+                    "success": True,
+                    "content": "".join(chunks),
+                    "usage": {},
+                    "finish_reason": "stop",
+                }
+
+        correcting_client = FollowupCorrectingClient()
+        server._default_client = correcting_client
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "stream": True,
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "创建文件并验证它"}],
+                    },
+                    {
+                        "type": "function_call",
+                        "name": "shell_command",
+                        "arguments": '{"command":"Get-Location"}',
+                        "call_id": "call_1",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "Process exited with code 0",
+                    },
+                ],
+                "tools": [
+                    {"type": "function", "name": "shell_command", "parameters": {"type": "object"}}
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(correcting_client.calls), 2)
+        self.assertNotIn("读取前端验证规范", response.text)
+        self.assertIn('"type": "function_call"', response.text)
+
+    def test_responses_tool_result_followup_allows_observation_backed_final_answer(self) -> None:
+        self.fake_client.next_stream_chunks = ["文件已写入并验证完成，退出码 0。"]
+        response = self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "stream": True,
+                "input": [
+                    {"type": "message", "role": "user", "content": "创建文件并验证它"},
+                    {
+                        "type": "function_call",
+                        "name": "shell_command",
+                        "arguments": '{"command":"Set-Content target.html ok"}',
+                        "call_id": "call_1",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "Process exited with code 0",
+                    },
+                ],
+                "tools": [
+                    {"type": "function", "name": "shell_command", "parameters": {"type": "object"}}
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.fake_client.calls), 1)
+        self.assertIn("文件已写入并验证完成", response.text)
+        self.assertNotIn('"type": "function_call"', response.text)
 
     def test_hermes_root_chat_completions_alias(self) -> None:
         response = self.client.post(

@@ -82,6 +82,11 @@ FLOWITH_FABLE_CONTEXT_COMPACT_CHARS = _env_int("FLOWITH_FABLE_CONTEXT_COMPACT_CH
 # default clears the observed OK first-byte max (~83s) with generous margin
 # while sitting well below the dead-stream floor (~240s). Set to 0 to disable.
 FLOWITH_STREAM_IDLE_TIMEOUT = _env_float("FLOWITH_STREAM_IDLE_TIMEOUT", 150.0)
+# SSE comments keep the TCP connection active but are not events, so clients
+# such as Codex may still expire their event-level idle timer. Responses routes
+# emit a protocol-level in-progress event at this cadence while awaiting the
+# next upstream delta. Keep this comfortably below common client idle limits.
+FLOWITH_SSE_HEARTBEAT_INTERVAL = _env_float("FLOWITH_SSE_HEARTBEAT_INTERVAL", 5.0)
 # Fresh Fable turns normally produce their first delta quickly. Bound no-byte
 # waits separately so a dead Fable stream is retried instead of pinning a task.
 FLOWITH_FABLE_STREAM_IDLE_TIMEOUT = _env_float("FLOWITH_FABLE_STREAM_IDLE_TIMEOUT", 45.0)
