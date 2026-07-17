@@ -274,6 +274,19 @@ def _tool_choice_instruction(tool_choice: Any) -> str:
     return "Use a tool only when it is needed; if no tool is needed, answer directly."
 
 
+_PLAN_TOOL_NAME_RE = re.compile(r"(^|_)(update_)?(plan|todo)(s|_list)?($|_)", re.IGNORECASE)
+
+
+def _has_plan_tool(anthropic_tools: list[dict[str, Any]]) -> str | None:
+    """Return the first tool name that looks like a plan/todo tool, if any."""
+    for raw_tool in anthropic_tools:
+        tool = _as_dict(raw_tool)
+        name = str(tool.get("name", "") or "")
+        if name and _PLAN_TOOL_NAME_RE.search(name):
+            return name
+    return None
+
+
 def _build_tool_xml_prompt(
     anthropic_tools: list[dict[str, Any]],
     tool_choice: Any = None,
@@ -308,6 +321,34 @@ def _build_tool_xml_prompt(
 
     tool_list = "\n\n".join(tool_descs)
     choice_instruction = _tool_choice_instruction(tool_choice)
+    plan_tool_name = _has_plan_tool(anthropic_tools)
+    if plan_tool_name:
+        plan_rule = (
+            f'2. For any multi-step task, the FIRST <tool_call> you emit MUST be '
+            f'"{plan_tool_name}" populated with the full ordered list of pending steps. '
+            'You may emit multiple sequential <tool_call> blocks in one response when independent '
+            f'tools can run together — emit "{plan_tool_name}" first, then the first execution tool '
+            'in the same response when useful. For single-step or exploratory turns, skip it and call '
+            'the needed tool directly.\n'
+        )
+        plan_policy = (
+            f'For multi-step tasks, call "{plan_tool_name}" first with a concrete distributed todo '
+            'list of pending steps, then call the next execution tool. Keep the public action note '
+            f'short; put the full step list in "{plan_tool_name}"\'s arguments rather than long prose.'
+        )
+    else:
+        plan_rule = (
+            '2. You may emit multiple sequential <tool_call> blocks in one response when independent tools can run together '
+            '(for example a plan/todo tool plus the first concrete action, or several independent reads). '
+            'Prefer a plan/todo tool first for multi-step work so the client can show a distributed todo list, '
+            'then emit the first execution tool in the same response when useful.\n'
+        )
+        plan_policy = (
+            'For multi-step tasks, prefer calling an available plan/todo tool (for example '
+            'update_plan) early with a concrete distributed todo list of pending steps, '
+            'then call the next execution tool. Keep the public action note short; put '
+            'the full step list in the plan/todo tool arguments rather than long prose.'
+        )
 
     return (
         "# Tool Use\n\n"
@@ -349,10 +390,10 @@ def _build_tool_xml_prompt(
         "</parameters>\n"
         "</tool_call>\n\n"
         "CRITICAL RULES:\n"
-        "1. Before the <tool_call>, output exactly one brief action note with the tool and exact command/action; output no other narration.\n"
-        "2. Output ONLY ONE tool call per response.\n"
+        "1. Before the first <tool_call>, output exactly one brief action note with the tool and exact command/action; output no other narration.\n"
+        f"{plan_rule}"
         "3. The <parameters> body MUST be one valid JSON object matching the input schema.\n"
-        "4. STOP writing immediately after </tool_call> and wait for <observation>.\n"
+        "4. STOP writing immediately after the last </tool_call> and wait for <observation>.\n"
         "5. Treat every <observation> block as the result of your previous tool call.\n"
         f"6. {choice_instruction}\n\n"
         "EXAMPLE - calling a tool named \"Bash\" with parameter \"command\":\n\n"
@@ -370,7 +411,8 @@ def _build_tool_xml_prompt(
         "replace a required tool call with "
         "a promise, narration, guessed result, refusal, instructions for the user, "
         "or a claim that execution is unavailable. Only report failure after a real "
-        "tool observation reports the failure."
+        "tool observation reports the failure.\n\n"
+        f"{plan_policy}"
     )
 
 
@@ -379,6 +421,10 @@ def build_tool_xml_prompt(
     tool_choice: Any = None,
 ) -> str:
     return _build_tool_xml_prompt(anthropic_tools, tool_choice=tool_choice)
+
+
+def has_plan_tool(anthropic_tools: list[dict[str, Any]]) -> str | None:
+    return _has_plan_tool(anthropic_tools)
 
 
 def claude_request_to_flowith_messages(

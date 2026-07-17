@@ -1,6 +1,6 @@
-# clean.ps1 - Cleanup helper invoked by ..\clean.bat.
+﻿# clean.ps1 - Cleanup helper invoked by ..\clean.bat.
 # Removes local pytest/pycache dirs, upstream debug dumps, ad-hoc debug scripts,
-# log files, and optionally the proxy virtualenv.
+# log files, and optionally the proxy virtualenv. Can also stop local proxy listeners.
 
 param(
     [string]$Root = (Split-Path -Parent $PSScriptRoot),
@@ -71,36 +71,89 @@ function Remove-Tree {
     }
 }
 
+function Test-IsProxyProcess {
+    param([string]$CommandLine)
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+        return $false
+    }
+    return ($CommandLine -match 'python(\.exe)?"?\s+-m\s+proxy') -or ($CommandLine -match 'pythonw(\.exe)?"?\s+-m\s+proxy')
+}
+
 function Stop-ProxyListeners {
     $ports = @(8787, 8788, 8789)
-    $stopped = 0
+    $stopped = @{}
     foreach ($port in $ports) {
-        $listeners = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
+        $listeners = @()
+        try {
+            $listeners = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
+        }
+        catch {
+            $listeners = @()
+        }
         if ($listeners.Count -eq 0) {
-            continue
+            # Fallback for environments where Get-NetTCPConnection is restricted.
+            $net = netstat -ano | Select-String (":$port\s+.*LISTENING")
+            foreach ($line in $net) {
+                $parts = @(($line.ToString() -split '\s+') | Where-Object { $_ })
+                if ($parts.Count -ge 5 -and $parts[-1] -match '^\d+$') {
+                    $listeners += [pscustomobject]@{ OwningProcess = [int]$parts[-1] }
+                }
+            }
         }
         foreach ($listener in $listeners) {
             $pidValue = [int]$listener.OwningProcess
+            if ($stopped.ContainsKey($pidValue)) {
+                continue
+            }
             $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $pidValue" -ErrorAction SilentlyContinue
             $command = if ($proc) { [string]$proc.CommandLine } else { '' }
-            if ($command -notmatch 'python(\.exe)?"?\s+-m\s+proxy') {
+            if (-not (Test-IsProxyProcess -CommandLine $command)) {
                 Write-Host ("[WARN] Port {0} is held by PID {1}, but it does not look like this proxy; leaving it running." -f $port, $pidValue)
                 continue
             }
             try {
-                Stop-Process -Id $pidValue -ErrorAction Stop
-                $stopped++
+                Stop-Process -Id $pidValue -Force -ErrorAction Stop
+                $stopped[$pidValue] = $true
                 Write-Host ("[OK] Stopped proxy on port {0} (PID {1})." -f $port, $pidValue)
             }
             catch {
-                Write-Host ("[WARN] Could not stop proxy PID {0}: {1}" -f $pidValue, $_.Exception.Message)
+                $kill = Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', "$pidValue", '/F', '/T') -Wait -PassThru -WindowStyle Hidden
+                if ($kill.ExitCode -eq 0) {
+                    $stopped[$pidValue] = $true
+                    Write-Host ("[OK] Force-stopped proxy on port {0} (PID {1})." -f $port, $pidValue)
+                }
+                else {
+                    Write-Host ("[WARN] Could not stop proxy PID {0}: {1}" -f $pidValue, $_.Exception.Message)
+                }
             }
         }
     }
-    if ($stopped -eq 0) {
+
+    # Catch detached python -m proxy processes that no longer own a listen socket.
+    $orphans = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match '^python' -and (Test-IsProxyProcess -CommandLine ([string]$_.CommandLine))
+    }
+    foreach ($proc in $orphans) {
+        $pidValue = [int]$proc.ProcessId
+        if ($stopped.ContainsKey($pidValue)) {
+            continue
+        }
+        try {
+            Stop-Process -Id $pidValue -Force -ErrorAction Stop
+            $stopped[$pidValue] = $true
+            Write-Host ("[OK] Stopped orphan proxy process PID {0}." -f $pidValue)
+        }
+        catch {
+            Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', "$pidValue", '/F', '/T') -Wait -WindowStyle Hidden | Out-Null
+            Write-Host ("[OK] Force-stopped orphan proxy process PID {0}." -f $pidValue)
+            $stopped[$pidValue] = $true
+        }
+    }
+
+    if ($stopped.Count -eq 0) {
         Write-Host '[OK] No running proxy processes stopped.'
     }
-    elseif ($stopped -gt 0) {
+    else {
         Start-Sleep -Milliseconds 500
     }
 }
@@ -176,6 +229,7 @@ Remove-EmptyLock (Join-Path $ProxyDir '.install.lock')
 Remove-Tree (Join-Path $Root       '.pytest_cache')          'root pytest cache'
 Remove-Tree (Join-Path $ProxyDir   '.pytest_cache')          'proxy pytest cache'
 Remove-Tree (Join-Path $ProxyDir   'proxy\__pycache__')      'proxy bytecode cache'
+Remove-Tree (Join-Path $ProxyDir   'proxy\codex\__pycache__') 'codex bytecode cache'
 Remove-Tree (Join-Path $ProxyDir   'tests\__pycache__')      'test bytecode cache'
 Remove-Tree (Join-Path $ProxyDir   'debug_dumps')            'upstream debug dumps'
 
@@ -191,6 +245,8 @@ Remove-Glob $ProxyDir '_*.py'          'proxy ad-hoc debug scripts'
 Remove-Glob $ProxyDir '_*.json'        'proxy debug JSON dumps'
 Remove-Glob $ProxyDir '_*.txt'         'proxy debug text dumps'
 Remove-Glob $ProxyDir '_*.out'         'proxy debug output files'
+Remove-Glob $ProxyDir '_*.bat'         'proxy ad-hoc launcher scripts'
+Remove-Glob $ProxyDir '_*.ps1'         'proxy ad-hoc powershell scripts'
 Remove-Glob $ProxyDir '*_dump.txt'     'proxy stream dumps'
 Remove-Glob (Join-Path $ProxyDir 'proxy') '*.bak' 'proxy backup files'
 
@@ -203,4 +259,5 @@ else {
 
 Write-Host ''
 Write-Host '[DONE] Clean complete.'
+Write-Host '[TIP] Restart Codex proxy with start-codex.bat (port 8788).'
 exit 0

@@ -21,6 +21,7 @@ from ..adapter import (
     find_xml_tool_call_start,
     format_observation_xml,
     format_tool_call_xml,
+    has_plan_tool,
     map_model,
     new_message_id,
     parse_xml_tool_calls,
@@ -29,9 +30,12 @@ from .. import __version__
 from ..config import (
     DEFAULT_MODEL,
     FLOWITH_HERMES_SINGLE_ANSWER,
+    FLOWITH_MAX_NO_TOOL_CORRECTIONS,
     FLOWITH_MIN_MAX_TOKENS,
     FLOWITH_RESPONSES_COMPACT_FINAL_TEXT,
     FLOWITH_SSE_HEARTBEAT_INTERVAL,
+    FLOWITH_TOOL_BUFFER_MAX_CHARS,
+    FLOWITH_TOOL_BUFFER_MAX_SECONDS,
     FLOWITH_TRACE_HERMES,
 )
 from ..upstream import FlowithClient
@@ -657,8 +661,23 @@ def _inject_responses_tool_prompt(
     else:
         injected.insert(0, {"role": "system", "content": xml_prompt})
 
+    plan_tool_name = has_plan_tool(tools)
     tool_call_required = _tool_choice_requires_call(tool_choice)
     if tool_call_required:
+        if plan_tool_name:
+            plan_clause = (
+                f'If the user explicitly asks for a plan, or the task involves design, '
+                f'debugging, repair, verification, or multiple steps, the FIRST tool call '
+                f'MUST be "{plan_tool_name}" with a concrete distributed todo list, '
+                'optionally followed by the first execution tool in the same response.'
+            )
+        else:
+            plan_clause = (
+                'If the user explicitly asks for a plan, or the task involves design, '
+                'debugging, repair, verification, or multiple steps, prefer an available '
+                'plan/todo tool (for example update_plan) with a concrete distributed todo '
+                'list, optionally followed by the first execution tool in the same response.'
+            )
         injected.append({
             "role": "system",
             "content": (
@@ -666,18 +685,22 @@ def _inject_responses_tool_prompt(
                 "explain how the user could do the action, promise to do it later, or ask "
                 "the user to do it. First output a concise user-visible action note: an "
                 "execution summary stating the operational reason, tool name, and exact command or concrete "
-                "action. For a simple action use one line. If the user explicitly asks for "
-                "a plan, or the task involves design, debugging, repair, or verification, "
-                "use a short public decision brief with at most four items covering: the "
-                "current diagnosis/design choice, the key constraint or tradeoff, the exact "
-                "next tool action, and the evidence that will validate it. This "
-                "summary is not hidden chain-of-thought and must not include a "
-                "result, success/failure claim, or final answer. Immediately then output "
-                "the XML tool call and stop. Only after a real tool observation may you "
+                "action. For a simple action use one line. "
+                f"{plan_clause} "
+                "When no plan tool is available, use a "
+                "short public decision brief with typically 3-8 items covering the current "
+                "diagnosis/design choice, key constraints or tradeoffs, ordered next actions, "
+                "and validation evidence. This summary is not hidden chain-of-thought and must "
+                "not include a result, success/failure claim, or final answer. Immediately then "
+                "output the XML tool call(s) and stop. Only after a real tool observation may you "
                 "report success or failure."
             ),
         })
     elif tool_result_followup:
+        if plan_tool_name:
+            plan_update_clause = f'update the "{plan_tool_name}" tool with remaining steps'
+        else:
+            plan_update_clause = 'when available, update the plan/todo tool with remaining steps'
         injected.append({
             "role": "system",
             "content": (
@@ -687,10 +710,11 @@ def _inject_responses_tool_prompt(
                 "future-tense promise such as 'I will', 'next I will', or 'I am going to'. "
                 "Before that call, output one concise user-visible action note naming the "
                 "tool and exact command or concrete action. For non-trivial remaining work, "
-                "include a short public decision brief covering the current diagnosis, key "
+                "include a short public decision brief or, "
+                f"{plan_update_clause}. Cover the current diagnosis, key "
                 "tradeoff, next action, and validation evidence. The note must not include a "
                 "result, success/failure claim, or final answer; then immediately emit the "
-                "XML tool call. "
+                "XML tool call(s). "
                 "Answer in prose only when the observations prove the requested work is "
                 "already complete; otherwise emit the XML tool call and stop."
             ),
@@ -1551,7 +1575,7 @@ _COMPLETION_EVIDENCE_RE = re.compile(
 )
 
 
-def _bounded_tool_action_note(text: str, *, max_chars: int = 900, max_steps: int = 4) -> str:
+def _bounded_tool_action_note(text: str, *, max_chars: int = 1600, max_steps: int = 8) -> str:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         return ""
@@ -1592,7 +1616,7 @@ def _looks_like_unfinished_tool_progress(result: dict[str, Any]) -> bool:
     return bool(_UNFINISHED_PROGRESS_RE.search(content))
 
 
-_MAX_NO_TOOL_CORRECTIONS = 2
+_MAX_NO_TOOL_CORRECTIONS = max(0, FLOWITH_MAX_NO_TOOL_CORRECTIONS)
 
 
 def _required_tool_retry_messages(
@@ -1607,10 +1631,11 @@ def _required_tool_retry_messages(
                 f"RETRY CORRECTION {correction_attempt}/{_MAX_NO_TOOL_CORRECTIONS}: "
                 "The previous response did not call a tool even though "
                 "this turn requires one. Discard the previous prose. Output a concise "
-                "user-visible decision brief with at most four items covering diagnosis or "
-                "design choice, the key constraint/tradeoff, the exact next tool action, and "
-                "the validation evidence. Then immediately emit one valid "
-                "XML tool call and stop. Do not apologize, promise future work, report a "
+                "user-visible action note or short decision brief (typically 3-8 items) "
+                "covering diagnosis or design choice, key constraint/tradeoff, the exact "
+                "next tool action, and validation evidence. Prefer an available plan/todo "
+                "tool for multi-step work. Then immediately emit one or more valid "
+                "XML tool call(s) and stop. Do not apologize, promise future work, report a "
                 "result, or answer without the tool call."
             ),
         },
@@ -1684,20 +1709,55 @@ def _responses_stream_events(
                 result_holder["result"] = _call(messages, on_chunk, on_reasoning)
                 return
 
-            selected_events: list[tuple[str, str]] = []
-
-            def _capture_text(piece: str) -> None:
-                if piece:
-                    selected_events.append(("text", piece))
-
-            def _capture_reasoning(piece: str) -> None:
-                if piece:
-                    selected_events.append(("reasoning", piece))
-
+            # Buffer until a tool call is confirmed so failed/no-tool attempts can
+            # be discarded. Once XML tool markup appears, flush immediately and
+            # stream the rest live so Codex no longer waits for the full turn.
             call_messages = messages
             result: dict[str, Any] = {}
             for attempt in range(_MAX_NO_TOOL_CORRECTIONS + 1):
-                selected_events = []
+                selected_events: list[tuple[str, str]] = []
+                released = False
+                accum_text = ""
+                buffer_started_at = time.monotonic()
+
+                def _release_buffer() -> None:
+                    nonlocal released
+                    if released:
+                        return
+                    for kind, piece in selected_events:
+                        _safe_put((kind, piece))
+                    selected_events.clear()
+                    released = True
+
+                def _capture_text(piece: str) -> None:
+                    nonlocal accum_text
+                    if not piece:
+                        return
+                    if released:
+                        _safe_put(("text", piece))
+                        return
+                    selected_events.append(("text", piece))
+                    accum_text += piece
+                    # Bound the pre-marker withhold so a long preamble never stalls
+                    # the client indefinitely: release on marker, or once the
+                    # buffer exceeds a size/time cap, whichever comes first.
+                    if (
+                        find_xml_tool_call_start(accum_text) >= 0
+                        or (FLOWITH_TOOL_BUFFER_MAX_CHARS and len(accum_text) >= FLOWITH_TOOL_BUFFER_MAX_CHARS)
+                        or (
+                            FLOWITH_TOOL_BUFFER_MAX_SECONDS
+                            and time.monotonic() - buffer_started_at >= FLOWITH_TOOL_BUFFER_MAX_SECONDS
+                        )
+                    ):
+                        _release_buffer()
+
+                def _capture_reasoning(piece: str) -> None:
+                    if not piece:
+                        return
+                    # Reasoning never gates marker detection (which only inspects
+                    # accum_text), so it can stream live even while text is buffered.
+                    _safe_put(("reasoning", piece))
+
                 result = _call(call_messages, _capture_text, _capture_reasoning)
                 needs_correction = (
                     result.get("success")
@@ -1705,6 +1765,11 @@ def _responses_stream_events(
                     and (require_tool or _looks_like_unfinished_tool_progress(result))
                 )
                 if not needs_correction:
+                    if not released:
+                        _release_buffer()
+                    break
+                if released:
+                    # Already delivered bytes; cannot silently replace the turn.
                     break
                 if attempt >= _MAX_NO_TOOL_CORRECTIONS:
                     selected_events = []
@@ -1724,8 +1789,6 @@ def _responses_stream_events(
                     correction_attempt=attempt + 1,
                 )
 
-            for kind, piece in selected_events:
-                _safe_put((kind, piece))
             result_holder["result"] = result
         except Exception as e:
             result_holder["result"] = {"success": False, "error": str(e)}

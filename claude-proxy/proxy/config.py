@@ -110,6 +110,17 @@ if FLOWITH_TOOL_MODE not in {"xml", "native"}:
 # gives the model room to finish the call. Set to 0 to disable.
 FLOWITH_MIN_MAX_TOKENS = _env_int("FLOWITH_MIN_MAX_TOKENS", 8192)
 
+# gpt-5.6 require_tool/correct_no_tool_progress buffering (router._responses_stream_events
+# / _chat_stream_events): text is withheld from the client until a tool-call marker
+# appears or the turn ends, so a long pre-tool preamble can otherwise stall the client
+# indefinitely. These bound that stall independent of the marker.
+FLOWITH_TOOL_BUFFER_MAX_CHARS = _env_int("FLOWITH_TOOL_BUFFER_MAX_CHARS", 4000)
+FLOWITH_TOOL_BUFFER_MAX_SECONDS = _env_float("FLOWITH_TOOL_BUFFER_MAX_SECONDS", 20.0)
+
+# Extra full upstream attempts allowed when a tool call was required but not produced,
+# before giving up and returning an explicit failure.
+FLOWITH_MAX_NO_TOOL_CORRECTIONS = _env_int("FLOWITH_MAX_NO_TOOL_CORRECTIONS", 2)
+
 FLOWITH_SSL_VERIFY = os.environ.get("FLOWITH_SSL_VERIFY", "true").strip().lower() not in {
     "0", "false", "no", "off",
 }

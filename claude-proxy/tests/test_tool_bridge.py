@@ -67,7 +67,9 @@ class ToolBridgeTests(unittest.TestCase):
 
         self.assertIn("explicitly asks you to use a tool", prompt)
         self.assertIn("Do not claim that you cannot access or execute", prompt)
-        self.assertTrue(prompt.endswith("tool observation reports the failure."))
+        self.assertIn("tool observation reports the failure.", prompt)
+        self.assertIn("update_plan", prompt)
+        self.assertTrue(prompt.rstrip().endswith("rather than long prose."))
         example_prefix = prompt.split("<tool_call>", 2)[1]
         self.assertNotIn("I need to", example_prefix)
 
@@ -431,8 +433,9 @@ class ToolBridgeTests(unittest.TestCase):
         self.assertIn("If the user request can be answered directly", prompt)
         self.assertIn("EXAMPLE", prompt)
         self.assertIn('"command": "ls -la"', prompt)
-        self.assertIn("Output ONLY ONE tool call per response.", prompt)
-        self.assertIn("STOP writing immediately after </tool_call>", prompt)
+        self.assertIn("You may emit multiple sequential <tool_call> blocks", prompt)
+        self.assertIn("update_plan", prompt)
+        self.assertIn("STOP writing immediately after the last </tool_call>", prompt)
 
     def test_non_streaming_xml_tool_response_strips_think_blocks(self) -> None:
         response = flowith_result_to_claude_response(

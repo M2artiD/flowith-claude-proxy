@@ -13,6 +13,9 @@ build/
 
 # Environment and secrets
 .env
+.env.*
+.env.bak*
+claude-proxy/.env.bak*
 .flowith_api_key
 claude-proxy/.flowith_api_key
 .hermes/

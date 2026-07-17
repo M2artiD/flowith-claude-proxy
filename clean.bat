@@ -59,17 +59,18 @@ echo.
 echo Default cleanup:
 echo   - claude-proxy\.install.lock if it is empty
 echo   - .pytest_cache folders
-echo   - project __pycache__ folders
+echo   - project __pycache__ folders (proxy + codex)
 echo   - claude-proxy\debug_dumps upstream intercept dumps
 echo   - *.log files in project root and claude-proxy\ when they are not in use
-echo   - _apply_*.py / _check_*.py / _fix_*.py / _inspect_*.py helper scripts
-echo   - _scratch_*.py / _repro_*.py / _patch_*.py / _regress.py / _replay.py debug scripts
-echo   - *.bak files under claude-proxy\proxy\
+echo   - _*.py / _*.json / _*.txt / _*.out / _*.bat / _*.ps1 probe helpers
+echo   - *_dump.txt and claude-proxy\proxy\*.bak
 echo.
 echo Options:
-echo   --venv      Also delete claude-proxy\venv so dependencies reinstall next launch.
-echo   --stop-proxy Stop local proxy listeners on ports 8787/8788/8789 before cleanup.
-echo   --no-pause  Do not wait for a keypress at the end.
+echo   --venv       Also delete claude-proxy\venv so dependencies reinstall next launch.
+echo   --stop-proxy Stop local proxy listeners on ports 8787/8788/8789 and orphan
+echo                python -m proxy processes before cleanup. Use this before a clean
+echo                start-codex.bat when Codex shows 502 or reconnect loops.
+echo   --no-pause   Do not wait for a keypress at the end.
 set "EXIT_CODE=0"
 goto finish
 

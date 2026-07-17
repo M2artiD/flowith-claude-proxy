@@ -1389,6 +1389,104 @@ class OpenAIProxyTests(unittest.TestCase):
         self.assertNotIn("PREMATURE_OK", events)
         self.assertIn('"type": "function_call"', events)
 
+
+
+    def test_responses_required_action_streams_after_tool_markup_detected(self) -> None:
+        """Required-tool turns must flush as soon as tool XML appears, not at call end."""
+        import threading
+        import time
+
+        class SlowToolClient:
+            def __init__(self) -> None:
+                self.calls = []
+                self.allow_finish = threading.Event()
+
+            def call_api(self, messages, **kwargs):
+                self.calls.append({"messages": [dict(message) for message in messages], **kwargs})
+                note = "Use shell_command with Get-Location."
+                kwargs["on_chunk"](note)
+                kwargs["on_chunk"](
+                    "<tool_call>\n"
+                    "<name>shell_command</name>\n"
+                    "<parameters>\n"
+                    '{"command":"Get-Location"}'
+                    "\n</parameters>\n"
+                    "</tool_call>"
+                )
+                # Hold the upstream call open. Progressive release must already have
+                # delivered the function_call events to the client before we continue.
+                if not self.allow_finish.wait(timeout=3.0):
+                    raise TimeoutError("client never observed early tool events")
+                return {
+                    "success": True,
+                    "content": (
+                        note
+                        + "<tool_call>\n"
+                        + "<name>shell_command</name>\n"
+                        + "<parameters>\n"
+                        + '{"command":"Get-Location"}'
+                        + "\n</parameters>\n"
+                        + "</tool_call>"
+                    ),
+                    "usage": {},
+                    "finish_reason": "stop",
+                }
+
+        slow_client = SlowToolClient()
+        server._default_client = slow_client
+
+        saw_function_call = False
+        with self.client.stream(
+            "POST",
+            "/v1/responses",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.6-sol",
+                "input": "run Get-Location",
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "shell_command",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+            },
+        ) as response:
+            self.assertEqual(response.status_code, 200)
+            deadline = time.time() + 3.0
+            for line in response.iter_lines():
+                if (not saw_function_call) and ("function_call" in line) and ("shell_command" in line):
+                    saw_function_call = True
+                    slow_client.allow_finish.set()
+                if time.time() > deadline and not saw_function_call:
+                    break
+            # Unblock even if assertion fails next, so the worker can exit.
+            slow_client.allow_finish.set()
+
+        self.assertTrue(saw_function_call)
+        self.assertEqual(len(slow_client.calls), 1)
+
+    def test_bounded_tool_action_note_keeps_distributed_plan_steps(self) -> None:
+        from proxy.codex.router import _bounded_tool_action_note
+
+        text = "\n".join(
+            [
+                "Plan:",
+                "1. Read project context",
+                "2. List related files",
+                "3. Patch stream buffering",
+                "4. Allow multi-tool calls",
+                "5. Strengthen update_plan guidance",
+                "6. Add regression tests",
+                "7. Restart port 8788",
+                "8. Sync memory and changelog",
+            ]
+        )
+        note = _bounded_tool_action_note(text)
+        self.assertIn("8. Sync memory and changelog", note)
+        self.assertIn("1. Read project context", note)
+
     def test_responses_required_action_corrects_one_no_tool_response_before_delivery(self) -> None:
         class CorrectingClient:
             def __init__(self) -> None:

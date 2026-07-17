@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-07-17
+
+- Optimized GPT-5.6 Codex (8788) perceived latency and multi-step tool UX versus official OpenAI:
+  progressive stream release after tool XML is detected (no longer waits for the full required-tool attempt), multi-tool calls allowed in one turn, `update_plan`/todo guidance for distributed task lists, and public plan notes expanded from 4 to 8 steps / 1600 chars.
+- Kept no-tool correction buffering until tool markup appears, so anti-avoidance retries still discard pure-prose attempts.
+- Added regressions for progressive tool flush and multi-step plan notes; full suite `180 passed, 63 subtests passed`.
+- Hardened Codex launcher/cleanup: `start-codex.bat` loads `.env` key, prefers venv Python, reuses healthy `/health` listeners, and documents that Codex `502 Bad Gateway` is usually an upstream Flowith failure; `clean.bat --stop-proxy` force-stops 8787/8788/8789 and orphan `python -m proxy` processes and removes `_*.bat/_*.ps1` probe helpers.
+
 ## 2026-07-16
 
 - Added a Hermes-only single-answer mode for port 8789: chat/responses requests ask the model to state each distinct point once while retaining necessary detail and examples, and the CN Desktop configuration no longer renders interim assistant status messages as separate chat answers. Existing Responses final-snapshot compaction remains active.
