@@ -2,6 +2,7 @@
 
 ## 2026-07-17
 
+- `clean.bat` default (double-click) now stops 8787/8788/8789 and orphan `python -m proxy` processes before file cleanup; use `--keep-proxy` for files-only.
 - Optimized GPT-5.6 Codex (8788) perceived latency and multi-step tool UX versus official OpenAI:
   progressive stream release after tool XML is detected (no longer waits for the full required-tool attempt), multi-tool calls allowed in one turn, `update_plan`/todo guidance for distributed task lists, and public plan notes expanded from 4 to 8 steps / 1600 chars.
 - Kept no-tool correction buffering until tool markup appears, so anti-avoidance retries still discard pure-prose attempts.

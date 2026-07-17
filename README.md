@@ -57,7 +57,13 @@ This removes the dependency install lock when it is empty, plus local pytest and
 To stop local proxy listeners on ports `8787`, `8788`, and `8789` before cleanup:
 
 ```powershell
-.\clean.bat --stop-proxy
+.\clean.bat
+```
+
+Files-only cleanup (leave proxies running):
+
+```powershell
+.\clean.bat --keep-proxy
 ```
 
 ## Claude Code / Anthropic configuration

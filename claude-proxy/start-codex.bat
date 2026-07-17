@@ -112,7 +112,7 @@ echo   Streaming: progressive tool flush + update_plan multi-tool
 echo.
 echo   Keep ONE 8788 instance. Codex 502 usually means Flowith upstream
 echo   failed, not that this port is down. Health: /health
-echo   Stop: clean.bat --stop-proxy
+echo   Stop: clean.bat   (or clean.bat --keep-proxy to clean files only)
 echo =====================================
 echo.
 
@@ -140,13 +140,13 @@ if %ERRORLEVEL% EQU 10 (
     echo [OK] Proxy already running and healthy on http://127.0.0.1:%_PORT%
     echo      Reusing this instance. Do not start a second 8788 window.
     echo      Tip: Codex "502 Bad Gateway" usually means Flowith upstream failed;
-    echo           local /health can still be ok. Retry, or clean.bat --stop-proxy then start-codex.bat.
+    echo           local /health can still be ok. Retry, or clean.bat then start-codex.bat.
     set "PORT_ALREADY_RUNNING=1"
     exit /b 0
 )
 echo [ERROR] Port %_PORT% is already in use by a non-dashboard or unhealthy process.
 echo         Kill the previous instance, or change the port, then retry.
-echo         Tip: from project root, run clean.bat --stop-proxy
+echo         Tip: from project root, run clean.bat (stops proxies; use --keep-proxy for files only)
 echo         Owning PIDs:
 for /f "tokens=5" %%P in ('netstat -ano ^| findstr /r /c:":%_PORT% .*LISTENING"') do echo           PID %%P
 pause

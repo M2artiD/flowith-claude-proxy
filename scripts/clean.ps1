@@ -1,6 +1,6 @@
 ﻿# clean.ps1 - Cleanup helper invoked by ..\clean.bat.
 # Removes local pytest/pycache dirs, upstream debug dumps, ad-hoc debug scripts,
-# log files, and optionally the proxy virtualenv. Can also stop local proxy listeners.
+# log files, and optionally the proxy virtualenv. By default clean.bat also stops local proxy listeners.
 
 param(
     [string]$Root = (Split-Path -Parent $PSScriptRoot),
@@ -261,3 +261,4 @@ Write-Host ''
 Write-Host '[DONE] Clean complete.'
 Write-Host '[TIP] Restart Codex proxy with start-codex.bat (port 8788).'
 exit 0
+
